@@ -31,7 +31,12 @@ python.pkgs.buildPythonApplication {
     rich
   ];
 
-  nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
+  # git: the ship pipeline's tests run against a real clone and a protected remote
+  # (tools/avc/tests/test_ship.py).
+  nativeCheckInputs = [
+    python.pkgs.pytestCheckHook
+    pkgs.git
+  ];
   # clan_lib on the import path for the checks as well as at runtime.
   preCheck = ''
     export PYTHONPATH=${clan-cli}/${python.sitePackages}:$PYTHONPATH
@@ -54,8 +59,11 @@ python.pkgs.buildPythonApplication {
       [ clan-cli ]
       ++ lib.optional (siteProvisioner != null) siteProvisioner
       ++ lib.attrValues clan-cli.runtimeDependenciesMap
+      # gh: avc opens a pull request for every change and never pushes the deploy
+      # branch (tools/avc/avc/core/pr.py). It uses the operator's own `gh auth login`.
       ++ (with pkgs; [
         git
+        gh
         openssh
         nix
       ])

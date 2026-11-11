@@ -29,7 +29,9 @@ def _git(ctx: Ctx) -> None:
     changed = repo.changes(root)
     parts = [f"branch [bold]{repo.branch(root)}[/]"]
     parts.append(f"{len(changed)} uncommitted" if changed else "clean")
-    if ahead:
+    if ahead and repo.is_pr_branch(repo.branch(root)):
+        parts.append(f"[yellow]{ahead} commit(s) waiting on a pull request (`avc deploy ship` resumes)[/]")
+    elif ahead:
         parts.append(f"[yellow]{ahead} unpushed[/]")
     if behind:
         parts.append(f"[yellow]{behind} behind {repo.deploy_ref(root)}[/]")

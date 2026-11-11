@@ -17,7 +17,7 @@ def _nodes(ctx: Ctx) -> list[str]:
     return ctx.installed
 
 
-@action("deploy", "ship", "Ship changes (commit → push → deploy → post-actions)")
+@action("deploy", "ship", "Ship changes (commit → pull request → merge → deploy → post-actions)")
 def ship_changes(ctx: Ctx) -> None:
     ship.ship(ctx, "chore: update cluster configuration", post=ship.pending(ctx))
 
@@ -59,11 +59,11 @@ def retry(ctx: Ctx, node: str) -> None:
 
 @action("deploy", "break-glass", "Break-glass push from this working tree", Arg("node", "Node", choices=_nodes))
 def break_glass(ctx: Ctx, node: str) -> None:
-    """README "break-glass": hold → clan machines update → push → release.
+    """README "break-glass": hold → clan machines update → pull request → release.
 
-    The hold stops the timer from reverting the pushed build to the last
-    pushed commit; it is only released once that commit is on origin, so the
-    next pull builds the same thing."""
+    The hold stops the timer from reverting the pushed build to what the deploy
+    branch has; it is only released once the same change has merged there, so
+    the next pull builds the same thing."""
     ui.header(f"Break-glass deploy to {node}")
     ui.warn("this builds the WORKING TREE (uncommitted edits included) and activates it directly")
     if not ui.confirm(f"Hold {node}, then `clan machines update {node}`?"):
@@ -77,16 +77,19 @@ def break_glass(ctx: Ctx, node: str) -> None:
         ui.say(f"fix and re-run, or `avc deploy release {node}` to go back to pull-deploy")
         return
     ui.ok(f"{node}: updated")
-    ui.info("now commit and push the same change, so the timer builds what is running")
+    ui.info("now get the same change merged, so the timer builds what is running")
     try:
         shipped = ship.ship(ctx, "fix: break-glass change", paths=None)
     except AvcError:
-        # A lock or input change, say, which goes by pull request: the timer would revert
-        # the build until main has it, so the hold stays.
+        # The pull request was closed, say: the timer would revert the build until main
+        # has the change, so the hold stays.
         ui.warn(f"{node}: still held; release it once main has the change (`avc deploy release {node}`)")
         raise
-    if shipped or repo.ahead_behind(ctx.root)[0] == 0:
+    if shipped or (repo.branch(ctx.root) == repo.DEPLOY_BRANCH and repo.ahead_behind(ctx.root)[0] == 0):
         n.release()
         ui.ok(f"{node}: hold released — pull-deploy resumes")
     else:
-        ui.warn(f"{node}: still held; release it after pushing (`avc deploy release {node}`)")
+        ui.warn(
+            f"{node}: still held, so the timer cannot revert it while the pull request is open. `avc deploy ship` once it "
+            f"has merged, then `avc deploy release {node}`. A hold does not survive a reboot."
+        )

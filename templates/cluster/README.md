@@ -43,7 +43,7 @@ Before anything here, the Tang server: a small separate machine with its own pri
    avc boot reboot node1            # nobody types; expect the Worker's email
    ```
 
-After that, every node rebuilds itself from `main` on a timer. `avc` is the guided way to do day-to-day operations, and it pushes its own commits to `main` (see "Merging safely" for why, and for what goes by pull request instead).
+After that, every node rebuilds itself from `main` on a timer. `avc` is the guided way to do day-to-day operations. It never pushes to `main`: it puts each change on a branch of its own, opens a pull request and waits for it to merge (see "Merging safely"). Run `gh auth login` once so that it can.
 
 ## Keep an offline kit
 
@@ -59,11 +59,11 @@ The first deploy of a library version with boot security waits on every such nod
 
 ## Adding an app
 
-Write `apps/<name>.nix`, run `clan vars generate <node>`, and push. To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
+Write `apps/<name>.nix`, run `clan vars generate <node>`, and ship it (`avc deploy ship`). To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
 
 ## Updating the library
 
-Change the `cluster` input's revision and bump nothing else in the same commit. Open it as a pull request, never a push to `main`, because nodes apply `main` within minutes: the merge gate below has to pass on it first. `avc` refuses to push it for you.
+Change the `cluster` input's revision and bump nothing else in the same commit. It goes by pull request like every other change (`avc deploy ship` opens one), because nodes apply `main` within minutes: the merge gate below has to pass on it first.
 
 ## Merging safely
 
@@ -77,12 +77,16 @@ Set a ruleset (or branch protection) on `main`, in the repository's settings:
 - Require status checks to pass, and require these: `merge-gate`, `boot-install`, `boot-fallback`. `merge-gate` fails unless every job in the workflow succeeded; naming the boot tests as well keeps them required if someone edits it.
 - Require branches to be up to date before merging, so the checks ran on the lock that merges.
 - Block force pushes and deletion.
-- **Bypass list: the operators who run `avc`, and no one else.** Never the account behind `FLAKE_UPDATE_TOKEN`, an app, or "Repository admin" as a role that anyone with admin rights inherits.
+- **Bypass list: empty.** Not the operators, not the account behind `FLAKE_UPDATE_TOKEN`, not an app, and not "Repository admin" as a role that anyone with admin rights inherits.
 
-The bypass is there for `avc`. Everything it ships (vars and secrets after a provision or a rotation, `topology.nix`, apps, a break-glass fix, and a rollback's revert of anything but the lock) goes straight to `main` with `git push`, because those can't wait twenty minutes behind a runner that may be down, and its post-actions (restarts, revoking an old credential) wait for the push. A change to `flake.lock` or `flake.nix`, which is where a nixpkgs, kernel, Lanzaboote, clan or library bump comes from, `avc` refuses to push: it goes by pull request, and through the gate.
+Under "Require a pull request", ask for no approvals unless you want a second person on every operation: nobody can approve their own pull request, and `avc` waits until someone else has.
 
-What the bypass costs: an operator on that list can still `git push` anything to `main` by hand, a lock bump included, and nothing here stops it. Such a push skips the boot tests and the per-node builds. The canary still holds a new boot stack back from the other nodes, and `merge-gate` runs on the push and turns red afterwards, but only after every node has started building it. Keep the list to the people who run `avc`, and use pull requests for everything that is not an operation.
+Nothing needs a bypass, because `avc` has no push to `main`. Everything it ships (vars and secrets after a provision or a rotation, `topology.nix`, apps, a break-glass fix, a rollback's revert, a lock or library bump) is committed on a branch named `avc/<time>-<subject>`, pushed, and opened as a pull request with auto-merge asked for. It does that as the operator, through the GitHub CLI: run `gh auth login` once, and have write access to the repository. Then it waits for the merge, deploys, and only after that runs its post-actions (restarts, revoking an old credential). If a check fails, the wait is interrupted (Ctrl-C, or an hour without a merge) or `gh` is not there, nothing has reached `main` and the post-actions are kept: `avc deploy ship` picks up from wherever it stopped, whether the pull request is still open or has merged since. Without `gh` it pushes the branch and asks you to open the pull request yourself.
 
-Then auto-merge is safe: GitHub merges a pull request only once the required checks pass, and never on a red or skipped run. `.github/workflows/flake-update.yml` updates the lock on a branch, opens a pull request and asks for auto-merge. It needs a `FLAKE_UPDATE_TOKEN` secret (contents and pull-requests write), not the built-in token, whose pull requests start no workflows; and "Allow auto-merge" turned on. If your project flakes are private, put a read token in a `NIX_ACCESS_TOKENS` secret as `access-tokens = github.com=<token>`. An auto-merge that pushes to `main` itself, or merges without these checks, is exactly the gap this closes: replace it.
+In the repository's settings, turn on "Allow auto-merge" and allow squash merging. `avc` and `flake-update.yml` both ask for a squash.
+
+What that costs: every operation waits for the gate. The two boot tests are built from the lock and the library, not from your vars or apps, so on a runner that keeps its Nix store a pull request that leaves `flake.lock` alone finds them already built and waits for the evaluation and each node's system. One that changes the lock waits for the boot tests too, about 20 minutes. And while the runner is down nothing merges at all. For a fix that cannot wait for that, `avc deploy break-glass <node>` applies the working tree to one node and holds the node there until the pull request has merged. That hold does not survive a reboot.
+
+With those rules auto-merge is safe: GitHub merges a pull request only once the required checks pass, and never on a red or skipped run. `.github/workflows/flake-update.yml` updates the lock on a branch, opens a pull request and asks for auto-merge. It needs a `FLAKE_UPDATE_TOKEN` secret (contents and pull-requests write), not the built-in token, whose pull requests start no workflows; and "Allow auto-merge" turned on. If your project flakes are private, put a read token in a `NIX_ACCESS_TOKENS` secret as `access-tokens = github.com=<token>`. An auto-merge that pushes to `main` itself, or merges without these checks, is exactly the gap this closes: replace it.
 
 **The canary.** One node, `canary = true` in `topology.nix`, takes each new boot stack first: a nixpkgs, kernel, Lanzaboote, clan or library bump. The others build it and wait (`DeployWaitingForCanary` after a day) until the canary has been rebooted into it and unlocked by Clevis on its own. Reboot it with `avc boot reboot <canary>` and watch the console; if it fails to come back, nothing else has the bad stack as its boot entry. If the canary cannot be rebooted, list the closure in `/run/cluster-upgrade.skip-canary` on each node you accept it on. A site of one node needs no canary; a site of more needs one, or `deploy.withoutCanary = "<reason>"`.

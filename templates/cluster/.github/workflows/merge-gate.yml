@@ -4,9 +4,10 @@
 # which is what the nodes run, and every node's closure builds.
 #
 # Branch protection on `main`: require the status checks `merge-gate`, `boot-install`
-# and `boot-fallback`, require branches to be up to date, and let no one bypass but the
-# operators who run avc (README.md says why, and what it costs). Then auto-merge,
-# including flake-update.yml's, waits for them and never merges a red run.
+# and `boot-fallback`, require branches to be up to date, and let no one bypass. avc
+# needs no bypass: it opens a pull request for every change and never pushes `main`
+# (README.md says what that costs). Then auto-merge, avc's and flake-update.yml's alike,
+# waits for the checks and never merges a red run.
 #
 # Runs on a self-hosted runner with KVM (the boot tests are VMs that boot VMs' disks):
 # Nix with flakes, /dev/kvm, `system-features = kvm nixos-test`, 16 GB of RAM. Each step

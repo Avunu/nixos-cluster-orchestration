@@ -201,16 +201,18 @@ check(
 readme = tpl_readme.read_text()
 for name in ("merge-gate", "boot-install", "boot-fallback"):
     check(f"the template README names `{name}` as a required status check", f"`{name}`" in readme)
-# The protection model avc can live with: operators bypass the pull-request rule for
-# avc's own pushes, nothing else does (the flake-update token above all), and avc refuses
-# to push the lock or the inputs, which go through the gate (avc/core/ship.py, GATED_PATHS).
+# The protection model: nobody bypasses the gate, the flake-update token least of all,
+# and avc does not need to, because it opens a pull request for every change and has no
+# push to the deploy branch. tools/avc/tests/test_ship.py proves that part, against a
+# remote that refuses such a push.
 check(
-    "the template README limits the bypass to avc's operators, never the update token, and says avc refuses lock pushes",
-    "Bypass list: the operators who run `avc`, and no one else" in readme
-    and "Never the account behind `FLAKE_UPDATE_TOKEN`" in readme
-    and "`avc` refuses to push" in readme
-    and "What the bypass costs" in readme
-    and "auto-merge" in readme,
+    "the template README leaves the bypass list empty and says how avc lives with that",
+    "Bypass list: empty" in readme
+    and "not the account behind `FLAKE_UPDATE_TOKEN`" in readme
+    and "`avc` has no push to `main`" in readme
+    and "What that costs" in readme
+    and '"Allow auto-merge"' in readme
+    and "bypass list: the operators" not in readme.lower(),
 )
 
 if failures:

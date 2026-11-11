@@ -118,8 +118,8 @@ def dependents(gens: list[GeneratorInfo], name: str) -> list[str]:
 
 # Writes go through the clan CLI rather than clan_lib: it owns the interactive
 # prompts (hidden input, previous value as default). clan commits what it
-# writes itself, so the ship pipeline then finds unpushed commits rather than
-# a dirty tree, and pushes them.
+# writes itself, so the ship pipeline then finds commits on the deploy branch
+# rather than a dirty tree, and moves them to a pull-request branch.
 
 
 def _clan(root: Path, *args: str, input: str | None = None, capture: bool = False) -> str:

@@ -403,7 +403,7 @@ The boot menu's timeout is 0, so it shows only if you press a key (hold space) a
 A closure that builds and passes every gate but fails at a reboot has to be kept off, because the pull loop would otherwise activate it again within about 90 seconds of the node coming back. The order:
 
 1. Hold the pull loop on every node (`avc deploy hold <node>`), so nothing else takes the bad closure.
-2. Revert or pin the private repository to the last good commit. A revert of anything but `flake.lock` and `flake.nix` is pushed (`avc deploy ship`). A lock revert goes by pull request through the merge gate, about 20 minutes, and `avc` refuses to push it; the holds of step 1 and the denylist of step 4 keep the nodes off the bad closure meanwhile.
+2. Revert or pin the private repository to the last good commit. Ship it with `avc deploy ship`: the revert goes by pull request through the merge gate like every other change, about 20 minutes when it changes the lock. The holds of step 1 and the denylist of step 4 keep the nodes off the bad closure meanwhile.
 3. Boot the previous generation on the broken node ([above](#booting-an-older-generation)).
 4. `avc boot rollback <node>` (or `avc boot rollback --all`) adds every generation after the running one to `/var/lib/cluster-upgrade/refused`, which survives reboots. The tick refuses anything listed (`cluster_deploy_rollback_held 1`, `DeployRollbackHeld`).
 5. Once `main` has the revert, release the holds (`avc deploy release <node>`). Released earlier, a node that never took the bad closure takes it.
@@ -461,9 +461,9 @@ Lost keys and a deliberate rotation are the same procedure. A rotation is what r
 The order matters: the Tang host's guard refuses every connection while a pinned key is missing.
 
 1. On the Tang host: `tang-keys rotate-begin`. It makes a new key pair and hides the old one (hidden keys still decrypt).
-2. Pin the new thumbprint: in the Tang host's `pinnedThumbprints` (deploy it) and in the site's `security.tang.thumbprints` (push it). Thumbprints are not in the boot contract, so this needs no approval.
+2. Pin the new thumbprint: in the Tang host's `pinnedThumbprints` (deploy it) and in the site's `security.tang.thumbprints` (ship it, `avc deploy ship`). Thumbprints are not in the boot contract, so this needs no approval.
 3. Once every node has deployed the new thumbprint, rebind each from a freshly delivered advertisement: `avc boot bind <node> adv.jws --replace`. Then `avc boot reboot <node>`, one at a time, proves each.
-4. Unpin the old thumbprint on the Tang host and deploy; take it out of `security.tang.thumbprints` and push.
+4. Unpin the old thumbprint on the Tang host and deploy; take it out of `security.tang.thumbprints` and ship that.
 5. **Before the next step, check every node.** Once a node has deployed step 4, a Clevis slot still bound to the old key fails `cluster-boot-seal check` with exit status 4, `avc boot reboot` refuses, and the boot audit raises `ClevisBoundToUnpinnedTang`. Rebind any node that shows it, as in step 3. `tang-keys rotate-finish` on the Tang host can't see the nodes, so this is the only place a node missed in step 3 shows.
 6. `tang-keys rotate-finish`, which deletes the hidden keys. It refuses while a hidden key is still pinned.
 
@@ -662,7 +662,7 @@ Beside the kind, every generic `clusterApps` option stays available (`modules/ap
 ### Adding an app
 
 1. Add its flake input if it has one.
-2. Write `apps/<name>.nix`, run `clan vars generate <node>` for the kind's generated secrets, and push. Nomad starts it. With no `tunnel.id` it has no ingress yet.
+2. Write `apps/<name>.nix`, run `clan vars generate <node>` for the kind's generated secrets, and ship it (`avc deploy ship`). Nomad starts it. With no `tunnel.id` it has no ingress yet.
 3. Wire the tunnel:
    ```sh
    cloudflared tunnel create <name>
@@ -670,7 +670,7 @@ Beside the kind, every generic `clusterApps` option stays available (`modules/ap
    clan vars set <node> <name>-cf/cloudflared < ~/.cloudflared/<id>.json
    cloudflared tunnel route dns <name> <hostname>
    ```
-4. Commit the id and the var together and push, then run `nomad job restart app-<name>`, because the credentials are a new bind mount.
+4. Ship the id and the var together (`avc deploy ship`), then run `nomad job restart app-<name>`, because the credentials are a new bind mount.
 
 Odoo and Frappe databases are not initialised for you. Restore or create one after the first start. Deploys then migrate it.
 
@@ -745,7 +745,7 @@ Rotation notes:
 
 ### Deploying
 
-Commit and push (`avc deploy ship` does both, and waits for the nodes). Within `deploy.pullInterval`, every node converges. A change to `flake.lock` or `flake.nix` is the exception: it goes by pull request through the site's merge gate, and `avc` refuses to push it (see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md)). Watch one with `journalctl -fu cluster-upgrade` (`avc deploy watch <node>`), or force it with `systemctl start cluster-upgrade` (`avc deploy now` for the fleet).
+A change reaches the nodes by merging into `main`, and it merges by pull request. `avc deploy ship` does all of it: it commits on a branch of its own (`avc/...`), pushes that branch, opens the pull request and asks for auto-merge, waits for the site's merge gate to merge it, and then waits for the nodes. It never pushes to `main`, so `main` can be protected with no bypass for anyone (see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md)). It needs the GitHub CLI logged in once (`gh auth login`); without it, it pushes the branch and tells you to open the pull request yourself. Within `deploy.pullInterval` of the merge, every node converges. Watch one with `journalctl -fu cluster-upgrade` (`avc deploy watch <node>`), or force it with `systemctl start cluster-upgrade` (`avc deploy now` for the fleet).
 
 What a tick does (`lib/cluster-upgrade.nix`), in order:
 
@@ -767,7 +767,8 @@ Pull deploys never reboot. A node running a closure it has not booted shows `clu
 ```sh
 ssh root@node1 touch /run/cluster-upgrade.hold     # or: avc deploy hold node1
 clan machines update node1
-git push && ssh root@node1 rm /run/cluster-upgrade.hold   # or: avc deploy release node1
+# get the same change merged into main (avc deploy ship), and only then:
+ssh root@node1 rm /run/cluster-upgrade.hold          # or: avc deploy release node1
 ```
 
 The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (a backup dumping a database, a restore) use one file each in `/run/cluster-upgrade.hold.d/`, so they cannot release each other, and `avc boot reboot` refuses while any is set. Keep a console open for changes to `br-wan` or the WAN stanza: on a remote machine a mistake there is a lockout.
@@ -790,7 +791,7 @@ cluster-restore <app> --db-only --yes      # or --files-only
 cluster-restore <app> --to-scratch /var/tmp/r
 ```
 
-A weekly rehearsal restores each app's backup to prove it works. If you lose a node, set the app's `homeNode` to a survivor, push, and run `cluster-restore <app> --yes` there. Keep your age key somewhere other than your laptop, because backups can't be decrypted without it.
+A weekly rehearsal restores each app's backup to prove it works. If you lose a node, set the app's `homeNode` to a survivor, ship it (`avc deploy ship`), and run `cluster-restore <app> --yes` there. Keep your age key somewhere other than your laptop, because backups can't be decrypted without it.
 
 The staging, verify and restore directories (`/var/lib/cluster-backup/{staging,verify,restore}`) hold plaintext dumps until the next run, on the node's encrypted root.
 
@@ -917,7 +918,7 @@ avc audit tang-clients | wrangler secret put TANG_CLIENTS
 wrangler deploy
 ```
 
-Then set `alerting.heartbeatUrl` to its `/heartbeat` URL and `alerting.auditUrl` to its `/event` URL, and push.
+Then set `alerting.heartbeatUrl` to its `/heartbeat` URL and `alerting.auditUrl` to its `/event` URL, and ship it.
 
 #### Audit trail
 
