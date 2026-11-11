@@ -1,0 +1,9 @@
+plans
+/result
+/result-*
+/.avc/
+tmp
+.direnv
+.devenv
+__pycache__/
+node_modules/

@@ -1,0 +1,35 @@
+# cluster-watchdog — deploy: see README "Monitoring and alerting" -> "Dead-man".
+name = "cluster-watchdog"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[kv_namespaces]]
+binding = "WATCHDOG"
+# `wrangler kv namespace create WATCHDOG` prints the id to put here.
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# The audit trail (POST /event). Write-only from the Worker's side: it only ever puts.
+# Lock the bucket against deletion (an R2 bucket lock rule) so that a stolen Cloudflare
+# token cannot quietly rewrite history either; how long is the site's decision (the
+# design leaves the retention period to the risk analysis). Not verified here.
+[[r2_buckets]]
+binding = "AUDIT"
+bucket_name = "my-cluster-audit"
+
+[vars]
+CLUSTER_NAME = "my-cluster"
+ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+ALERT_FROM = "alerts@example.com"
+ALERT_TO = "ops@example.com"
+
+# Secrets (wrangler secret put):
+#   WATCHDOG_TOKEN  = `clan vars get <metrics node> alerting-watchdog/token`
+#   CF_EMAIL_TOKEN  = the Email-Sending-only token (same as alerting/cf-email-token)
+#   AUDIT_TOKENS    = `avc audit tokens`: {"<token>": {"sender": "<node>", "kinds": [...]}},
+#                     one per node from its `audit/token`, plus the Tang host's entry
+#                     {"sender": "tang", "kinds": ["tang_rec", "tang_probe"]} from the Tang repo
+#   TANG_CLIENTS    = `avc audit tang-clients`: {"<tangIp>": "<node>"}

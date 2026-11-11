@@ -1,0 +1,102 @@
+# The library's merge gate: every check in `checks.x86_64-linux`, the boot-* VM tests
+# included, built on a self-hosted runner with KVM (README.md, "Continuous integration").
+#
+# Each check is its own job, evaluated by its own nix process (tools/ci/build.sh), never
+# `nix flake check`: one whole-flake evaluation takes 16 to 53 GB, one check at most about
+# 9 GB. Make `ci-gate` the one required status check on the default branch; it fails
+# unless every check job succeeded, including when a job was skipped.
+#
+# Security: this runs the pull request's code on your runner. A public repository must
+# set "Require approval for all external contributors" for fork workflows (Settings,
+# Actions), and approve only what has been read: a fork can edit this file too, so the
+# `if:` below stops accidents, not attackers. Because of that `if:`, a fork's pull request
+# never passes `ci-gate`, approved or not: a maintainer who has read the change pushes it
+# to a branch of this repository and opens the pull request from there.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  list:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    outputs:
+      checks: ${{ steps.list.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner preflight
+        run: tools/ci/preflight.sh
+      # Assign, then echo: a failing $(...) inside echo's argument is lost under `bash -e`,
+      # and list.sh's refusal (an empty list, a failed evaluation) must fail this job.
+      - id: list
+        name: List the checks
+        run: |
+          checks=$(tools/ci/list.sh checks.x86_64-linux)
+          echo "checks=$checks" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: list
+    name: check (${{ matrix.check }})
+    runs-on: [self-hosted, linux, x64, kvm]
+    # The slowest, boot-attack, took about 31 minutes on a 125 GB build host.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.list.outputs.checks) }}
+    steps:
+      - uses: actions/checkout@v4
+      # Each job may land on a different runner; each one checks its own.
+      - name: Runner preflight
+        run: tools/ci/preflight.sh
+      - name: Build
+        env:
+          ATTR: checks.x86_64-linux.${{ matrix.check }}
+        run: tools/ci/build.sh "$ATTR"
+
+  outputs:
+    needs: list
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner preflight
+        run: tools/ci/preflight.sh
+      - name: Build the packages and the dev shell
+        run: |
+          for set in packages.x86_64-linux devShells.x86_64-linux; do
+            names=$(tools/ci/list.sh "$set")
+            for n in $(printf '%s' "$names" | tr -d '[]"' | tr ',' ' '); do
+              tools/ci/build.sh "$set.$n"
+            done
+          done
+
+  ci-gate:
+    needs: [list, check, outputs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        # jq is on GitHub's hosted runners. Anything but success fails, skipped included:
+        # a fork's run skips the jobs above, and must not pass the gate by that.
+        run: |
+          echo "$RESULTS"
+          jq -e 'length > 0 and all(.[]; .result == "success")' <<<"$RESULTS" >/dev/null || {
+            echo "ci-gate: a job did not succeed (failed, cancelled or skipped)" >&2
+            exit 1
+          }

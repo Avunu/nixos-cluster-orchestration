@@ -1,0 +1,50 @@
+# Updates flake.lock on a branch and asks GitHub to merge it once merge-gate.yml has
+# passed on it. It never pushes to `main`: with branch protection as merge-gate.yml
+# describes, a lock the boot tests fail on is never merged, and no node ever sees it.
+#
+# The `cluster` input is pinned by revision in flake.nix, so this moves only what
+# follows a branch (your project flakes). Bump the library by hand, alone.
+#
+# Needs a secret FLAKE_UPDATE_TOKEN: a fine-grained token (or a GitHub App's) with
+# contents and pull-requests write on this repository. Not GITHUB_TOKEN: a pull request
+# it opens starts no workflows, so merge-gate would never report, and nothing would
+# merge. Turn on "Allow auto-merge" in the repository's settings.
+name: flake-update
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+      - name: Update the lock on flake-auto-update
+        env:
+          GH_TOKEN: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+          NIX_CONFIG: ${{ secrets.NIX_ACCESS_TOKENS }}
+        run: |
+          git config user.name "flake-update"
+          git config user.email "flake-update@example.invalid"   # not a mailbox
+          git switch -C flake-auto-update
+          nix flake update
+          if git diff --quiet -- flake.lock; then
+            echo "flake.lock is current"
+            exit 0
+          fi
+          git commit -m "chore: update flake lock" -- flake.lock
+          git push --force origin flake-auto-update
+          gh() { nix run --inputs-from . nixpkgs#gh -- "$@"; }
+          gh pr view flake-auto-update >/dev/null 2>&1 \
+            || gh pr create --base main --head flake-auto-update \
+              --title "chore: update flake lock" \
+              --body "Merged by auto-merge once merge-gate passes. Nothing merges on a red run."
+          gh pr merge flake-auto-update --auto --squash

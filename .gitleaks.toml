@@ -1,0 +1,22 @@
+[extend]
+useDefault = true
+
+# The VM tests' WireGuard keys are throwaway fixtures, committed on purpose
+# (tests/lib/fixture-wg.nix explains why). Nothing anywhere uses them.
+[[allowlists]]
+description = "test fixtures, not secrets"
+paths = [
+  '''tests/lib/fixture-wg\.nix''',
+]
+
+# The boot harness's volume identity secret: a sequential-hex placeholder that only the
+# VM tests use (its sha256 is the fixture's identityHash, the line below it). Narrow on
+# purpose: this one rule, this one file, this one value. Any other secret in that file,
+# or this value anywhere else, is still reported.
+[[allowlists]]
+description = "boot-harness VM-test placeholder identity secret"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/lib/boot-harness\.nix$''']
+regexTarget = "secret"
+regexes = ['''^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$''']

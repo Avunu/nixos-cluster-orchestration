@@ -1,0 +1,48 @@
+# Every named mutant (tests/lib/control.py, `legacyPackages.x86_64-linux.mutants`): one
+# control removed, and the build succeeds only if the assertion it guards went false.
+# About four hours of VM time in all, so a pre-release step, started by hand. Each mutant
+# is its own job and its own evaluation, as in ci.yml; `tests/run-mutants.sh` with no
+# names evaluates all of them in one process (33 to 41 GB), which a runner may not have.
+name: mutants
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    outputs:
+      mutants: ${{ steps.list.outputs.mutants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner preflight
+        run: tools/ci/preflight.sh
+      # Assign, then echo, so that list.sh's refusal fails this job (ci.yml says why).
+      - id: list
+        name: List the mutants
+        run: |
+          mutants=$(tools/ci/list.sh legacyPackages.x86_64-linux.mutants)
+          echo "mutants=$mutants" >> "$GITHUB_OUTPUT"
+
+  mutant:
+    needs: list
+    name: mutant (${{ matrix.mutant }})
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        mutant: ${{ fromJSON(needs.list.outputs.mutants) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner preflight
+        run: tools/ci/preflight.sh
+      - name: Build
+        env:
+          ATTR: legacyPackages.x86_64-linux.mutants.${{ matrix.mutant }}
+        run: tools/ci/build.sh "$ATTR"

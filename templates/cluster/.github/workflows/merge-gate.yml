@@ -1,0 +1,122 @@
+# This site's merge gate (README.md, "Merging safely"). Every node applies `main` within
+# the pull interval and first runs a new kernel and initrd at its next reboot, so nothing
+# reaches `main` unless the library's boot tests pass at THIS repository's flake.lock,
+# which is what the nodes run, and every node's closure builds.
+#
+# Branch protection on `main`: require the status checks `merge-gate`, `boot-install`
+# and `boot-fallback`, require branches to be up to date, and let no one bypass but the
+# operators who run avc (README.md says why, and what it costs). Then auto-merge,
+# including flake-update.yml's, waits for them and never merges a red run.
+#
+# Runs on a self-hosted runner with KVM (the boot tests are VMs that boot VMs' disks):
+# Nix with flakes, /dev/kvm, `system-features = kvm nixos-test`, 16 GB of RAM. Each step
+# below evaluates one thing in its own nix process and builds the .drv it printed, so no
+# evaluation needs more than a few GB.
+name: merge-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A token that can read this site's private flake inputs, as a nix.conf line:
+  # "access-tokens = github.com=<token>". Optional; leave the secret unset if every input
+  # is public or in this repository.
+  NIX_CONFIG: ${{ secrets.NIX_ACCESS_TOKENS }}
+
+jobs:
+  # The library's boot tests, as this lock resolves the library and its inputs
+  # (flake.nix re-exports them). A nixpkgs, clan, Lanzaboote or library bump that breaks
+  # an encrypted node's boot fails here, before any node has it.
+  boot-install:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checks.x86_64-linux.boot-install
+        run: |
+          test -w /dev/kvm
+          drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.boot-install.drvPath)
+          nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
+
+  boot-fallback:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checks.x86_64-linux.boot-fallback
+        run: |
+          test -w /dev/kvm
+          drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.boot-fallback.drvPath)
+          nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
+
+  # The boot tests prove the library's nixpkgs; the nodes build on this flake's. They are
+  # the same store path only if one follows the other.
+  nixpkgs-follows-library:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checks.x86_64-linux.nixpkgs-follows-library
+        run: |
+          drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.nixpkgs-follows-library.drvPath)
+          nix build --no-link --print-build-logs "$drv^*"
+
+  nodes:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    outputs:
+      names: ${{ steps.list.outputs.names }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          names=$(nix --option eval-cores 1 eval --json .#nixosConfigurations --apply builtins.attrNames)
+          test "$names" != "[]"
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+
+  # Every node's closure, built: the build gates (the initrd's contents, the log label
+  # contract) fail here instead of on the node, where they only stop the deploy.
+  toplevel:
+    needs: nodes
+    name: toplevel (${{ matrix.node }})
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(needs.nodes.outputs.names) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the node's system
+        env:
+          NODE: ${{ matrix.node }}
+        run: |
+          drv=$(nix --option eval-cores 1 eval --raw ".#nixosConfigurations.$NODE.config.system.build.toplevel.drvPath")
+          nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
+
+  merge-gate:
+    needs: [boot-install, boot-fallback, nixpkgs-follows-library, nodes, toplevel]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        # Anything but success fails, a skipped or cancelled job included.
+        run: |
+          echo "$RESULTS"
+          jq -e 'length > 0 and all(.[]; .result == "success")' <<<"$RESULTS" >/dev/null || {
+            echo "merge-gate: a job did not succeed (failed, cancelled or skipped)" >&2
+            exit 1
+          }

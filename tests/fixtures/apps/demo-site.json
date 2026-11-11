@@ -1,0 +1,19 @@
+{
+  "homeNode": "node1",
+  "wordpress": {
+    "publicUrl": "https://www.example.com",
+    "adminHost": "admin.example.com",
+    "repoUrl": "https://git.example.net/demo/site.git",
+    "branch": "main",
+    "cloudflareTeam": "example",
+    "accessAud": "00000000000000000000000000000000",
+    "allowLogin": false,
+    "r2": {
+      "bucket": "demo-site-files",
+      "endpoint": "https://r2.example.net",
+      "publicUrl": "https://media.example.com/"
+    }
+  },
+  "public": { "tunnel": { "id": "00000000-0000-4000-8000-000000000004" } },
+  "admin": { "tunnel": { "id": "00000000-0000-4000-8000-000000000005" } }
+}

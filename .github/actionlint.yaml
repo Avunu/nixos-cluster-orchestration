@@ -1,0 +1,4 @@
+# The runner labels the workflows ask for, so actionlint (checks.ci-gate) knows them.
+self-hosted-runner:
+  labels:
+    - kvm

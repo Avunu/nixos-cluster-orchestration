@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avc"
+version = "0.1.0"
+description = "Guided day-to-day operations for a nixos-cluster-orchestration cluster"
+requires-python = ">=3.12"
+dependencies = ["questionary", "rich"]
+
+[project.scripts]
+avc = "avc.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["avc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# The shell avc sends to a node for a rollback. The node's own guard reads it from the
+# source tree (modules/pull-deploy-core.nix).
+[tool.setuptools.package-data]
+"avc.core" = ["*.sh"]
