@@ -81,4 +81,8 @@ class Ctx:
     def state_dir(self) -> Path:
         d = self.root / ".avc"
         d.mkdir(exist_ok=True)
+        ignore = d / ".gitignore"
+        if not ignore.exists():
+            # Local state, never part of a commit, whatever the site's own .gitignore says.
+            ignore.write_text("*\n")
         return d
