@@ -13,7 +13,7 @@
 #
 # Returns what clan-core's `lib.clan` returns. See README.md "The interface".
 #
-# A node's disks are encrypted, and it boots through Secure Boot and Clevis. A node
+# A node's disks are encrypted, and it boots through Secure Boot and unlocks from its TPM. A node
 # that does not end up that way fails to evaluate (modules/boot-security.nix). The
 # one opt-out is topology data, not an argument here:
 #

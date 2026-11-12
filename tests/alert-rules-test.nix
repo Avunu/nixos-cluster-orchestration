@@ -821,11 +821,11 @@ let
       (s ''cluster_boot_pcr7_info{instance="n",value="aa"}'' "1x60")
       (s ''cluster_boot_pcr7_info{instance="n",value="bb"}'' "_x60 1x1600")
     ] "26h" none)
-    (case "UnlockTpmShareFailing" [ (s ''cluster_unlock_tpm_share_ok{instance="n"}'' "0x30") ] "20m" [
+    (case "UnlockTpmFailing" [ (s ''cluster_unlock_tpm_ok{instance="n"}'' "0x30") ] "20m" [
       (crit "critical")
     ])
-    (case "UnlockTpmShareFailing" [
-      (s ''cluster_unlock_tpm_share_ok{instance="n"}'' "0x10 1x20")
+    (case "UnlockTpmFailing" [
+      (s ''cluster_unlock_tpm_ok{instance="n"}'' "0x10 1x20")
     ] "25m" none)
     (case "RebootPendingTooLong" [ (s ''cluster_reboot_pending{instance="n"}'' "1x21000") ] "14d1h" [
       (crit "warning")
@@ -846,9 +846,9 @@ let
     (case "VolumeIdentityMissing" [
       (s ''cluster_volume_identity_ok{instance="n"}'' "0x3 1x10")
     ] "10m" none)
-    (case "ClevisBindingMissing"
+    (case "TpmBindingMissing"
       [
-        (s ''cluster_boot_clevis_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "0x30")
+        (s ''cluster_boot_tpm_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "0x30")
       ]
       "20m"
       [
@@ -860,25 +860,8 @@ let
       ]
     )
     # A rebind: unbound for five minutes, then bound again.
-    (case "ClevisBindingMissing" [
-      (s ''cluster_boot_clevis_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x5 0x5 1x20")
-    ] "20m" none)
-    (case "ClevisBoundToUnpinnedTang"
-      [
-        (s ''cluster_boot_clevis_unpinned_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x30")
-      ]
-      "20m"
-      [
-        {
-          instance = "n";
-          device = "/dev/disk/by-partlabel/disk-nvme1-luks";
-          severity = "critical";
-        }
-      ]
-    )
-    # A --replace rebind: the old slot lingers for minutes, then goes.
-    (case "ClevisBoundToUnpinnedTang" [
-      (s ''cluster_boot_clevis_unpinned_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x5 0x25")
+    (case "TpmBindingMissing" [
+      (s ''cluster_boot_tpm_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x5 0x5 1x20")
     ] "20m" none)
     (case "CoreDumpsNotOff" [ (s ''cluster_core_pattern_ok{instance="n"}'' "0x30") ] "20m" [
       (crit "warning")
@@ -893,19 +876,21 @@ let
     ] "5m" none)
     # Scoped to nodes that have not opted out, and still firing when the boot report
     # never ran at all (no cluster_boot_insecure_optout).
-    (case "TangVlanPresent" [ (s ''cluster_tang_vlan_present{instance="n"}'' "1x10") ] "5m" [
-      (crit "critical")
-    ])
-    (case "TangVlanPresent" [
-      (s ''cluster_tang_vlan_present{instance="n"}'' "1x10")
-      (s ''cluster_boot_insecure_optout{instance="n"}'' "0x10")
-    ] "5m" [ (crit "critical") ])
-    (case "TangVlanPresent" [
-      (s ''cluster_tang_vlan_present{instance="n"}'' "1x10")
-      (s ''cluster_boot_insecure_optout{instance="n"}'' "1x10")
-    ] "5m" none)
-    (case "TangVlanPresent" [ (s ''cluster_tang_vlan_present{instance="n"}'' "0x10") ] "5m" none)
     (case "EspNotMounted" [ (s ''cluster_esp_mounted{instance="n",esp="/boot-fallback"}'' "0x30") ]
+      "20m"
+      [
+        {
+          instance = "n";
+          esp = "/boot-fallback";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "EspNotMounted"
+      [
+        (s ''cluster_esp_mounted{instance="n",esp="/boot-fallback"}'' "0x30")
+        (s ''cluster_boot_insecure_optout{instance="n"}'' "0x30")
+      ]
       "20m"
       [
         {

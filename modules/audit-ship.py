@@ -7,8 +7,7 @@
 # Everything goes through one directory, the spool. A producer writes an event whole and
 # renames it in; only then does it move its own cursor on, so an event it has read is
 # never lost to a crash. The sender deletes a file only once the Worker has taken it
-# (2xx). So a receiver that is down delays the trail and drops nothing, which is the
-# tang-rec-notify pattern of design Appendix N with the spool between the two halves.
+# (2xx). So a receiver that is down delays the trail and drops nothing.
 #
 # What a producer puts in an event is only ever the fields the Worker's allowlist names
 # (workers/cluster-watchdog/src/index.js, SCHEMAS), each cut to the characters it takes.

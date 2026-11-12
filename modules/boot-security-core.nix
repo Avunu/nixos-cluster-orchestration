@@ -4,10 +4,11 @@
 # LUKS devices come from the layout (lib/mk-disk-layout.nix); this adds the initrd that
 # can open them, reachable over the network, patient with a slow human and not stuck on
 # a dead disk, signed by Lanzaboote on both ESPs, and refusing any root filesystem that
-# doesn't hold the volume identity secret. Clevis unlocks it unattended, with the TPM
-# (PCR 7) and Tang together, over a VLAN that exists only in the initrd. Emergency mode
-# burns PCR 7 first, so a shell there can't ask for the key. cluster-boot-seal is how an
-# operator binds it, and refuses every binding someone else could reproduce.
+# doesn't hold the volume identity secret. Each leg opens unattended from a TPM2 slot in
+# its own LUKS header, sealed to PCR 7, and asks for the passphrase when the TPM refuses.
+# Emergency mode burns PCR 7 first, so a shell there can't ask the TPM for the key.
+# cluster-boot-seal is how an operator binds it, and refuses every binding someone else
+# could reproduce.
 #
 # Written this way round so boot behaviour stays testable without clan: the boot
 # VM tests import this module directly with literal values, and
@@ -28,47 +29,14 @@ let
   # Values modules/boot-security.nix leaves undefined until they exist. Reading one
   # that is undefined throws a missing-option error, which would bury the refusal
   # that tells a new site what to do, so anything an assertion can reach asks first.
-  haveVlan = options.cluster.boot.tang.vlanId.isDefined;
-  haveTangAddress = options.cluster.boot.tang.address.isDefined;
   haveEmergencyHash = options.cluster.boot.emergency.passwordHash.isDefined;
   haveIdentityHash = options.cluster.boot.identity.hash.isDefined;
   haveNicModules = options.cluster.boot.network.kernelModules.isDefined;
-  haveTangUrl = options.cluster.boot.tang.url.isDefined;
-  haveThumbprints = options.cluster.boot.tang.thumbprints.isDefined;
 
-  vlanIf = "${cfg.network.trunk.interface}.${toString cfg.tang.vlanId}";
-
-  # Shell shared by cluster-boot-seal's `check` and the boot audit: whether one Tang
-  # sub-JWE of a Clevis token was bound to an advertisement a pinned key signed. A node
-  # nobody rebound after a Tang rotation or reinstall keeps slots for a key that is no
-  # longer pinned, and they unlock only while Tang still holds that key: once
-  # `tang-keys rotate-finish` deletes it, the next boot waits at the prompt. Nothing on
-  # the Tang host can see that, so the node has to.
-  #
-  # clevis-encrypt-tang stores the advertisement's JWKSet in the sub-JWE's protected
-  # header (.clevis.tang.adv), and its verify keys' S256 thumbprints are what
-  # cluster.boot.tang.thumbprints pins (verified_thp checks the same at bind). Returns 0
-  # pinned, 1 not, 2 the header can't be read. Steps, not one pipeline: the audit runs
-  # without pipefail. What it does not do: check the header's signature. It answers "was
-  # this bound before the rotation", not "is this binding genuine"; whoever can write a
-  # LUKS header has better attacks than a forged one.
-  tangPinnedText = ''
-    thumbprints=(${lib.escapeShellArgs (if haveThumbprints then cfg.tang.thumbprints else [ ])})
-    tang_sub_pinned() {
-      local hdr adv ver thps t
-      hdr=$(cut -d. -f1 <<<"$1" | jose b64 dec -i-) || return 2
-      adv=$(jq -ce '.clevis.tang.adv' <<<"$hdr") || return 2
-      ver=$(jose jwk use -i- -r -u verify -o- <<<"$adv") || return 2
-      thps=$(jose jwk thp -i- -a S256 <<<"$ver") || return 2
-      [ -n "$thps" ] || return 2
-      for t in "''${thumbprints[@]}"; do
-        if printf '%s\n' "$thps" | grep -qxF -- "$t"; then
-          return 0
-        fi
-      done
-      return 1
-    }
-  '';
+  # The crypttab option that makes systemd-cryptsetup wait for the TPM, rather than ask
+  # for the passphrase because the TPM's driver had not loaded yet.
+  # lib/mk-disk-layout.nix sets it on every leg.
+  tpmOption = "tpm2-device=auto";
 
   legs = lib.mapAttrsToList (name: v: {
     inherit name;
@@ -193,14 +161,11 @@ let
         pkgs.findutils
         pkgs.gawk
         pkgs.gnugrep
-        pkgs.iproute2
-        pkgs.jose
         pkgs.jq
         pkgs.lvm2
         pkgs.util-linux
       ]
     }
-    ${tangPinnedText}
     bad=0
     # -P, not -L: with -L the paths become /dev/dm-N and it false-alarms. A leg that is gone
     # shows up by its GUID, so it isn't counted: a DEGRADED pool isn't a plaintext one.
@@ -225,8 +190,6 @@ let
         mountpoint -q "$e" && r=1 || r=0
         echo "cluster_esp_mounted{esp=\"$e\"} $r"
       done
-      ip link show ${vlanIf} >/dev/null 2>&1 && r=1 || r=0
-      echo "cluster_tang_vlan_present $r"
       echo "cluster_iommu_groups $(find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
       [ -e /dev/watchdog0 ] && r=1 || r=0
       echo "cluster_watchdog_device $r"
@@ -234,7 +197,7 @@ let
       echo "cluster_core_pattern_ok $r"
       # What the next boot depends on, while there is still time to fix it: a node whose
       # identity secret went missing halts at its next boot, on every generation, and a leg
-      # with no Clevis binding holds that boot at the prompt. Nothing else notices either
+      # with no TPM binding holds that boot at the prompt. Nothing else notices either
       # before the reboot. A leg that is absent is the DEGRADED pool's alert, not this one.
       f=${lib.escapeShellArg cfg.identity.path}
       if [ -f "$f" ] && [ ! -L "$f" ] \
@@ -246,79 +209,21 @@ let
       echo "cluster_volume_identity_ok $r"
       for d in ${lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)}; do
         if [ -e "$d" ] && n=$(cryptsetup luksDump --dump-json-metadata "$d" 2>/dev/null \
-          | jq '[.tokens[] | select(.type == "clevis")] | length') && [ -n "$n" ]; then
-          echo "cluster_boot_clevis_tokens{device=\"$d\"} $n"
-        fi
-        # Slots whose Tang key is no longer pinned; a header that can't be read counts.
-        if [ -e "$d" ] && meta=$(cryptsetup luksDump --dump-json-metadata "$d" 2>/dev/null); then
-          u=0
-          for tok in $(jq -r '.tokens | to_entries[] | select(.value.type=="clevis") | .key' <<<"$meta"); do
-            pinned=1
-            if jwe=$(cryptsetup token export --token-id "$tok" "$d" 2>/dev/null | jq -c .jwe) \
-              && protected=$(jq -r .protected <<<"$jwe" | jose b64 dec -i-) \
-              && subs=$(jq -r '.clevis.sss.jwe[]' <<<"$protected"); then
-              for sub in $subs; do
-                if [ "$(cut -d. -f1 <<<"$sub" | jose b64 dec -i- | jq -r .clevis.pin)" = tang ]; then
-                  tang_sub_pinned "$sub" || pinned=0
-                fi
-              done
-            else
-              pinned=0
-            fi
-            [ "$pinned" = 1 ] || u=$((u + 1))
-          done
-          echo "cluster_boot_clevis_unpinned_tokens{device=\"$d\"} $u"
+          | jq '[.tokens[] | select(.type == "systemd-tpm2")] | length') && [ -n "$n" ]; then
+          echo "cluster_boot_tpm_tokens{device=\"$d\"} $n"
         fi
       done
     } > "$m/boot_audit.prom.tmp"
     mv "$m/boot_audit.prom.tmp" "$m/boot_audit.prom"
   '';
 
-  # Three fixes to stock clevis. The fleet takes all three; a test that needs one taken
-  # out (a mutant, a built-in negative control) asks for exactly that one through
-  # system.build.clevisFor, so it removes nothing else.
-  #
-  # 1. replyFix, required for an unattended unlock. boot.initrd.clevisLuksAskpass
-  #    stores ${config.systemd.package}/lib/systemd/systemd-reply-password in the
-  #    initrd, but pkgs.clevis hard-codes the path from pkgs.systemd.
-  #    config.systemd.package has an `apply` that adds a patch, so the store paths
-  #    differ and every recovered passphrase is thrown away.
-  # 2. maxTime, required for an unattended unlock. nixpkgs carries only
-  #    --connect-timeout 10. A Tang that accepts and goes silent hangs curl forever
-  #    without --max-time. --replace-fail on purpose: a nixpkgs change must break the
-  #    build, not silently lose the timeout.
-  # 3. recoverOnce: one key recovery at Tang per device per boot. Each answer is
-  #    pushed to the kernel keyring, the other leg drops its pending question to try
-  #    that (wrong) passphrase, and the reply Clevis was about to send it is lost;
-  #    stock clevis then recovers the key again. Tang's count of /rec is a signal
-  #    (2 on a normal boot), so the askpass keeps what it recovered and answers the
-  #    device's next question with it. The patch fails the build if it stops applying.
-  clevisFor =
-    {
-      replyFix ? true,
-      maxTime ? true,
-      recoverOnce ? true,
-    }:
-    (if replyFix then pkgs.clevis.override { systemd = config.systemd.package; } else pkgs.clevis)
-    .overrideAttrs
-      (old: {
-        patches = (old.patches or [ ]) ++ lib.optional recoverOnce ./clevis-askpass-recover-once.patch;
-        postPatch =
-          (old.postPatch or "")
-          + lib.optionalString maxTime ''
-            substituteInPlace src/pins/tang/clevis-decrypt-tang \
-              --replace-fail 'curl --connect-timeout 10' 'curl --connect-timeout 5 --max-time 15'
-          '';
-      });
-  clevisFixed = clevisFor { };
-
-  # A closure whose initrd cannot unlock must fail to build, not fail at the boot that
-  # needed it (D16). Every absolute store path the askpass script calls has to be in the
-  # initrd: stock clevis names pkgs.systemd's systemd-reply-password, which isn't, and
-  # then every key it recovers is thrown away. A function of the package, so that
-  # tests/boot-closure.nix can build the negative case directly.
-  initrdContentsFor =
-    clevis:
+  # A closure whose initrd cannot unlock unattended must fail to build, not fail at the boot
+  # that needed it (D16). systemd-cryptsetup opens a leg through libcryptsetup's token
+  # plugin, which loads the TPM libraries at run time, so nothing but the initrd's own file
+  # list says they are there. The plugin's path is also the one whose log line the boot
+  # report counts (modules/boot-report.py). In system.build, so that tests/boot-closure.nix
+  # can build the negative case directly.
+  initrdContents =
     pkgs.runCommand "check-initrd-contents"
       {
         nativeBuildInputs = [
@@ -331,24 +236,24 @@ let
       ''
         f=${config.system.build.initialRamdisk}/initrd
         zstd -dc "$f" | cpio -t --quiet 2>/dev/null | sed 's|^\./||; s|^|/|' > list
-        script=${clevis}/libexec/.clevis-luks-askpass-wrapped
-        [ -s "$script" ] || { echo "MISSING the askpass script itself: $script"; exit 1; }
         bad=0
-        for p in $(grep -aoE '/nix/store/[a-z0-9]{32}-[^ "'"'"':;)]+' "$script" | sort -u); do
-          grep -qxF "$p" list || { echo "MISSING $p"; bad=$((bad + 1)); }
+        for want in \
+          /lib/cryptsetup/libcryptsetup-token-systemd-tpm2.so \
+          /lib/libtss2-esys.so \
+          /lib/libtss2-tcti-device.so; do
+          grep -qF -- "$want" list || { echo "MISSING $want"; bad=$((bad + 1)); }
         done
         [ "$bad" = 0 ]
-        echo "every store path the askpass script calls is in the initrd"
+        echo "the initrd holds the TPM token plugin and the libraries it loads"
         touch $out
       '';
 
   # cluster-boot-seal, Appendix D of the design: what an operator runs on the node to enroll
-  # keys and bind Clevis. Its job is mostly refusing: anything that would seal the disk key
-  # to a PCR 7 that someone else can reproduce. Text, so a test can take a control out.
+  # keys and bind each leg to the TPM. Its job is mostly refusing: anything that would seal
+  # the disk key to a PCR 7 that someone else can reproduce. Text, so a test can take a
+  # control out.
   sealText = ''
     devices=(${lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)})
-    url=${lib.escapeShellArg (if haveTangUrl then cfg.tang.url else "")}
-    ${tangPinnedText}
     identity_path=${lib.escapeShellArg cfg.identity.path}
     identity_hash=${lib.escapeShellArg (if haveIdentityHash then cfg.identity.hash else "")}
     burn_marker=/run/cluster-boot/pcr7-burned
@@ -475,83 +380,53 @@ let
       fi
     }
 
-    # Prints the signing thumbprint if the advertisement's signature checks and the key is
-    # one we pinned. A 200 from /adv proves nothing, so the signature is what counts. The
-    # check has its own `||`: this runs in a command substitution, where errexit is off.
-    verified_thp() {
-      local adv=$1 keys sig thps t
-      keys=$(jose fmt -j- -g payload -y -o- < "$adv")
-      sig=$(printf '%s' "$keys" | jose jwk use -i- -r -u verify -o-)
-      if ! printf '%s' "$sig" | jose jws ver -i "$adv" -k- -a > /dev/null; then
-        echo "refusing: the advertisement's signature does not verify" >&2
-        return 1
-      fi
-      thps=$(printf '%s' "$sig" | jose jwk thp -i- -a S256)
-      for t in "''${thumbprints[@]}"; do
-        if printf '%s\n' "$thps" | grep -qxF -- "$t"; then
-          printf '%s' "$t"
-          return 0
-        fi
-      done
-      echo "refusing: advertisement is not signed by a pinned key: $thps" >&2
-      return 1
+    # How many TPM slots a leg's header holds.
+    tpm_tokens() {
+      cryptsetup luksDump --dump-json-metadata "$1" \
+        | jq '[.tokens[] | select(.type == "systemd-tpm2")] | length'
     }
 
-    # The TPM share alone, no Tang needed. `avc boot reboot` refuses on a 1 here. D24 called
-    # this advisory because it read as failing on healthy nodes; that was the here-string
-    # below, and with printf it reads 0 on a healthy bound node (tests/boot-install.py).
-    # Returns: 0 ok, 1 a share failed or a leg is unbound, 3 can't tell (burned), 4 a slot
-    # is bound to a Tang key that is no longer pinned (and nothing worse).
-    # Every clevis token on every selected device, not just token 0, so a second slot from a
-    # disk swap is seen, and a dead leg is skipped rather than fatal.
-    check_tpm_share() {
+    # Whether a leg's TPM slot opens now: the unseal the next boot's initrd does, against
+    # this boot's PCR 7. Nothing is activated, and stdin is closed so it can never turn
+    # into a passphrase question. The token plugin is systemd's, and cryptsetup finds it
+    # only through the library path.
+    tpm_opens() {
+      LD_LIBRARY_PATH=${config.systemd.package}/lib/cryptsetup \
+        cryptsetup open --test-passphrase --token-only --token-type systemd-tpm2 "$1" 2>&1 < /dev/null
+    }
+
+    # `avc boot reboot` refuses on a 1 here. Returns: 0 every selected leg's TPM slot
+    # opens, 1 one does not or a leg is unbound, 3 can't tell (burned). A dead leg was
+    # skipped by select_devices rather than being fatal.
+    check_tpm() {
       if [ -e "$burn_marker" ]; then
-        echo "BURNED: PCR 7 was burned this boot; the TPM share cannot be checked. Reboot to clear; do not rebind." >&2
+        echo "BURNED: PCR 7 was burned this boot; the TPM binding cannot be checked. Reboot to clear; do not rebind." >&2
         return 3
       fi
-      local d tok jwe protected sub pin prc ok=0 n
+      local d n err ok=0
       for d in "''${selected[@]}"; do
-        n=0
-        for tok in $(cryptsetup luksDump --dump-json-metadata "$d" \
-            | jq -r '.tokens | to_entries[] | select(.value.type=="clevis") | .key'); do
-          n=$((n + 1))
-          jwe=$(cryptsetup token export --token-id "$tok" "$d" | jq -c .jwe)
-          protected=$(jq -r .protected <<<"$jwe" | jose b64 dec -i-)
-          for sub in $(jq -r '.clevis.sss.jwe[]' <<<"$protected"); do
-            pin=$(cut -d. -f1 <<<"$sub" | jose b64 dec -i- | jq -r .clevis.pin)
-            if [ "$pin" = tang ]; then
-              prc=0
-              tang_sub_pinned "$sub" || prc=$?
-              case $prc in
-                0) echo "Tang key pinned: $d token $tok" ;;
-                1)
-                  echo "FAILED: $d token $tok: bound to a Tang key that is not pinned (not in cluster.boot.tang.thumbprints); rebind with --replace" >&2
-                  [ "$ok" = 1 ] || ok=4
-                  ;;
-                *)
-                  echo "FAILED: $d token $tok: its Tang share's header can't be read" >&2
-                  ok=1
-                  ;;
-              esac
-              continue
-            fi
-            [ "$pin" = tpm2 ] || continue
-            # printf, not <<<: a here-string adds a newline, and clevis decrypt then prints
-            # the share and exits 1 anyway, which reads as the TPM refusing (RAN, swtpm).
-            if err=$(printf '%s' "$sub" | clevis decrypt 2>&1 > /dev/null); then
-              echo "OK: $d token $tok"
-            else
-              echo "FAILED: $d token $tok: the TPM refused its share: ''${err##*$'\n'}" >&2
-              ok=1
-            fi
-          done
-        done
-        if [ "$n" = 0 ]; then
-          echo "FAILED: $d has no Clevis binding" >&2
+        if ! n=$(tpm_tokens "$d"); then
+          echo "FAILED: $d: its LUKS header can't be read" >&2
+          ok=1
+        elif [ "$n" = 0 ]; then
+          echo "FAILED: $d has no TPM binding" >&2
+          ok=1
+        elif err=$(tpm_opens "$d"); then
+          echo "OK: $d"
+        else
+          echo "FAILED: $d: its TPM slot does not open: ''${err%%$'\n'*}" >&2
           ok=1
         fi
       done
       return "$ok"
+    }
+
+    # One new TPM slot on a leg, sealed to this boot's PCR 7. The passphrase goes in on
+    # stdin and never on a command line. With --wipe-slot the new slot is written first
+    # and the leg's other TPM slots are removed after it, so a failure loses nothing.
+    tpm_enroll() { # device [--wipe-slot=tpm2]
+      printf %s "$pass" | systemd-cryptenroll --unlock-key-file=/dev/stdin \
+        --tpm2-device=auto --tpm2-pcrs=7 "''${@:2}" "$1"
     }
 
     case "''${1:-}" in
@@ -562,7 +437,7 @@ let
           echo "PCR 7 BURNED this boot (emergency recovery). Reboot to clear; do not rebind."
         fi
         select_devices
-        for d in "''${selected[@]}"; do echo "$d: $(clevis luks list -d "$d" 2>/dev/null || true)"; done
+        for d in "''${selected[@]}"; do echo "$d: $(tpm_tokens "$d" 2>/dev/null || echo unreadable) TPM slot(s)"; done
         need_identity
         echo "identity OK"
         zpool status rpool | grep -E 'state:|crypt-' || true
@@ -581,57 +456,58 @@ let
         ;;
       bind)
         shift
-        adv=""
         replace=0
         want=""
         while [ $# -gt 0 ]; do
           case "$1" in
-            --adv) adv=$2; shift 2 ;;
             --replace) replace=1; shift ;;
             --device) want=$2; shift 2 ;;
             *) echo "unknown argument: $1" >&2; exit 2 ;;
           esac
         done
-        if [ -z "$adv" ]; then
-          echo "--adv is required: stage 2 has no route to Tang" >&2
-          exit 2
-        fi
         need_enforcing
         need_unburned
         need_own_authority_only
         need_identity
         select_devices "$want"
-        thp=$(verified_thp "$adv")
+        # Every leg is looked at before any is touched, so a refusal changes nothing.
+        if [ "$replace" != 1 ]; then
+          for d in "''${selected[@]}"; do
+            if [ "$(tpm_tokens "$d")" != 0 ]; then
+              echo "refusing: $d is already bound; use --replace, or --device for the other leg" >&2
+              exit 1
+            fi
+          done
+        fi
         # The passphrase comes on stdin, with or without a final newline (clan vars get
         # writes none), and never on the command line.
         pass=""
-        IFS= read -r pass || [ -n "$pass" ]
+        IFS= read -r pass || true
         if [ -z "$pass" ]; then
           echo "refusing: no passphrase on stdin" >&2
           exit 2
         fi
-        pin=$(jq -cn --arg u "$url" --arg t "$thp" --arg a "$adv" \
-          '{t:2,pins:{tang:[{url:$u,thp:$t,adv:$a}],tpm2:[{pcr_bank:"sha256",pcr_ids:"7"}]}}')
         for d in "''${selected[@]}"; do
-          old=""
           if [ "$replace" = 1 ]; then
-            old=$(clevis luks list -d "$d" 2>/dev/null | cut -d: -f1 || true)
-          elif [ -n "$(clevis luks list -d "$d" 2>/dev/null || true)" ]; then
-            echo "refusing: $d is already bound; use --replace, or --device for the other leg" >&2
-            exit 1
+            tpm_enroll "$d" --wipe-slot=tpm2
+            # systemd-cryptenroll leaves a slot alone when its policy names the PCR 7 value
+            # this boot has. One that still does not open (a replaced TPM, say) is worth
+            # nothing, so it goes, and the leg gets a fresh one.
+            if ! tpm_opens "$d" > /dev/null; then
+              systemd-cryptenroll --wipe-slot=tpm2 "$d"
+              tpm_enroll "$d"
+            fi
+          else
+            tpm_enroll "$d"
           fi
-          # Bind FIRST, then unbind the old slot, so a bad advertisement loses nothing.
-          # Never `clevis luks regen`: it hard-codes -y and drops thp.
-          printf %s "$pass" | clevis luks bind -y -k - -d "$d" sss "$pin"
-          for s in $old; do clevis luks unbind -f -d "$d" -s "$s"; done
         done
         unset pass
-        check_tpm_share
+        check_tpm
         echo "Bound. Reboot and confirm it unlocks unattended."
         ;;
       check)
         select_devices
-        check_tpm_share
+        check_tpm
         ;;
       # What the next boot's identity check will find. avc boot reboot refuses on a 1.
       identity)
@@ -639,7 +515,7 @@ let
         echo "identity OK"
         ;;
       *)
-        echo "usage: cluster-boot-seal status|enroll|bind --adv FILE [--replace] [--device DEV]|check|identity" >&2
+        echo "usage: cluster-boot-seal status|enroll|bind [--replace] [--device DEV]|check|identity" >&2
         exit 2
         ;;
     esac
@@ -650,14 +526,12 @@ let
     pkgs.writeShellApplication {
       name = "cluster-boot-seal";
       runtimeInputs = [
-        cfg.clevisPackage
         config.boot.zfs.package
         config.systemd.package
         pkgs.coreutils
         pkgs.cryptsetup
         pkgs.gawk
         pkgs.gnugrep
-        pkgs.jose
         pkgs.jq
         pkgs.openssl
         pkgs.sbctl
@@ -760,32 +634,9 @@ in
           description = "On-link gateway for address4.";
         };
       };
-      trunk.interface = mkOption {
-        type = types.str;
-        description = "Parent NIC of the Tang VLAN.";
-      };
       kernelModules = mkOption {
         type = types.nonEmptyListOf types.str;
         description = "NIC drivers for the initrd. Hardware-specific and not detectable at eval.";
-      };
-    };
-
-    tang = {
-      url = mkOption {
-        type = types.str;
-        description = "Pin target, used by the seal tool. An IP literal: the initrd has no DNS.";
-      };
-      thumbprints = mkOption {
-        type = types.nonEmptyListOf types.str;
-        description = "Signing key thumbprints the seal tool accepts.";
-      };
-      vlanId = mkOption {
-        type = types.int;
-        description = "The Tang VLAN, which exists only in the initrd.";
-      };
-      address = mkOption {
-        type = types.str;
-        description = "This node's address on the Tang VLAN, in CIDR form.";
       };
     };
 
@@ -800,18 +651,11 @@ in
       };
     };
 
-    clevisPackage = mkOption {
-      type = types.package;
-      default = clevisFixed;
-      defaultText = lib.literalMD "clevis with the systemd and `--max-time` fixes";
-      description = "Tests override this with stock clevis to prove the hang.";
-    };
-
     sealPackage = mkOption {
       type = types.package;
       internal = true;
       default = sealPackageFor sealText;
-      defaultText = lib.literalMD "`cluster-boot-seal`, built from the configured devices, Tang and identity";
+      defaultText = lib.literalMD "`cluster-boot-seal`, built from the configured devices and identity";
       description = "The seal tool. Internal: a test mutant replaces it to take one refusal out.";
     };
 
@@ -832,9 +676,14 @@ in
     # person running a site. tests/security-policy.nix holds both sets.
     assertions = [
       {
-        assertion =
-          config.boot.initrd.clevisLuksAskpass.enable && config.boot.initrd.clevisLuksAskpass.useTang;
-        message = "cluster.boot: boot.initrd.clevisLuksAskpass needs enable and useTang: the unlock is the TPM and Tang together.";
+        assertion = lib.all (d: lib.elem tpmOption d.crypttabExtraOpts) (
+          lib.attrValues config.boot.initrd.luks.devices
+        );
+        message = "cluster.boot: every LUKS device needs ${tpmOption} in its crypttab options, or a leg can ask for the passphrase before the TPM is there to answer.";
+      }
+      {
+        assertion = config.boot.initrd.systemd.tpm2.enable;
+        message = "cluster.boot: boot.initrd.systemd.tpm2.enable must stay on: the initrd opens each leg from its TPM slot.";
       }
       {
         assertion = config.boot.lanzaboote.enable;
@@ -877,13 +726,9 @@ in
         message = "cluster.boot: flushBeforeStage2 has to stay on, or initrd addresses reach stage 2.";
       }
       {
-        assertion = !haveVlan || builtins.stringLength vlanIf <= 15;
-        message = "cluster.boot: <trunk>.<vlanId> is over the kernel's 15 characters for an interface name.";
-      }
-      {
         # Without these the initrd would have no network and nothing else would say so.
-        assertion = haveVlan && haveTangAddress && haveNicModules;
-        message = "cluster.boot: tang.vlanId, tang.address and network.kernelModules must be set.";
+        assertion = haveNicModules;
+        message = "cluster.boot: network.kernelModules must be set.";
       }
     ];
 
@@ -919,14 +764,13 @@ in
     # Build gates: a closure that could not unlock, or would not fit the ESP, fails to build
     # on the node and in CI, so a pull deploy never activates it (D16).
     system.checks = [
-      (initrdContentsFor cfg.clevisPackage)
+      initrdContents
       (espBudgetFor 1024)
     ];
     system.build = {
       inherit
-        clevisFor
         espBudgetFor
-        initrdContentsFor
+        initrdContents
         auditText
         sealText
         sealPackageFor
@@ -952,10 +796,7 @@ in
     ];
 
     boot.initrd = {
-      kernelModules = [
-        "8021q"
-        "dm_crypt"
-      ];
+      kernelModules = [ "dm_crypt" ];
       availableKernelModules = [
         "tpm_tis"
         "tpm_crb"
@@ -985,20 +826,10 @@ in
           text = cfg.identity.hash + "\n";
         };
 
-        # The WAN NIC is how an operator reaches the prompt: /32 and an on-link
-        # gateway, like stage 2. The trunk NIC carries only the Tang VLAN here, and
-        # vlan-teardown below removes it before stage 2. RequiredForOnline is `no` on the
-        # WAN NIC because an unlock must not wait for a network it does not use, and
-        # `routable` on the VLAN because Clevis waits for network-online.target.
-        network = lib.mkIf (haveVlan && haveTangAddress) {
+        # The WAN NIC is how an operator reaches the prompt: /32 and an on-link gateway,
+        # like stage 2. Nothing in the unlock uses the network, so nothing waits for it.
+        network = {
           enable = true;
-          netdevs."20-${vlanIf}" = {
-            netdevConfig = {
-              Name = vlanIf;
-              Kind = "vlan";
-            };
-            vlanConfig.Id = cfg.tang.vlanId;
-          };
           networks."30-wan" = {
             matchConfig.Name = cfg.network.wan.interface;
             address = [ "${cfg.network.wan.address4}/32" ];
@@ -1011,20 +842,15 @@ in
             networkConfig.LinkLocalAddressing = "no";
             linkConfig.RequiredForOnline = "no";
           };
-          # 35, not 40: nixpkgs copies stage 2's `networking.interfaces` into the initrd as
-          # 40-<name>, and the first file in sort order matching a link wins.
-          networks."35-trunk" = {
-            matchConfig.Name = cfg.network.trunk.interface;
-            vlan = [ vlanIf ];
-            networkConfig.LinkLocalAddressing = "no";
-            linkConfig.RequiredForOnline = "carrier";
-          };
-          networks."50-${vlanIf}" = {
-            matchConfig.Name = vlanIf;
-            address = [ cfg.tang.address ];
-            networkConfig.LinkLocalAddressing = "no";
-            linkConfig.RequiredForOnline = "routable";
-          };
+        };
+
+        # systemd-cryptsetup says nothing at its usual log level when a TPM slot opens a
+        # leg: "Volume <name> activated with a LUKS token." is a debug line, and it is the
+        # one modules/boot-report.py counts. Debug costs about 200 journal lines a leg per
+        # boot, and none of them holds the passphrase (tests/boot-fallback.py looks).
+        services."systemd-cryptsetup@" = {
+          overrideStrategy = "asDropin";
+          environment.SYSTEMD_LOG_LEVEL = "debug";
         };
 
         # nixpkgs' import loops 60s, tries once more, then exits 1, and is not ordered
@@ -1153,35 +979,11 @@ in
           script = "systemctl reset-failed 'systemd-cryptsetup@*.service'";
         };
 
-        # flushBeforeStage2 only sets KeepConfiguration=no. A VLAN link that no stage-2
-        # .network matches stays up, with its address, into stage 2. So the initrd deletes
-        # it, once the root is known good and before anything from the root runs. Without
-        # this, "the Tang VLAN exists only in the initrd" is false, and anything on the node
-        # could reach Tang.
-        services.vlan-teardown = lib.mkIf haveVlan {
-          description = "Remove the Tang VLAN before leaving the initrd";
-          unitConfig.DefaultDependencies = false;
-          after = [
-            "volume-identity-check.service"
-            "initrd-fs.target"
-          ];
-          before = [
-            "initrd.target"
-            "initrd-cleanup.service"
-          ];
-          wantedBy = [ "initrd.target" ];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "/bin/ip link del ${vlanIf}";
-          };
-        };
-
         # Under enforcing Secure Boot a failed /sysroot mount lands in emergency mode in the
-        # genuine initrd, with PCR 7 intact and Tang reachable. Whoever gets a shell there
-        # can ask Clevis for the real disk key, and the emergency password's hash is on the
-        # ESP for anyone to crack. So PCR 7 is extended before any shell can start, and the
-        # TPM refuses its share for the rest of the boot. The next boot is unattended again.
+        # genuine initrd, with PCR 7 intact. Whoever gets a shell there can ask the TPM for
+        # the real disk key, and the emergency password's hash is on the ESP for anyone to
+        # crack. So PCR 7 is extended before any shell can start, and the TPM refuses to
+        # unseal for the rest of the boot. The next boot is unattended again.
         #
         # requiredBy, so a burn that fails (no TPM to reach) keeps the local shell from
         # starting: recovery is then initrd SSH, which stays up. wants as well as after,
@@ -1226,11 +1028,12 @@ in
           '';
         };
 
-        # A passphrase, typed or recovered by Clevis, is cached as a `user cryptsetup` key in
-        # root's keyring, and stays there for about two minutes into stage 2. Nothing in
-        # stage 2 needs it. `keyctl purge` searches only the caller's session keyring tree,
-        # and a service gets a private session keyring by default, which would make this a
-        # silent no-op. KeyringMode=shared links root's user keyring into it.
+        # A typed passphrase is cached as a `user cryptsetup` key in root's keyring, which is
+        # how one answer opens both legs, and it stays there for about two minutes into
+        # stage 2. Nothing in stage 2 needs it. `keyctl purge` searches only the caller's
+        # session keyring tree, and a service gets a private session keyring by default,
+        # which would make this a silent no-op. KeyringMode=shared links root's user keyring
+        # into it.
         services.initrd-keyring-purge = {
           description = "Remove the cached LUKS passphrase from root's keyring";
           unitConfig.DefaultDependencies = false;
@@ -1250,15 +1053,6 @@ in
           };
           script = "${pkgs.keyutils}/bin/keyctl purge user cryptsetup || true";
         };
-      };
-
-      # Clevis answers the password queries in parallel with the prompt, from tokens in
-      # the LUKS headers, so the prompt never waits for it and no JWE sits on the ESP. The
-      # binding is the TPM (PCR 7) and Tang together, made by cluster-boot-seal.
-      clevisLuksAskpass = {
-        enable = true;
-        useTang = true;
-        package = cfg.clevisPackage;
       };
 
       network = {

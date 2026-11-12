@@ -2,7 +2,7 @@
 #
 # A node either carries a reason in `topology.nodes.<n>.insecurePlaintextBoot`, or
 # its evaluation fails unless the RESULTING configuration has LUKS under the pool,
-# Lanzaboote, Clevis and the rest. The assertions below read results, not intent,
+# Lanzaboote, a TPM slot on every leg and the rest. The assertions below read results, not intent,
 # so a host file that swaps `disko.devices` for a plain layout or forces
 # `boot.lanzaboote.enable = false` fails too. tests/security-policy.nix proves each
 # of them, one forced control at a time.
@@ -25,7 +25,6 @@
   topology,
   node,
   nodeName,
-  clusterLib,
   clusterSite,
   ...
 }:
@@ -36,9 +35,6 @@ let
 
   gens = config.clan.core.vars.generators;
   security = topology.security or { };
-  tang = security.tang or { };
-  tangIp = node.tangIp or null;
-  tangSubnet = tang.subnet or null;
   nicModules = node.initrdNicModules or [ ];
 
   # Every refusal names the way out, so a new site is never left guessing. Each
@@ -51,47 +47,6 @@ let
       + "A node that may hold plaintext instead sets"
       + " topology.nodes.${nodeName}.insecurePlaintextBoot = \"<reason>\".";
   };
-
-  # ── address checks ────────────────────────────────────────────────────────
-  # clusterLib's arithmetic assumes well-formed input, and these fields come from a
-  # hand-written topology. No leading zeros, because lib.toInt refuses them.
-  octet = "(0|[1-9][0-9]{0,2})";
-  isIp4 =
-    s:
-    let
-      m =
-        if builtins.isString s then builtins.match "${octet}\\.${octet}\\.${octet}\\.${octet}" s else null;
-    in
-    m != null && lib.all (o: lib.toInt o <= 255) m;
-  isCidr4 =
-    s:
-    let
-      m = if builtins.isString s then builtins.match "([^/]+)/(0|[1-9][0-9]?)" s else null;
-    in
-    m != null && isIp4 (builtins.head m) && lib.toInt (lib.last m) <= 32;
-  # Exactly http://<ipv4>:<port>. The port is not optional: the Tang socket is not on
-  # 80 in anything this repo ships, and a URL that fell back to 80 would only show up
-  # as an unlock that cannot reach Tang.
-  tangUrlIsIpLiteral =
-    let
-      m =
-        if builtins.isString (tang.url or null) then
-          builtins.match "http://([^/:]+):([1-9][0-9]{0,4})" tang.url
-        else
-          null;
-    in
-    m != null && isIp4 (builtins.head m) && lib.toInt (lib.last m) <= 65535;
-
-  # What the Tang VLAN must not collide with. Its addresses are routed only in the
-  # initrd, so an overlap would not show up as a stage-2 failure: it would show up
-  # as an unlock that cannot reach Tang, or as Tang traffic going somewhere else.
-  otherSubnets = lib.filter isCidr4 (
-    lib.mapAttrsToList (_: v: v.subnet or null) (topology.vlans or { })
-    ++ [
-      (topology.mesh.subnet or null)
-      (topology.privateServices or null)
-    ]
-  );
 
   # ── disk layout ───────────────────────────────────────────────────────────
   # Each disk's own content plus each of its partitions' content: a pool leg can be
@@ -257,17 +212,7 @@ in
             address4 = node.publicIp4;
             gateway4 = node.publicGw4;
           };
-          trunk.interface = node.vrackInterface;
           kernelModules = lib.mkIf (nicModules != [ ]) nicModules;
-        };
-        tang = {
-          url = lib.mkIf (tang ? url) tang.url;
-          thumbprints = lib.mkIf (tang ? thumbprints) tang.thumbprints;
-          # Not a type error for the core to trip over: the assertion below says what to do.
-          vlanId = lib.mkIf (builtins.isInt (tang.vlanId or null)) tang.vlanId;
-          address = lib.mkIf (
-            tangIp != null && isCidr4 tangSubnet
-          ) "${tangIp}/${toString (clusterLib.cidrPrefix tangSubnet)}";
         };
         install = {
           identitySecretFile = gens.volume-identity.files.secret.path;
@@ -341,7 +286,7 @@ in
         )
 
         # Same reasoning: every signed generation must carry the burn. A generation without
-        # it hands whoever reaches its emergency shell the disk key, through Clevis, until the
+        # it hands whoever reaches its emergency shell the disk key, from the TPM, until the
         # signing keys change. requiredBy is the part that keeps a shell from starting when
         # the burn could not run.
         (refuseUnless
@@ -356,24 +301,19 @@ in
               "rescue.service"
             ]
           )
-          "boot.initrd.systemd.services.emergency-pcr-burn must run, and be required by emergency.service and rescue.service: without it an initrd shell can ask Clevis for the disk key."
-        )
-        # The Tang VLAN must exist only in the initrd, or anything running on the node can
-        # reach Tang, and Tang is half of the disk key.
-        (refuseUnless
-          (
-            let
-              teardown = config.boot.initrd.systemd.services.vlan-teardown or null;
-            in
-            teardown != null && teardown.enable && lib.elem "initrd.target" teardown.wantedBy
-          )
-          "boot.initrd.systemd.services.vlan-teardown must run: flushBeforeStage2 alone leaves the Tang VLAN up in stage 2."
+          "boot.initrd.systemd.services.emergency-pcr-burn must run, and be required by emergency.service and rescue.service: without it an initrd shell can ask the TPM for the disk key."
         )
 
         # ── unlock ────────────────────────────────────────────────────────────
+        # Read from what the initrd's crypttab will hold, not from the layout that set it.
         (refuseUnless
-          (config.boot.initrd.clevisLuksAskpass.enable && config.boot.initrd.clevisLuksAskpass.useTang)
-          "boot.initrd.clevisLuksAskpass.enable and useTang must be true: the unlock needs both the TPM and Tang."
+          (lib.all (d: lib.elem "tpm2-device=auto" d.crypttabExtraOpts) (
+            lib.attrValues config.boot.initrd.luks.devices
+          ))
+          "boot.initrd.luks.devices has a device without tpm2-device=auto in crypttabExtraOpts: that leg can ask for the passphrase before the TPM is there to answer."
+        )
+        (refuseUnless config.boot.initrd.systemd.tpm2.enable
+          "boot.initrd.systemd.tpm2.enable must be true: without it the initrd cannot open a leg from its TPM slot."
         )
         # A crypt(3) hash, so never `true` (no password at all) and never "": nixpkgs
         # treats any string as access granted, and writes it as root's password
@@ -391,10 +331,6 @@ in
           "boot.initrd.systemd.emergencyAccess must be a crypt(3) hash: anything else is a shell with no password, or none at all."
         )
         (refuseUnless config.boot.initrd.network.flushBeforeStage2 "boot.initrd.network.flushBeforeStage2 must be true: initrd addresses must not leak into stage 2.")
-        (refuseUnless (
-          builtins.stringLength "${config.cluster.boot.network.trunk.interface}.${toString (tang.vlanId or "")}"
-          <= 15
-        ) "the Tang VLAN's interface name <trunk>.<vlanId> is over the kernel's 15 characters.")
 
         # ── generated values ──────────────────────────────────────────────────
         (refuseUnless (
@@ -404,36 +340,6 @@ in
         ) "boot vars are missing. Run: clan vars generate ${nodeName}, then git add vars secrets.")
 
         # ── topology ──────────────────────────────────────────────────────────
-        (refuseUnless (
-          tang ? url && tang ? thumbprints && tang ? vlanId && tang ? subnet
-        ) "topology.security.tang must set url, thumbprints, vlanId and subnet.")
-        (refuseUnless tangUrlIsIpLiteral "topology.security.tang.url must be http://<ipv4>:<port>: the initrd has no DNS.")
-        (refuseUnless
-          (
-            builtins.isList (tang.thumbprints or null)
-            && tang.thumbprints != [ ]
-            && lib.all (t: builtins.isString t && builtins.match "[A-Za-z0-9_-]{43}" t != null) tang.thumbprints
-          )
-          "topology.security.tang.thumbprints must be a non-empty list of S256 thumbprints: copy them from the Tang host."
-        )
-        (refuseUnless (
-          builtins.isInt (tang.vlanId or null) && tang.vlanId >= 1 && tang.vlanId <= 4094
-        ) "topology.security.tang.vlanId must be a VLAN id, 1 to 4094.")
-        # modules/overlay-network.nix makes <trunk>.<vlans.X.id> in stage 2 on the same trunk,
-        # so the same id would bring the Tang VLAN's segment straight back up after
-        # vlan-teardown removed it, and "only in the initrd" would be false.
-        (refuseUnless (
-          !lib.elem (tang.vlanId or null) (
-            lib.mapAttrsToList (_: v: v.id or null) (topology.vlans or { })
-          )
-        ) "topology.security.tang.vlanId is also a vlans.*.id: the Tang VLAN must exist only in the initrd.")
-        (refuseUnless (isCidr4 tangSubnet) "topology.security.tang.subnet must be an IPv4 CIDR.")
-        (refuseUnless (
-          isCidr4 tangSubnet && !lib.any (clusterLib.cidrsOverlap tangSubnet) otherSubnets
-        ) "topology.security.tang.subnet overlaps vlans, mesh.subnet or privateServices.")
-        (refuseUnless (
-          isCidr4 tangSubnet && isIp4 tangIp && clusterLib.cidrContains tangSubnet tangIp
-        ) "tangIp must be an address inside topology.security.tang.subnet.")
         (refuseUnless (builtins.isList nicModules && nicModules != [ ])
           "initrdNicModules must list the initrd's NIC drivers: they are hardware-specific and cannot be detected at eval."
         )

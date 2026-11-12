@@ -48,21 +48,9 @@
     # mtu = 8920;    # the default: vlans.control.mtu - 80, WireGuard's largest overhead.
   };
 
-  # Disk encryption and unattended unlock. A node that sets none of this does not
-  # evaluate, unless it opts out (see `insecurePlaintextBoot` below).
+  # Disk encryption and unattended unlock need nothing here: each node's disks unlock
+  # from its own TPM, and its boot fields are under `nodes` below.
   security = {
-    tang = {
-      # An IP literal, because the initrd has no DNS. The port is the Tang host's
-      # cluster.tangServer.port, 7654 by default.
-      url = "http://10.40.0.1:7654";
-      # The Tang server's signing key thumbprints: copy them from the Tang host
-      # after `tang-keys init`. Public data. A node refuses this placeholder.
-      thumbprints = [ "REPLACE-ME" ];
-      # A VLAN that exists only in the initrd, and its subnet, which must not overlap
-      # `vlans`, `mesh.subnet` or `privateServices`.
-      vlanId = 40;
-      subnet = "10.40.0.0/28";
-    };
     # initrdSshPort = 2222;    # not 22: the initrd host key is a different key.
     # nomadTlsRotation = 0;    # bump to reissue every Nomad agent certificate.
   };
@@ -134,7 +122,7 @@
       fqdn = "node1.example.com";
       # The canary: each new boot stack (a nixpkgs, kernel, Lanzaboote, clan or library
       # bump) activates here first, and every other node waits until this one has been
-      # rebooted into it, with someone watching, and unlocked by Clevis on its own. Exactly
+      # rebooted into it, with someone watching, and unlocked from its TPM on its own. Exactly
       # one node, a real one with boot security. README.md, "Deploying".
       canary = true;
       deployHost = "192.0.2.11"; # SSH target
@@ -160,9 +148,7 @@
       wanInterface = "eth0";
       vrackInterface = "eth1"; # the private VLAN trunk
 
-      # This node's address on the Tang VLAN, inside security.tang.subnet.
-      tangIp = "10.40.0.11";
-      # Kernel modules for both NICs in the initrd. Hardware-specific and not
+      # Kernel modules for the WAN NIC in the initrd. Hardware-specific and not
       # detectable at evaluation, so this node refuses to evaluate until you fill it
       # in, e.g. [ "igb" "mlx5_core" ]. `lspci -k` on the node names them.
       initrdNicModules = [ ];

@@ -7,7 +7,6 @@ base
 // {
   nodes = base.nodes // {
     node1 = builtins.removeAttrs base.nodes.node1 [ "insecurePlaintextBoot" ] // {
-      tangIp = "10.40.0.11";
       initrdNicModules = [
         "virtio_net"
       ];

@@ -1,4 +1,4 @@
-"""`avc audit`: the Worker's AUDIT_TOKENS and TANG_CLIENTS, from each node's own vars."""
+"""`avc audit`: the Worker's AUDIT_TOKENS, from each node's own vars."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+from avc import actions
 from avc.core import vars as clanvars
 from avc.errors import AvcError
 from avc.flows import audit
@@ -16,10 +17,10 @@ from avc.flows import audit
 def fleet(ctx, index, monkeypatch):
     base = index.nodes["node1"]
     nodes = {
-        "node1": {**base, "audit": {"enabled": True, "nomadAcl": True, "tangIp": "10.40.0.11"}},
-        "node2": {**base, "tags": [], "audit": {"enabled": True, "nomadAcl": False, "tangIp": "10.40.0.12"}},
+        "node1": {**base, "audit": {"enabled": True, "nomadAcl": True}},
+        "node2": {**base, "tags": [], "audit": {"enabled": True, "nomadAcl": False}},
         # Opted out with no URL: it ships nothing and has no token.
-        "node3": {**base, "tags": [], "audit": {"enabled": False, "nomadAcl": False, "tangIp": None}},
+        "node3": {**base, "tags": [], "audit": {"enabled": False, "nomadAcl": False}},
     }
     ctx.__dict__["index"] = dataclasses.replace(index, nodes=nodes)
     asked = []
@@ -47,9 +48,13 @@ def test_the_printed_json_is_only_the_tokens(fleet, capsys):
     ctx, _ = fleet
     audit.tokens(ctx)
     out = capsys.readouterr()
-    # stdout is what `wrangler secret put` reads: the reminder about Tang goes to stderr.
+    # stdout is what `wrangler secret put` reads: the whole of it is the secret, as it is.
     assert json.loads(out.out) == audit.audit_tokens(ctx)
-    assert "tang" in out.err and "tang" not in out.out
+    assert out.err == ""
+
+
+def test_tokens_is_the_only_audit_command():
+    assert [a.name for a in actions.in_group("audit")] == ["tokens"]
 
 
 def test_two_nodes_with_one_token_are_refused(fleet, monkeypatch):
@@ -64,9 +69,3 @@ def test_an_empty_token_is_refused(fleet, monkeypatch):
     monkeypatch.setattr(clanvars, "get_value", lambda root, m, v: "\n")
     with pytest.raises(AvcError, match="empty"):
         audit.audit_tokens(ctx)
-
-
-def test_tang_clients_map_each_tang_address_to_its_node(fleet, capsys):
-    ctx, _ = fleet
-    audit.tang_clients(ctx)
-    assert json.loads(capsys.readouterr().out) == {"10.40.0.11": "node1", "10.40.0.12": "node2"}

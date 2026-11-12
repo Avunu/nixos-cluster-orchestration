@@ -103,10 +103,10 @@ in
       message = "topology: deploy.withoutCanary must be a non-empty reason, and only on a site with no canary node.";
     }
     {
-      # An opted-out canary's boot has no unlock to prove, so it would vouch for a stack it
-      # never ran the Clevis path of.
+      # An opted-out canary's boot has no unlock to prove, so it would vouch for a stack whose
+      # TPM unlock it never ran.
       assertion = canaries == [ ] || !optedOut (lib.head canaries) || lib.all optedOut provisioned;
-      message = "topology: the canary (${toString canaries}) opted out of boot security (insecurePlaintextBoot) while other nodes did not. Its boots cannot prove a Clevis unlock; make a node with boot security the canary.";
+      message = "topology: the canary (${toString canaries}) opted out of boot security (insecurePlaintextBoot) while other nodes did not. Its boots cannot prove a TPM unlock; make a node with boot security the canary.";
     }
   ];
 
@@ -149,11 +149,10 @@ in
   cluster.deploy.targetCommand = "nix build --refresh --no-link --print-out-paths ${lib.escapeShellArg toplevel}";
   cluster.deploy.pullInterval = d.pullInterval;
 
-  # Topology-level fields only, so a nixpkgs or kernel bump does not trip the gate.
-  # Tang thumbprints are out on purpose: rotating Tang must not stop a deploy. The keys
-  # are a hash so that the contract holds no key material and stays comparable. All of
-  # this is read only when the toplevel is built, after the assertions in
-  # modules/boot-security.nix have had their say.
+  # Topology and library settings only, so a nixpkgs or kernel bump does not trip the gate.
+  # The authorized keys are a hash so that the contract holds no key material and stays
+  # comparable. All of this is read only when the toplevel is built, after the assertions
+  # in modules/boot-security.nix have had their say.
   cluster.deploy.bootContract =
     if !boot.enable then
       {
@@ -164,11 +163,15 @@ in
       {
         inherit requiredMounts;
         luksDevices = lib.mapAttrs (_: device: device.device) config.boot.initrd.luks.devices;
+        # What decides how a leg is opened: its crypttab options, where `tpm2-device=auto`
+        # makes systemd-cryptsetup try the TPM slot before it asks, and TPM2 support in the
+        # initrd. A closure without either builds, activates, and waits at the prompt at its
+        # next reboot.
         unlock = {
-          inherit (config.boot.initrd.clevisLuksAskpass) enable useTang;
-        };
-        tang = {
-          inherit (boot.tang) url vlanId address;
+          tpm2 = config.boot.initrd.systemd.tpm2.enable;
+          crypttabExtraOpts = lib.mapAttrs (
+            _: device: device.crypttabExtraOpts
+          ) config.boot.initrd.luks.devices;
         };
         identityHash = boot.identity.hash;
         # Where the initrd looks for the secret, and where the bootloader install reads the
@@ -182,7 +185,6 @@ in
         wan = {
           inherit (boot.network.wan) interface address4 gateway4;
         };
-        trunkInterface = boot.network.trunk.interface;
         initrdKernelModules = boot.network.kernelModules;
         authorizedKeysSha256 = builtins.hashString "sha256" (
           lib.concatStringsSep "\n" (lib.sort lib.lessThan boot.ssh.authorizedKeys)

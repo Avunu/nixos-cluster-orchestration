@@ -6,19 +6,18 @@ PAYLOAD = re.compile(r"FORGED-PAYLOAD-RAN")
 SWITCH_ROOT = re.compile(r"Reached target .*Switch Root")
 LINUX = re.compile(r"Linux version")
 VERDICT = re.compile(r"volume-identity: MISMATCH|FORGED-PAYLOAD-RAN")
-STOLEN = re.compile(r"STOLEN-KEY-([ab])=([0-9a-f]{64})")
-EK_KEY = re.compile(r"EK-KEY=([0-9a-f]{64})")
+# What the TPM said when asked to open a copy of a real LUKS header: from the forged root's
+# payload, per leg, and from the emergency shell.
+PAYLOAD_ANSWER = re.compile(r"TPM-ANSWER-([ab])=(opened|refused)")
+SHELL_ANSWER = re.compile(r"SHELL-ANSWER=(opened|refused)")
 BURNED = re.compile(r"emergency-pcr-burn: PCR 7 burned")
 BURN_FAILED = re.compile(r"Failed to start .*Extend PCR 7|Dependency failed for .*(Emergency|Rescue)")
 EARLY_FAILED = re.compile(r"Failed to start .*Fail before the TPM is up")
 SHELL = re.compile(r"RIGHT-SHELL-42")
 MARKER = re.compile(r"BURN-MARKER-PRESENT")
-# Who owns the extra db entry. Any GUID will do.
-OTHER_GUID = "6c5b8bb0-6c9f-4b55-9d7e-2b0a3e1f4c11"
-
 # Time for firmware and the stub to get to the kernel, generously, on a loaded build machine.
 NO_KERNEL_SECONDS = 90
-# With Tang answering, a binding that still holds unlocks in about 12 seconds of initrd.
+# A binding that still holds opens both legs in the first seconds of the initrd.
 NO_UNLOCK_SECONDS = 45
 
 
@@ -127,8 +126,9 @@ def open_forged():
 
 def payload_text(head):
     """What the attacker puts where the signed command line will run it. It announces itself,
-    and, given stolen tokens, does what Appendix O's attacker does with the genuine initrd's
-    network and TPM: brings the Tang VLAN back up and asks Clevis for the real keys."""
+    and, given copies of the real LUKS headers, asks the TPM to open each one. The genuine boot
+    chain ran to get here, so PCR 7 is the value their slots are sealed to. The answer is
+    printed from a variable, so that the text of this script can never be taken for one."""
     return "\n".join(
         [
             head,
@@ -140,14 +140,12 @@ def payload_text(head):
             "  mount -t devtmpfs devtmpfs /dev 2>/dev/null",
             "  for d in /nix/store/*/bin; do PATH=$PATH:$d; done",
             "  export PATH",
-            f"  ip link add link {TRUNK} name {TANG_VLAN} type vlan id {VLAN_ID} 2>/dev/null",
-            f"  ip addr add {TANG_NODE_ADDRESS}/{TANG_PREFIX} dev {TANG_VLAN} 2>/dev/null",
-            f"  ip link set {TRUNK} up; ip link set {TANG_VLAN} up",
-            "  sleep 3",
             "  for l in a b; do",
+            "    said=refused",
+            f"    {tpm_opens('/stolen/$l.hdr')} && said=opened",
             # Standard output reaches the serial log through the unit's journal+console.
             # /dev/console doesn't: with console=tty0 last, it is the first VT.
-            "    echo \"STOLEN-KEY-$l=$(clevis decrypt < /stolen/$l.jwe 2>/dev/null | sha256sum | cut -d' ' -f1)\"",
+            "    echo \"TPM-ANSWER-$l=$said\"",
             "  done",
             "fi",
             "exit 1",
@@ -160,20 +158,19 @@ def forge(base):
     """The attacker's workbench. Their disks copy everything public about the real ones (the
     LUKS UUIDs, the pool's GUID, the partition labels, a byte copy of the ESP) and hold the
     same signed closure, with a payload where the signed command line will run it from, in the
-    default entry and in `nocheck`. They know the secret's length, not its value. The Clevis
-    tokens in the LUKS headers are public, so they keep them before they wipe. The real GUID is
-    read with the real passphrase here, which is more than an attacker needs: pool GUIDs aren't
-    what stops them."""
+    default entry and in `nocheck`. They know the secret's length, not its value. A LUKS
+    header is public, TPM slot and all, so they keep a copy of each before they wipe. The real
+    GUID is read with the real passphrase here, which is more than an attacker needs: pool
+    GUIDs aren't what stops them."""
     disks = new_case(base=base)
     installer_up(disks)
     installer.succeed("mkdir -p /stolen")
     for name, device in sorted(LUKS_DEVICES.items()):
+        copy = f"/stolen/{name[-1]}.hdr"
         installer.succeed(
-            f"tok=$(cryptsetup luksDump --dump-json-metadata {device} "
-            "| jq -r '.tokens | to_entries[] | select(.value.type == \"clevis\") | .key' | head -n 1); "
-            f"[ -n \"$tok\" ] && cryptsetup token export --token-id $tok {device} "
-            "| jq -j '.jwe | .protected+\".\"+.encrypted_key+\".\"+.iv+\".\"+.ciphertext+\".\"+.tag' "
-            f"> /stolen/{name[-1]}.jwe && test -s /stolen/{name[-1]}.jwe"
+            f"cryptsetup luksHeaderBackup {device} --header-backup-file {copy}",
+            f"cryptsetup luksDump --dump-json-metadata {copy} "
+            "| jq -e '[.tokens[] | select(.type == \"systemd-tpm2\")] | length == 1'",
         )
     open_real()
     guid = installer.succeed("zpool get -H -o value guid rpool").strip()
@@ -244,25 +241,25 @@ def forged_identity_mismatch(forged, firmware):
     power_off()
 
 
-def forged_control_nocheck_steals_keys(forged, firmware, keys):
+def forged_control_nocheck_steals_keys(forged, firmware):
     """The built-in negative control: the same forged disks, through the signed `nocheck` entry,
     which the unsigned loader.conf selects. Without the identity check the payload runs inside
-    the genuine initrd, with PCR 7 intact and Tang reachable, and Clevis hands it the real keys.
-    If it doesn't, this attack wasn't reproduced and the check above has proven nothing."""
+    the genuine boot, with PCR 7 intact, and the TPM opens both real headers for it: opening a
+    header's slot is having the key to the data it was copied from. If it doesn't, this attack
+    wasn't reproduced and the check above has proven nothing."""
     disks = new_case(base=forged)
     select_entry(disks, "nocheck")
     boot(disks, firmware=new_firmware(firmware))
     type_until_console(target, serial(), ATTACKER, PAYLOAD)
     deadline = time.monotonic() + 90
-    stolen = {}
-    while time.monotonic() < deadline and len(stolen) < 2:
-        stolen = {m.group(1): m.group(2) for m in console_findall(target, STOLEN)}
+    said = {}
+    while time.monotonic() < deadline and len(said) < 2:
+        said = {m.group(1): m.group(2) for m in console_findall(target, PAYLOAD_ANSWER)}
         time.sleep(1)
-    real = {name[-1]: digest for name, digest in keys.items()}
     control(
         "forged-control-nocheck-steals-keys",
-        seen(PAYLOAD) and stolen == real,
-        f"stolen {stolen}, real {real}\n{tail()}",
+        seen(PAYLOAD) and said == {"a": "opened", "b": "opened"},
+        f"the TPM said {said}\n{tail()}",
     )
     power_off()
 
@@ -325,10 +322,9 @@ def identity_stall_does_not_halt(sealed, sealed_firmware):
 
 
 def firmware_changed(name, disks, firmware, reference_pcr7, same_pcr7=False, also=None):
-    """What every change to the firmware's trust must come to: the prompt is there, Tang is up
-    and nothing unlocks, the TPM refuses a JWE sealed to PCR 7 alone, and the passphrase still
-    boots. `also` returns (ok, detail) for what is particular to a case."""
-    before = rec_count()
+    """What every change to the firmware's trust must come to: the prompt is there, nothing
+    unlocks by itself, the TPM still refuses every leg when asked from stage 2, and the
+    passphrase still boots. `also` returns (ok, detail) for what is particular to a case."""
     boot(disks, firmware=firmware)
     stage2 = connecting(target)
     prompt = next_prompt(target, 0, 90, ANY_PROMPT) is not None
@@ -337,7 +333,7 @@ def firmware_changed(name, disks, firmware, reference_pcr7, same_pcr7=False, als
     booted = not unlocked and type_until_stage2(target, serial(), thread=stage2)
     refused, answer, now_pcr7, extra_ok, extra = False, "", "", False, ""
     if booted:
-        rc, answer = tpm_only_answer()
+        rc, answer = tpm_answer()
         refused = rc != 0
         now_pcr7 = pcr7()
         extra_ok, extra = also() if also else (True, "")
@@ -345,28 +341,11 @@ def firmware_changed(name, disks, firmware, reference_pcr7, same_pcr7=False, als
     control(
         name,
         prompt and not unlocked and booted and refused and moved and extra_ok and both_legs_online(pool_status()),
-        f"prompt={prompt} unlocked-unattended={unlocked} typed-boot={booted} tpm-only-refused={refused} "
-        f"PCR 7 {reference_pcr7} then {now_pcr7}; Tang key recoveries meanwhile: {rec_count() - before}\n"
+        f"prompt={prompt} unlocked-unattended={unlocked} typed-boot={booted} tpm-refused={refused} "
+        f"PCR 7 {reference_pcr7} then {now_pcr7}\n"
         f"{extra}\nTPM: {answer.strip()[-300:]}",
     )
     power_off()
-
-
-def vars_of(firmware):
-    return firmware / "vars.fd"
-
-
-def other_cert():
-    """A second signer the firmware could be made to trust: a stand-in for Microsoft-signed
-    software, which the enrolled db already trusts on real boards."""
-    work = WORK / "other"
-    if not work.exists():
-        work.mkdir(parents=True)
-        run(
-            OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
-            "-subj", "/CN=another signer", "-keyout", work / "other.key", "-out", work / "other.crt",
-        )
-    return work
 
 
 def sb_toggled_off(bound, firmware, bound_pcr7):
@@ -395,8 +374,7 @@ def keys_cleared(bound, firmware, bound_pcr7):
 
 
 def db_cert_added(bound, firmware, bound_pcr7):
-    fw = new_firmware(firmware)
-    run(VIRT_FW_VARS, "--inplace", vars_of(fw), "--add-db", OTHER_GUID, other_cert() / "other.crt")
+    fw = refusing_firmware(firmware)
     firmware_changed(
         "db-cert-added",
         new_case(base=bound),
@@ -415,12 +393,9 @@ def other_signed_loader(bound, db_firmware):
     disks = new_case(base=bound)
     boot(disks, firmware=fw)
     control("other-signed-loader-rebind-boot", type_until_stage2(target, serial()), "no typed boot")
-    rc, out = bind(fetch_adv(), "--replace")
-    target.succeed(
-        f"echo tpm-canary | clevis encrypt tpm2 '{{\"pcr_bank\":\"sha256\",\"pcr_ids\":\"7\"}}' > {TPM_ONLY}"
-    )
+    rc, out = bind("--replace")
     db_pcr7 = pcr7()
-    control("other-signed-loader-rebound", rc == 0 and set(clevis_tokens().values()) == {1}, f"rc={rc}\n{out}")
+    control("other-signed-loader-rebound", rc == 0 and set(tpm_tokens().values()) == {1}, f"rc={rc}\n{out}")
     power_off()
     # The rebinding holds in that state, so the refusal below is the signer's doing.
     booted, took = boot_unattended(disks, fw)
@@ -462,9 +437,9 @@ def foreign_authority_bind_refused(disks, fw):
     boot(disks, firmware=fw)
     control("foreign-authority-boot", type_until_stage2(target, serial()), "no typed boot")
     target.wait_for_unit("multi-user.target")
-    before = clevis_tokens()
-    rc, out = bind(fetch_adv(), "--replace")
-    after = clevis_tokens()
+    before = tpm_tokens()
+    rc, out = bind("--replace")
+    after = tpm_tokens()
     control(
         "foreign-authority-bind-refused",
         rc != 0
@@ -492,18 +467,20 @@ def tpm_cleared(bound, firmware, bound_pcr7):
 # ── a shell in the genuine initrd ─────────────────────────────────────────
 
 
-def emergency_on_forged(forged, firmware, keys, specialisation):
+def emergency_on_forged(forged, firmware, specialisation):
     """The forged disks with no root dataset, so /sysroot fails to mount and the genuine initrd
     drops to emergency mode under enforcing Secure Boot. The attacker types their own
-    passphrase, then the emergency password (the hash is on the ESP to crack), and asks Clevis
-    for the real key with a stolen token they left on the ESP. Returns (key, burned, detail)."""
+    passphrase, then the emergency password (the hash is on the ESP to crack), and has the
+    initrd's own systemd-cryptsetup open a copy of a real header they left on the ESP, from
+    the TPM alone. Any block device does for the data: the header is what the TPM opens.
+    Returns (what the TPM said, burned, detail)."""
     disks = new_case(base=forged)
     installer_up(disks)
     open_forged()
     installer.succeed(
         "mkdir -p /e",
         "mount /dev/disk/by-partlabel/disk-nvme0-ESP /e",
-        "cp /mnt/stolen/a.jwe /e/stolen-a.jwe",
+        "cp /mnt/stolen/a.hdr /e/stolen-a.hdr",
         "umount /e",
         "umount /mnt",
         "zfs destroy -r rpool/root",
@@ -521,32 +498,32 @@ def emergency_on_forged(forged, firmware, keys, specialisation):
     send(
         "(mkdir -p /e; mount /dev/disk/by-partlabel/disk-nvme0-ESP /e; "
         "for d in /nix/store/*/bin; do PATH=$d:$PATH; done; "
-        f"ip link add link {TRUNK} name {TANG_VLAN} type vlan id {VLAN_ID}; "
-        f"ip addr add {TANG_NODE_ADDRESS}/{TANG_PREFIX} dev {TANG_VLAN}; "
-        f"ip link set {TRUNK} up; ip link set {TANG_VLAN} up; sleep 3; "
-        "echo EK-KEY=$(clevis decrypt < /e/stolen-a.jwe | sha256sum)) > /dev/ttyS0 2>&1"
+        "systemd-cryptsetup attach stolen /dev/disk/by-partlabel/disk-nvme1-ESP - "
+        "header=/e/stolen-a.hdr,tpm2-device=auto,headless=true; "
+        "said=refused; [ -e /dev/mapper/stolen ] && said=opened; "
+        "echo SHELL-ANSWER=$said) > /dev/ttyS0 2>&1"
     )
-    found, match = wait_console_match(target, EK_KEY, 120)
-    key = None
+    found, match = wait_console_match(target, SHELL_ANSWER, 120)
+    said = None
     if found is not None:
-        key = match.group(1)
-    detail = f"emergency: {reached}, key {key}, real {keys['crypt-a']}\n{tail()}"
+        said = match.group(1)
+    detail = f"emergency: {reached}, the TPM said {said}\n{tail()}"
     burned = seen(BURNED)
     power_off()
-    return key, burned, detail
+    return said, burned, detail
 
 
-def emergency_noburn_recovers_key(forged, firmware, keys):
+def emergency_noburn_recovers_key(forged, firmware):
     """The built-in negative control: through the signed `noburn` entry the shell gets the key."""
-    key, _, detail = emergency_on_forged(forged, firmware, keys, "noburn")
-    control("emergency-noburn-recovers-key", key == keys["crypt-a"], detail)
+    said, _, detail = emergency_on_forged(forged, firmware, "noburn")
+    control("emergency-noburn-recovers-key", said == "opened", detail)
 
 
-def emergency_burn_refused(forged, firmware, keys):
+def emergency_burn_refused(forged, firmware):
     """The same, through the default entry. The shell runs (its output is there) and the TPM
     refuses, because PCR 7 was burned before it started."""
-    key, burned, detail = emergency_on_forged(forged, firmware, keys, None)
-    control("emergency-burn-refused", key is not None and key != keys["crypt-a"] and burned, f"burned: {burned}, {detail}")
+    said, burned, detail = emergency_on_forged(forged, firmware, None)
+    control("emergency-burn-refused", said == "refused" and burned, f"burned: {burned}, {detail}")
 
 
 def answer_until_open():
@@ -566,14 +543,15 @@ def answer_until_open():
 
 
 def burn_lasts_one_boot(bound, firmware):
-    """A genuine node that went through emergency mode: Tang down and no gate, so the import
-    gives up and nobody typed. Recovered over SSH, its binding looks broken for the rest of
-    that boot, because PCR 7 is burned. The seal tool must say so and refuse to reseal to the
-    burned value. The next boot unlocks by itself."""
-    stop_tang()
+    """A genuine node whose firmware came to trust one more signer, with no gate: the TPM
+    refuses, nobody types, the import gives up, and it is in emergency mode with PCR 7 burned.
+    Recovered over SSH, it has a binding to redo and a PCR 7 that is not the firmware's. The
+    seal tool must say so and refuse to seal to that value. On the next boot PCR 7 is the
+    firmware's own again, the same rebinding goes through, and the boot after unlocks by
+    itself."""
     disks = new_case(base=bound)
     select_entry(disks, "nogate")
-    fw = new_firmware(firmware)
+    fw = refusing_firmware(firmware)
     boot(disks, firmware=fw)
     reached = wait_console(target, EMERGENCY, 240) is not None
     control("burn-emergency-reached", reached and seen(BURNED), tail())
@@ -582,13 +560,13 @@ def burn_lasts_one_boot(bound, firmware):
     rc, out = initrd_ssh("systemctl restart zfs-import-rpool.service && systemctl --no-block default")
     booted = wait_stage2(target, 180)
     control("burn-recovered-over-ssh", booted, f"{opened}\n{out}")
-    start_tang()
 
-    rc, answer = tpm_only_answer()
-    marker = target.succeed("test -e /run/cluster-boot/pcr7-burned && echo yes || echo no").strip()
-    control("burn-survives-switch-root", marker == "yes" and rc != 0, f"marker {marker}, TPM: {answer}")
-    rc, out = bind(fetch_adv(), "--replace")
-    tokens = clevis_tokens()
+    def marker():
+        return target.succeed("test -e /run/cluster-boot/pcr7-burned && echo yes || echo no").strip()
+
+    burned_marker, burned_pcr7 = marker(), pcr7()
+    rc, out = bind("--replace")
+    tokens = tpm_tokens()
     control(
         "bind-refused-after-burn",
         rc != 0 and "PCR 7 was burned this boot" in out and set(tokens.values()) == {1},
@@ -598,25 +576,38 @@ def burn_lasts_one_boot(bound, firmware):
     control("preflight-reports-burn", rc == 3 and "BURNED" in out, f"rc={rc}\n{out}")
     power_off()
 
-    # The same entry, the same firmware, and Tang back: nobody types.
+    # The same entry on the same firmware, with someone typing before the import gives up.
+    boot(disks, firmware=fw)
+    typed = type_until_stage2(target, serial())
+    clean_marker, clean_pcr7 = (marker(), pcr7()) if typed else ("", "")
+    control(
+        "burn-survives-switch-root",
+        burned_marker == "yes" and typed and clean_marker == "no" and burned_pcr7 != clean_pcr7,
+        f"burned boot: marker {burned_marker!r}, PCR 7 {burned_pcr7}; "
+        f"the boot after: typed {typed}, marker {clean_marker!r}, PCR 7 {clean_pcr7}",
+    )
+    rc, out = bind("--replace") if typed else (1, "")
+    control("rebind-after-the-burned-boot", rc == 0, f"rc={rc}\n{out}")
+    power_off()
+
     booted, took = boot_unattended(disks, fw)
-    marker = target.succeed("test -e /run/cluster-boot/pcr7-burned && echo yes || echo no").strip() if booted else ""
-    rc, _ = tpm_only_answer() if booted else (1, "")
+    last_marker = marker() if booted else ""
+    rc, _ = tpm_answer() if booted else (1, "")
     control(
         "burn-lasts-one-boot",
-        booted and marker == "no" and rc == 0,
-        f"unattended: {booted} after {took:.0f}s, marker {marker!r}, TPM-only rc={rc}",
+        booted and last_marker == "no" and rc == 0,
+        f"unattended: {booted} after {took:.0f}s, marker {last_marker!r}, TPM rc={rc}",
     )
     power_off()
 
 
 def burn_fails_blocks_shell(bound, firmware):
     """A burn that can't reach the TPM must keep the local shell from starting. Recovery is
-    initrd SSH, which stays up."""
-    stop_tang()
+    initrd SSH, which stays up. The firmware trusts one more signer, so nothing unlocks and
+    the boot gets as far as emergency mode."""
     disks = new_case(base=bound)
     select_entry(disks, "burnfail")
-    boot(disks, firmware=new_firmware(firmware))
+    boot(disks, firmware=refusing_firmware(firmware))
     failed = wait_console(target, BURN_FAILED, 240) is not None
     time.sleep(8)
     send = tty0()
@@ -632,7 +623,6 @@ def burn_fails_blocks_shell(bound, firmware):
         f"burn failed: {failed}, shell: {shell}, ssh: {ssh}, marker {marker!r}\n{tail()}",
     )
     power_off()
-    start_tang()
 
 
 def burn_before_early_failure(bound, firmware):
@@ -702,7 +692,8 @@ def credential_companion_inert(bound, firmware):
     """Lanzaboote's stub packs ESP companion files into the initrd with no hash check: a .cred
     in \\loader\\credentials\\, and .cred and .raw files beside the signed image. The signed
     command line's systemd.import_credentials=no means they are delivered and nothing takes
-    them in. Tang is down, so the initrd waits at the prompt long enough to be looked at."""
+    them in. The firmware trusts one more signer, so the TPM refuses and the initrd waits at
+    the prompt long enough to be looked at."""
     disks = new_case(base=bound)
     edit_esp(
         disks,
@@ -712,8 +703,7 @@ def credential_companion_inert(bound, firmware):
         "mkdir -p \"$u.extra\"; echo planted > \"$u.extra/nco-planted-local.cred\"; "
         "head -c 4096 /dev/zero > \"$u.extra/nco-planted.raw\"",
     )
-    stop_tang()
-    boot(disks, firmware=new_firmware(firmware))
+    boot(disks, firmware=refusing_firmware(firmware))
     ssh = wait_initrd_ssh(90)
     _, delivered = initrd_ssh("ls -laR /.extra 2>&1") if ssh else (1, "")
     _, initrd_creds = initrd_ssh("ls -laR /run/credentials 2>&1") if ssh else (1, "")
@@ -749,12 +739,11 @@ def credential_companion_inert(bound, firmware):
         f"rc={rc}\n{out}",
     )
     power_off()
-    start_tang()
 
 
 def main():
-    tang.start()
-    tang.wait_for_unit("multi-user.target")
+    peer.start()
+    peer.wait_for_unit("multi-user.target")
     ssh_ready()
     provision()
     sealed, sealed_firmware = sealed_checkpoint()
@@ -768,7 +757,7 @@ def main():
     # what follows matters.
     plain_pool_not_imported(sealed, sealed_firmware)
 
-    bound, bound_firmware, keys, bound_pcr7 = bound_checkpoint(sealed, sealed_firmware)
+    bound, bound_firmware, bound_pcr7 = bound_checkpoint(sealed, sealed_firmware)
     sb_toggled_off(bound, bound_firmware, bound_pcr7)
     keys_cleared(bound, bound_firmware, bound_pcr7)
     db_firmware = db_cert_added(bound, bound_firmware, bound_pcr7)
@@ -781,9 +770,9 @@ def main():
     # After the forged case, which the identity-check mutants are about: without the check, or
     # with it late, a stall can't hold anything up either.
     identity_stall_does_not_halt(sealed, sealed_firmware)
-    forged_control_nocheck_steals_keys(forged, bound_firmware, keys)
-    emergency_burn_refused(forged, bound_firmware, keys)
-    emergency_noburn_recovers_key(forged, bound_firmware, keys)
+    forged_control_nocheck_steals_keys(forged, bound_firmware)
+    emergency_burn_refused(forged, bound_firmware)
+    emergency_noburn_recovers_key(forged, bound_firmware)
     forged_variant(
         "missing", forged, bound_firmware, [f"rm /mnt{IDENTITY_PATH}"], r"MISMATCH \(secret missing\)"
     )

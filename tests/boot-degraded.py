@@ -181,8 +181,7 @@ def no_plain_vdev(good, detail, clean):
         and 'cluster_esp_mounted{esp="/boot-fallback"} 1' in metrics
         and re.search(r"^cluster_iommu_groups \d+$", metrics, re.M) is not None
         and re.search(r"^cluster_watchdog_device [01]$", metrics, re.M) is not None
-        and re.search(r"^cluster_core_pattern_ok [01]$", metrics, re.M) is not None
-        and re.search(r"^cluster_tang_vlan_present [01]$", metrics, re.M) is not None,
+        and re.search(r"^cluster_core_pattern_ok [01]$", metrics, re.M) is not None,
         metrics,
     )
     target.succeed(
@@ -254,7 +253,11 @@ def zpool_replace_new_leg():
         f"printf %s '{PASSPHRASE}' | cryptsetup open --allow-discards --key-file=- /dev/disk/by-partlabel/disk-nvme0-luks crypt-a",
         f"zpool replace -f rpool {guid.group(1)} /dev/mapper/crypt-a",
     )
-    target.wait_until_succeeds("zpool status rpool | grep -q 'scan: resilvered'", timeout=600)
+    # ZFS reports the resilver done a moment before it detaches the leg being replaced.
+    target.wait_until_succeeds(
+        "zpool status rpool | grep -q 'scan: resilvered' && ! zpool status rpool | grep -q replacing",
+        timeout=600,
+    )
     status = pool_status()
     control("zpool-replace-new-leg", both_legs_online(status), status)
     power_off()
@@ -545,8 +548,8 @@ def sbctl_keys_lost_recovery(sealed, sealed_firmware):
 
 
 def main():
-    tang.start()
-    tang.wait_for_unit("multi-user.target")
+    peer.start()
+    peer.wait_for_unit("multi-user.target")
     ssh_ready()
     provision()
     disk_dead()

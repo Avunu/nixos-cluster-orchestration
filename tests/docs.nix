@@ -1,5 +1,5 @@
 # The README, held to the code (design WS16): the check table against the flake's checks,
-# the commands against avc's registry and the two node tools' usage lines, the topology,
+# the commands against avc's registry and the seal tool's usage line, the topology,
 # alert and secrets tables against the template, the fixtures, the alert rules and the
 # generators, the paths and metrics against the modules, and no address or email outside
 # the reserved ranges. tests/docs.py says what each check reads.
@@ -44,7 +44,6 @@ let
     avcFlows = ../tools/avc/avc/flows;
     avcCore = ../tools/avc/avc/core;
     bootCore = ../modules/boot-security-core.nix;
-    tangServer = ../modules/tang-server.nix;
     alertRules = [
       ../lib/alert-rules.nix
       ../lib/log-alert-rules.nix

@@ -30,6 +30,4 @@ ALERT_TO = "ops@example.com"
 #   WATCHDOG_TOKEN  = `clan vars get <metrics node> alerting-watchdog/token`
 #   CF_EMAIL_TOKEN  = the Email-Sending-only token (same as alerting/cf-email-token)
 #   AUDIT_TOKENS    = `avc audit tokens`: {"<token>": {"sender": "<node>", "kinds": [...]}},
-#                     one per node from its `audit/token`, plus the Tang host's entry
-#                     {"sender": "tang", "kinds": ["tang_rec", "tang_probe"]} from the Tang repo
-#   TANG_CLIENTS    = `avc audit tang-clients`: {"<tangIp>": "<node>"}
+#                     one per node from its `audit/token`

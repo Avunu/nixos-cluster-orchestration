@@ -13,7 +13,7 @@
 # that proves nothing about the kernel, initrd and unlock path, which first run at the
 # next reboot. A switch is exactly what must not open the gate.
 #
-# Only a good boot counts. On a node with boot security the boot report must say Clevis
+# Only a good boot counts. On a node with boot security the boot report must say the TPM
 # opened every leg: a stack that boots only because someone typed the passphrase would
 # leave every other node needing a console at its next reboot, which is the failure this
 # exists to stop. The report must be this boot's (its timestamp after the kernel's boot
@@ -32,7 +32,7 @@
   markerMount,
   # This boot needs a fresh boot report (modules/boot-report.nix) ...
   requireReport,
-  # ... and that report must show a Clevis unlock of every leg.
+  # ... and that report must show a TPM unlock of every leg.
   requireCleanUnlock,
   node,
   edit ? lib.id,
@@ -91,7 +91,7 @@ pkgs.writeShellApplication {
     ''}
     ${lib.optionalString requireCleanUnlock ''
       passphrase=$(report cluster_boot_unlock_passphrase)
-      opened=$(report cluster_boot_unlock_clevis_devices)
+      opened=$(report cluster_boot_unlock_tpm_devices)
       legs=$(report cluster_boot_unlock_expected_devices)
       # Positive form again: a missing or garbled series must not read as a clean unlock.
       clean=""
@@ -99,7 +99,7 @@ pkgs.writeShellApplication {
         clean=1
       fi
       if [ -z "$clean" ]; then
-        echo "canary-publish: this boot was not a Clevis unlock of every leg (passphrase=''${passphrase:-?} clevis=''${opened:-?} of ''${legs:-?}); boot stack $key is not published"
+        echo "canary-publish: this boot was not a TPM unlock of every leg (passphrase=''${passphrase:-?} tpm=''${opened:-?} of ''${legs:-?}); boot stack $key is not published"
         metric "cluster_deploy_canary_unproven 1" "cluster_deploy_canary_published 0"
         exit 0
       fi

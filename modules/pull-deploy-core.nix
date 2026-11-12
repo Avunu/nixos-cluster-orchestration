@@ -172,7 +172,7 @@ in
       requireCleanUnlock = mkOption {
         type = types.bool;
         default = false;
-        description = "A boot counts only if its report shows Clevis opened every leg.";
+        description = "A boot counts only if its report shows the TPM opened every leg.";
       };
 
       mutate = mkOption {

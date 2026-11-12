@@ -1,9 +1,7 @@
 SLOW_HUMAN_SECONDS = 75
-# Held connections time out after --max-time 15 and are retried, so after healing the patched
-# client needs one more try: well inside this.
-HEALED_SECONDS = 60
-# The stock client, stuck on its first connection, must still be stuck this long after.
-STOCK_STUCK_SECONDS = 180
+# From power-on. A TPM that refuses says so in the first seconds of the initrd, twice for
+# each leg, and the prompt follows: about 5 seconds of kernel time, plus the firmware's.
+REFUSED_PROMPT_SECONDS = 20
 
 
 SSHD_ACCEPTED = "journalctl -b -o cat --no-pager _COMM=sshd-session _COMM=sshd _UID=0 | grep -c '^Accepted ' || true"
@@ -17,7 +15,7 @@ def report_initrd_ssh_logins():
     initrd = int(metrics.get("cluster_boot_initrd_ssh_logins", "-1"))
     before = int(target.succeed(SSHD_ACCEPTED).strip())
     target.wait_for_unit("sshd.service")
-    rc, out = tang.execute(
+    rc, out = peer.execute(
         "ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes "
         f"-o ConnectTimeout=10 -i /root/id root@{STAGE2_ADDRESS} true 2>&1"
     )
@@ -39,54 +37,70 @@ def report_initrd_ssh_logins():
 
 
 def report_passphrase():
-    """A bound node that Tang refused, typed through: the report says passphrase, Clevis
-    answered no leg, and the Worker has the same. Clevis tried all the way through this boot,
-    so a report that counted its attempts would call it a Clevis unlock."""
+    """A bound node whose TPM refused, typed through: the report says passphrase, the TPM
+    opened no leg and refused both, and the Worker has the same. Both legs asked the TPM
+    on this boot, so a report that counted the asking would call it a TPM unlock."""
     metrics = report_metrics()
     event = delivered_boot_event(this_boot())
+    legs = str(len(LUKS_DEVICES))
     want = {
         "cluster_boot_unlock_passphrase": "1",
-        "cluster_boot_unlock_clevis_devices": "0",
-        "cluster_unlock_tpm_share_ok": "0",
+        "cluster_boot_unlock_tpm_devices": "0",
+        "cluster_boot_unlock_expected_devices": legs,
+        "cluster_unlock_tpm_ok": "0",
+        "cluster_boot_tpm_refusals": legs,
         "cluster_boot_secure_boot_enabled": "1",
         "cluster_boot_setup_mode": "0",
     }
     wrong = {k: metrics.get(k) for k, v in want.items() if metrics.get(k) != v}
-    attempts = target.succeed("journalctl -b -o cat --no-pager _SYSTEMD_UNIT=clevis-luks-askpass.service | wc -l").strip()
     control(
         "report-passphrase",
         not wrong
         and event is not None
         and event["unlock"] == "passphrase"
-        and event["clevis_devices"] == 0
+        and event["tpm_devices"] == 0
         and event["expected_devices"] == len(LUKS_DEVICES),
-        f"wrong metrics {wrong}; askpass logged {attempts} lines; event {event}; "
+        f"wrong metrics {wrong}; event {event}; "
         f"refused {refused_requests()}; last email {last_email()!r}\n{metrics}",
     )
 
 
 def refused_console(bound, firmware):
-    """Tang refusing connections on a bound, enforcing node: Clevis can't get its half, and
-    the prompt is there anyway, at once, because it never waited for Clevis. This boot is
-    also the one that checks everything else about a normal boot."""
-    stop_tang()
+    """A bound, enforcing node whose firmware came to trust one more signer: PCR 7 is not
+    the value the slots are sealed to, the TPM refuses both legs, and the prompt is there
+    within seconds. This boot is also the one that checks everything else about a normal
+    boot."""
     disks = new_case(base=bound)
-    started = boot(disks, firmware=new_firmware(firmware))
+    started = boot(disks, firmware=refusing_firmware(firmware))
     found = next_prompt(target, 0, 60)
     elapsed = time.monotonic() - started
-    control("refused-console-prompt-within-10s", found is not None and elapsed <= 10, f"{elapsed:.1f}s")
+    control(
+        f"refused-console-prompt-within-{REFUSED_PROMPT_SECONDS}s",
+        found is not None and elapsed <= REFUSED_PROMPT_SECONDS,
+        f"{elapsed:.1f}s",
+    )
 
     # The prompt is up, so the initrd's network is too, or it never will be.
     control("initrd-ssh-on-the-wan-nic", wait_initrd_ssh(), f"no ssh to {WAN_ADDRESS}")
-    rc, out = tang.execute(f"ping -c 1 -W 5 {TANG_NODE_ADDRESS}")
-    control("initrd-tang-vlan-on-the-trunk-nic", rc == 0, out)
-    rc, scanned = tang.execute(f"ssh-keyscan -p {SSH_PORT} -t ed25519 {WAN_ADDRESS} 2>/dev/null")
+    rc, scanned = peer.execute(f"ssh-keyscan -p {SSH_PORT} -t ed25519 {WAN_ADDRESS} 2>/dev/null")
     initrd_key = scanned.split()[-2:] if rc == 0 else []
 
     booted = type_until_stage2(target, serial())
     control("refused-console", booted, "typing on the serial console did not reach stage 2")
     status = pool_status()
     control("refused-console-both-legs", both_legs_online(status) and root_is_the_pool(), status)
+    # It was the TPM refusing that brought the prompt, for each leg, and neither opened from
+    # its slot. Without this the case could pass on a node that never asked the TPM.
+    journal = target.succeed("journalctl -b -o cat --no-pager")
+    refused = {name: leg_journal(name).count(TPM_REFUSED) for name in sorted(LUKS_DEVICES)}
+    control(
+        "refused-console-tpm-refused-both-legs",
+        all(n >= 1 for n in refused.values()) and tpm_opened_legs() == [] and TPM_OPENED not in journal,
+        f"refusals logged {refused}, legs opened by the TPM {tpm_opened_legs()}",
+    )
+    rc, answer = tpm_answer()
+    control("refused-console-tpm-still-refuses", rc != 0, answer)
+    control("passphrase-not-in-the-journal", PASSPHRASE not in journal, "the typed passphrase is in the journal")
     report_passphrase()
 
     rc, addresses = target.execute(f"ip -4 -o addr show {WAN_INTERFACE}")
@@ -107,27 +121,22 @@ def refused_console(bound, firmware):
         f"{mode}, initrd {initrd_key}, placed {placed}",
     )
     power_off()
-    start_tang()
 
 
 def refused_tty0(bound, firmware):
     """The closest stand-in for a BMC's KVM: PS/2 keystrokes on the first VT."""
-    stop_tang()
     disks = new_case(base=bound)
-    boot(disks, firmware=new_firmware(firmware))
+    boot(disks, firmware=refusing_firmware(firmware))
     booted = type_until_stage2(target, tty0())
     control("refused-tty0", booted and both_legs_online(pool_status()), "typing on tty0 did not reach stage 2")
     power_off()
-    start_tang()
 
 
-def drop_ssh(bound, firmware):
-    """Tang's port silently dropped, so every Clevis attempt waits out its timeout, and nobody
-    at a console: the operator answers over initrd SSH, on the WAN NIC."""
-    stop_tang()
-    tang.succeed(f"iptables -I INPUT 1 -i {TANG_VLAN} -p tcp --dport {TANG_PORT} -j DROP")
+def refused_ssh(bound, firmware):
+    """The TPM refuses and nobody is at a console: the operator answers over initrd SSH, on
+    the WAN NIC."""
     disks = new_case(base=bound)
-    boot(disks, firmware=new_firmware(firmware))
+    boot(disks, firmware=refusing_firmware(firmware))
     reachable = wait_initrd_ssh(90)
     opened = ""
     deadline = time.monotonic() + 150
@@ -139,92 +148,12 @@ def drop_ssh(bound, firmware):
             break
     booted = reachable and wait_stage2(target, 120)
     control(
-        "drop-ssh",
+        "refused-ssh",
         booted and both_legs_online(pool_status()),
         f"initrd ssh reachable: {reachable}, last /dev/mapper: {opened!r}, stage 2: {booted}",
     )
     report_initrd_ssh_logins()
     power_off()
-    tang.succeed(f"iptables -D INPUT -i {TANG_VLAN} -p tcp --dport {TANG_PORT} -j DROP")
-    start_tang()
-
-
-# ── Tang that accepts and goes silent ─────────────────────────────────────
-
-
-def tarpit_up():
-    stop_tang()
-    tang.succeed("rm -f /run/tarpit-heal", "systemctl start tarpit.service")
-    tang.wait_until_succeeds(f"ss -ltn | grep -q ':{TANG_PORT} '", timeout=30)
-
-
-def tarpit_down():
-    tang.succeed("systemctl stop tarpit.service", "rm -f /run/tarpit-heal")
-    start_tang()
-
-
-def tarpit_held():
-    return int(tang.succeed("journalctl -u tarpit.service -o cat --no-pager | grep -c 'holding a connection' || true").strip())
-
-
-def tarpit_until_held(seconds=120):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if tarpit_held() > 0:
-            return True
-        time.sleep(1)
-    return False
-
-
-def tarpit_max_time_recovers(bound, firmware):
-    """With --max-time, a client that got no answer gives up and asks again, so once Tang
-    heals the node unlocks by itself."""
-    tarpit_up()
-    disks = new_case(base=bound)
-    boot(disks, firmware=new_firmware(firmware))
-    stage2 = connecting(target)
-    held = tarpit_until_held()
-    # Longer than --max-time, so a patched client has already been held and retried.
-    time.sleep(30)
-    held_before = tarpit_held()
-    early = not stage2.is_alive()
-    tang.succeed("touch /run/tarpit-heal")
-    stage2.join(HEALED_SECONDS)
-    booted = not stage2.is_alive()
-    control(
-        "tarpit-max-time-recovers",
-        held and not early and booted and both_legs_online(pool_status()),
-        f"held: {held} ({held_before} connections before healing), stage 2 before healing: {early}, "
-        f"within {HEALED_SECONDS}s of healing: {booted}",
-    )
-    power_off()
-    tarpit_down()
-
-
-def tarpit_stock(bound, firmware):
-    """The built-in negative control: the same tarpit, and clevis as nixpkgs ships it, with only
-    the connect timeout. Its first connection never ends, so it never unlocks, healed or not.
-    A person typing still gets in, since the prompt never waited for it."""
-    tarpit_up()
-    disks = new_case(base=bound)
-    select_entry(disks, "stockclevis")
-    boot(disks, firmware=new_firmware(firmware))
-    stage2 = connecting(target)
-    held = tarpit_until_held()
-    time.sleep(30)
-    tang.succeed("touch /run/tarpit-heal")
-    stage2.join(STOCK_STUCK_SECONDS)
-    stuck = stage2.is_alive()
-    held_total = tarpit_held()
-    control(
-        "tarpit-stock-hangs",
-        held and stuck,
-        f"held: {held}, {held_total} connections held in all, no stage 2 {STOCK_STUCK_SECONDS}s after healing: {stuck}",
-    )
-    booted = type_until_stage2(target, serial(), thread=stage2)
-    control("tarpit-stock-typing-works", booted and both_legs_online(pool_status()), "typing did not reach stage 2")
-    power_off()
-    tarpit_down()
 
 
 def wrong_then_right():
@@ -437,25 +366,24 @@ def emergency_password():
 
 
 def main():
-    tang.start()
-    tang.wait_for_unit("multi-user.target")
+    peer.start()
+    peer.wait_for_unit("multi-user.target")
     ssh_ready()
     provision()
-    # A node as it runs: enforcing, and bound to Tang and PCR 7. The Tang cases only mean
-    # something on that, so they boot it with its own firmware. The typed cases boot fresh
-    # firmware, where the TPM has nothing to give and typing is the only way in.
+    # A node as it runs: enforcing, and bound to the TPM at its PCR 7. The refused cases
+    # boot that node on firmware that trusts one more signer, so its TPM is asked and
+    # refuses. The typed cases boot fresh firmware, where the TPM has nothing to give and
+    # typing is the only way in.
     sealed, sealed_firmware = sealed_checkpoint()
-    bound, bound_firmware, _, _ = bound_checkpoint(sealed, sealed_firmware)
+    bound, bound_firmware, _ = bound_checkpoint(sealed, sealed_firmware)
     # Each named mutant takes out one control for the whole node, so the case it is about
-    # runs before any case that leans on that control for something else: the tarpit cases
-    # wait longer than the import does without the gate, and partial_waits needs SSH.
+    # runs before any case that leans on that control for something else: partial_waits
+    # needs SSH.
     wrong_then_right()
     slow_human_gate()
-    drop_ssh(bound, bound_firmware)
+    refused_ssh(bound, bound_firmware)
     refused_console(bound, bound_firmware)
     refused_tty0(bound, bound_firmware)
-    tarpit_max_time_recovers(bound, bound_firmware)
-    tarpit_stock(bound, bound_firmware)
     partial_waits()
     recover_emergency_over_ssh()
     emergency_password()

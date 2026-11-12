@@ -27,7 +27,7 @@
 # the trunk the largest of them, because a VLAN can't exceed its parent. br-wan,
 # br-app and the container veths stay at 1500: the internet path is 1500, and a
 # container needs no more. The initrd sets no MTU at all (modules/boot-security-core.nix):
-# Tang's exchange is tiny, and a bad MTU must not be able to stop an unlock.
+# it brings up only the WAN NIC, for someone to type the passphrase over SSH.
 #
 # A VLAN that doesn't really carry its MTU is a silent blackhole: small packets
 # pass, large ones vanish, so every handshake looks healthy while transfers hang.
@@ -600,8 +600,8 @@ in
     # controlBoundUnit): Nomad. network-online.target means br-wan here
     # (modules/cluster-common.nix), and the control VLAN is RequiredForOnline=no
     # without ConfigureWithoutCarrier, so its address arrives only once the vRack
-    # trunk has carrier, which can be seconds after br-wan is routable (stage 2 sets
-    # the trunk's MTU on a link the initrd brought up, and many NICs reset on that).
+    # trunk has carrier, which can be seconds after br-wan is routable (the trunk
+    # comes up in stage 2, and many NICs reset when their MTU is set).
     # Nomad exits at once on an address it can't bind, and the nixpkgs unit allows 3
     # starts in 10 s, so without this a late VLAN left Nomad failed until someone
     # restarted it. Never fails: a VLAN that is down for longer is a different problem,

@@ -62,7 +62,6 @@ let
       modules = [ { cluster.boot.ssh.hostKeyPath = lib.mkForce "/var/lib/elsewhere/initrd-key"; } ];
     };
     "the WAN interface" = withNode1 { wanInterface = "eno2"; };
-    "the trunk interface" = withNode1 { vrackInterface = "enp4s0"; };
     "the WAN address" = withNode1 { publicIp4 = "192.0.2.77"; };
     "the WAN gateway" = withNode1 { publicGw4 = "192.0.2.253"; };
     "initrdNicModules" = withNode1 { initrdNicModules = [ "e1000e" ]; };
@@ -124,23 +123,20 @@ let
   overBudget = pkgs.testers.testBuildFailure (budgetFor 1);
 
   # initrd-contents: the fixture's own gate, exactly as system.checks has it, passes. A node
-  # given stock clevis, whose askpass names pkgs.systemd's systemd-reply-password where the
-  # initrd has config.systemd.package's, fails it for that reason. Built directly, since its
-  # toplevel would not build at all.
-  contentsOf = system: system.config.system.build.initrdContentsFor system.config.cluster.boot.clevisPackage;
+  # whose initrd was built without TPM support has no token plugin to open a leg with, and
+  # fails it for that reason. Built directly, since the module's assertion refuses its
+  # toplevel.
+  contentsOf = system: system.config.system.build.initrdContents;
   contentsPass = contentsOf (node { });
   contentsGated = lib.any (d: d.name == "check-initrd-contents") (node { }).config.system.checks;
-  stockClevis = node {
+  withoutTpm = node {
     modules = [
-      (
-        { pkgs, ... }:
-        {
-          cluster.boot.clevisPackage = lib.mkForce pkgs.clevis;
-        }
-      )
+      {
+        boot.initrd.systemd.tpm2.enable = lib.mkForce false;
+      }
     ];
   };
-  contentsStock = pkgs.testers.testBuildFailure (contentsOf stockClevis);
+  contentsWithoutTpm = pkgs.testers.testBuildFailure (contentsOf withoutTpm);
 
   fail = name: detail: ''
     echo ${lib.escapeShellArg "FAILED: ${name}: ${detail}"} >&2
@@ -172,15 +168,15 @@ pkgs.runCommand "boot-closure-checks" { } ''
     bad=1
   fi
 
-  # initrd-contents: the fixture passes, and stock clevis fails on the reply binary.
+  # initrd-contents: the fixture passes, and an initrd without TPM support fails on the plugin.
   ${lib.optionalString (!contentsGated) (
     fail "initrd-contents" "it is not in the secure fixture's system.checks"
   )}
   test -e ${contentsPass} || { echo "FAILED: initrd-contents: no result for the fixture" >&2; bad=1; }
-  if [ "$(cat ${contentsStock}/testBuildFailure.exit)" = 0 ] \
-    || ! grep -q 'MISSING /nix/store/.*/lib/systemd/systemd-reply-password' ${contentsStock}/testBuildFailure.log; then
-    echo "FAILED: initrd-contents: stock clevis did not fail for the reply binary" >&2
-    cat ${contentsStock}/testBuildFailure.log >&2
+  if [ "$(cat ${contentsWithoutTpm}/testBuildFailure.exit)" = 0 ] \
+    || ! grep -q 'MISSING /lib/cryptsetup/libcryptsetup-token-systemd-tpm2.so' ${contentsWithoutTpm}/testBuildFailure.log; then
+    echo "FAILED: initrd-contents: an initrd without TPM support did not fail for the token plugin" >&2
+    cat ${contentsWithoutTpm}/testBuildFailure.log >&2
     bad=1
   fi
 
@@ -190,7 +186,7 @@ pkgs.runCommand "boot-closure-checks" { } ''
   echo "esp-budget: passes for the fixture: $(grep -o 'peak .*' ${overBudget}/testBuildFailure.log | sed 's/ of 1 MiB//') of 1024 MiB"
   echo "esp-budget: fails for a synthetic limit"
   echo "initrd-contents: passes for the fixture"
-  echo "initrd-contents: stock clevis fails it: $(grep -o 'MISSING .*' ${contentsStock}/testBuildFailure.log | head -n 1)"
+  echo "initrd-contents: an initrd without TPM support fails it: $(grep -o 'MISSING .*' ${contentsWithoutTpm}/testBuildFailure.log | head -n 1)"
   echo "boot-contract: stable across kernel ${kernelVersion { }} to ${kernelVersion otherKernel}"
   echo "boot-contract: changes with: ${lib.concatStringsSep ", " (lib.attrNames mustDiffer)}"
   touch $out
