@@ -61,6 +61,10 @@
 #                                  mount reloads it and writes with the old key revoked
 #   probe-needs-the-mount          jfs-probe reads 1 on the mount and 0 on the bare
 #                                  directory a dead mount leaves
+#   dump-age-metric                jfs-meta-dump-age reports the newest dump's time;
+#                                  with no dump yet it does not fail, and counts from
+#                                  its first look; with S3 down it fails and leaves
+#                                  the metric alone
 #   metadata-down                  PostgreSQL stopped: the mount says "metadata
 #                                  unreachable", exits 4, writes NO metric and keeps
 #                                  retrying; it mounts on its own once PostgreSQL is
@@ -245,6 +249,7 @@ pkgs.testers.runNixOSTest {
       gens = nodes.node1.clan.core.vars.generators;
     in
     ''
+      import calendar
       import json
       import secrets
       import time
@@ -259,6 +264,7 @@ pkgs.testers.runNixOSTest {
       S3SK = "${s3sk}"
       FORMAT_STATE = "/var/lib/juicefs-format"
       PROBE_METRIC = "/var/lib/prometheus-node-exporter-text/jfs_probe.prom"
+      DUMP_METRIC = "/var/lib/prometheus-node-exporter-text/jfs_meta_dump.prom"
       PASS = "${gens.juicefs-rsa.files."rsa-passphrase".path}"
       WRONG_PEM = "${wrongPem}"
       META = "${jfs.metaDb}"
@@ -709,8 +715,11 @@ pkgs.testers.runNixOSTest {
               rc_up = node1.execute("systemctl start jfs-probe.service")[0]
               up = node1.execute(f"cat {PROBE_METRIC}")[1]
               node1.succeed("systemctl stop jfs-health.service juicefs-mount.service")
-              node1.execute(f"mountpoint -q {MNT} && umount -l {MNT}")
-              bare = not mounted()
+              # A stop that timed out leaves a dead mount, which mountpoint cannot stat and
+              # which refuses every write by itself. Detach whatever is there and read the
+              # mount table, so the probe is judged on a directory it could write to.
+              node1.execute(f"umount -l {MNT}")
+              bare = node1.execute(f"grep -q ' {MNT} ' /proc/self/mountinfo")[0] != 0
               rc_down = node1.execute("systemctl start jfs-probe.service")[0]
               down = node1.execute(f"cat {PROBE_METRIC}")[1]
               node1.execute("systemctl reset-failed jfs-probe.service")
@@ -720,6 +729,42 @@ pkgs.testers.runNixOSTest {
               control("probe-needs-the-mount",
                       rc_up == 0 and "cluster_jfs_probe_success 1" in up and bare
                       and rc_down != 0 and "cluster_jfs_probe_success 0" in down and back, detail)
+
+          with subtest("dump-age-metric"):
+              def dump_age():
+                  """(rc of the unit, the timestamp its metric holds or None)"""
+                  rc = node1.execute("systemctl start jfs-meta-dump-age.service")[0]
+                  node1.execute("systemctl reset-failed jfs-meta-dump-age.service")
+                  words = node1.execute(f"cat {DUMP_METRIC}")[1].split()
+                  return rc, int(words[1]) if len(words) == 2 else None
+
+              newest = newest_dump()
+              want = calendar.timegm(time.strptime(newest, "dump-%Y-%m-%d-%H%M%S.json.gz"))
+              rc_dump, with_dump = dump_age()
+              # A volume that has written no dump yet: the bucket without its dumps.
+              rclone(f"move jfs:{BUCKET}/{VOL}/meta jfs:{BUCKET}/ci-held")
+              before = int(since())
+              rc_empty, empty = dump_age()
+              after = int(since())
+              time.sleep(2)
+              rc_again, again = dump_age()
+              # A failed listing is not an empty bucket.
+              s3.succeed("systemctl stop s3.service")
+              rc_down, down = dump_age()
+              s3.succeed("systemctl start s3.service")
+              s3.wait_for_open_port(${toString s3Port})
+              rclone(f"move jfs:{BUCKET}/ci-held jfs:{BUCKET}/{VOL}/meta")
+              rc_back, back = dump_age()
+              detail = (f"newest {newest} ({want}): rc {rc_dump}, metric {with_dump}; no dump: rc {rc_empty}, metric {empty}"
+                        f" (looked between {before} and {after}); again: rc {rc_again}, metric {again};"
+                        f" S3 down: rc {rc_down}, metric {down}; dumps back: rc {rc_back}, metric {back}")
+              print(f"dump-age-metric: {detail}")
+              control("dump-age-metric",
+                      rc_dump == 0 and with_dump == want
+                      and rc_empty == 0 and empty is not None and before <= empty <= after
+                      and rc_again == 0 and again == empty
+                      and rc_down != 0 and down == empty
+                      and rc_back == 0 and back == want, detail)
 
           with subtest("metadata-down"):
               node1.succeed("systemctl stop jfs-health.service juicefs-mount.service")

@@ -868,7 +868,7 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `JuiceFSVolumeNotEncrypted` | critical | A node refused a JuiceFS volume that is not encrypted. |
 | `JuiceFSUnwritable` | critical | `/mnt/jfs` is not writable. |
 | `JuiceFSProbeStale` | warning | The JuiceFS probe has not run. |
-| `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old. |
+| `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old, or a volume has gone that long without writing its first. |
 | `AuditDeliveryStale` | warning | Audit events are held on the node, undelivered. |
 | `AuditProducerStale` | warning | An audit producer (sender, journal follower, Nomad stream) has stopped working. |
 | `AuditNomadStreamRefused` | warning | Nomad's ACL event stream refuses the audit follower. |

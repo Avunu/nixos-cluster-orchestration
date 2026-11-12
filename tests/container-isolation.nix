@@ -635,7 +635,9 @@ pkgs.testers.runNixOSTest {
             want = {"plain": [(GW1, 53)], LONG: [(GW1, 53)], "gprobe": sorted([(GW1, 53), (M1, LOKI), (M1, PROM)])}
             got = {app: scan(node1, app, HOST_IPS, ports) for app in want}
             # UDP: an echo on every address of node1; it answers node1 and no container.
-            node1.succeed("systemd-run --unit=ci-udp-echo -p SuccessExitStatus=143 ${pkgs.socat}/bin/socat UDP4-RECVFROM:5999,fork EXEC:${pkgs.coreutils}/bin/cat")
+            # Stopped with SIGKILL: a forked socat child can sit out SIGTERM, and the stop then
+            # times out and leaves a failed unit for the last subtest to find.
+            node1.succeed("systemd-run --unit=ci-udp-echo -p KillSignal=SIGKILL -p SuccessExitStatus=SIGKILL ${pkgs.socat}/bin/socat UDP4-RECVFROM:5999,fork EXEC:${pkgs.coreutils}/bin/cat")
             node1.wait_until_succeeds("echo local | timeout 3 socat - UDP4:127.0.0.1:5999 | grep -q local", timeout=30)
             udp: dict = {}
             for app in want:

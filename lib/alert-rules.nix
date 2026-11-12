@@ -552,7 +552,7 @@ in
           for = "10m";
           severity = "warning";
           summary = "newest JuiceFS metadata dump is {{ $value | humanizeDuration }} old";
-          description = "A reinstalled juicefs-meta node restores from the newest dump; older means more orphaned chunks.";
+          description = "A reinstalled juicefs-meta node restores from the newest dump; older means more orphaned chunks. On a volume that has never written one, the age counts from when the bucket was first seen without it.";
         })
       ];
     }
