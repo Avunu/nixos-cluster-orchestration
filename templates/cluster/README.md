@@ -45,11 +45,11 @@ After that, every node rebuilds itself from `main` on a timer. `avc` is the guid
 
 ## Keep an offline kit
 
-Off the cluster and away from your laptop: the offline age identity, a dated `git bundle create site-<date>.bundle --all` of this repository, and copies of each node's `luks/passphrase`, `restic/password`, `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase`, the S3 and backup-target keys, and `backup.repoSalt`. The library's README, "The offline kit", says what each restores. Refresh the bundle whenever `vars/` or `secrets/` change. Name a second person who can unlock a node.
+Off the cluster and away from your laptop: the offline age identity, a dated `git bundle create site-<date>.bundle --all` of this repository, and copies of each node's `luks/passphrase`, `restic/password`, `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase`, `<app>-db-archive/key` for each app that archives its database, the S3 and backup-target keys, and `backup.repoSalt`. The library's README, "The offline kit", says what each restores. Refresh the bundle whenever `vars/` or `secrets/` change. Name a second person who can unlock a node.
 
 ## Secrets policy
 
-`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
+`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says, and each app's database archive key (`<app>-db-archive`) is marked never; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
 
 ## Nodes that already run an earlier library
 

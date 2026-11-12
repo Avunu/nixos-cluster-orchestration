@@ -75,6 +75,7 @@
     endpoint = "https://s3.example.net";
     region = "fixture-1";
     juicefsBucket = "fixture-juicefs";
+    dbArchiveBucket = "fixture-db-archive";
   };
 
   logging.retention = "720h";

@@ -8,7 +8,7 @@
 #
 # TODO(HA): the metadata PG is still a single instance and therefore the
 # cluster's top SPOF — its loss strands /mnt/jfs on every node. Wrap it in
-# Patroni (modules/db-postgres.nix) once >=2 real nodes exist.
+# Patroni once >=2 real nodes exist.
 #
 # The volume is encrypted (vars `juicefs-rsa`), and every mount refuses one that
 # isn't: see `assertEncryptedSh` in lib/juicefs.nix. Nothing at evaluation can see
