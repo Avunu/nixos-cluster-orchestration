@@ -15,12 +15,13 @@
 #   - Binary logs numbered again from the start are refused: their names are
 #     already in storage, under another history.
 #   - A base backup when the generation has none or the newest is older than
-#     `baseIntervalHours`, then `delete retain`.
+#     `baseIntervalHours`, then `delete retain`, which removes the base backups
+#     beyond `retainBaseBackups` and the binary logs older than the oldest kept.
 #   - A last flush and push as MariaDB stops, so a clean stop loses nothing.
 #
 # `db-archive` (in the system path) is all of it: push, base, status,
-# next-generation, and `wal-g` for WAL-G itself with the same settings. See
-# modules/db-archive-common.nix for generations.
+# next-generation, generations, drop-generation, and `wal-g` for WAL-G itself
+# with the same settings. See modules/db-archive-common.nix for generations.
 #
 # WAL-G calls its MariaDB interface unstable. checks.db-archive is what says this
 # works with the pinned versions.
@@ -100,6 +101,38 @@ let
         NF { exit 3 }
         END { if (!seen) exit 3 }
       '
+    }
+
+    # `st ls -r` prints the same header and a row per object: type, size, date,
+    # time, zone, the zone's name, the object's name. A generation that is not
+    # there is the header alone.
+    dba_generation_newest() {
+      local out stamps
+      out=$(walg 300 "gen-$1" 1 st ls -r 2>/dev/null) || return 1
+      stamps=$(printf '%s\n' "$out" | awk '
+        NR == 1 { if ($0 !~ /^type +size +last modified +name *$/) exit 3; seen = 1; next }
+        $1 == "dir" { next }
+        $1 == "obj" && NF >= 6 && $3 ~ /^[0-9]+-[0-9]+-[0-9]+$/ && $4 ~ /^[0-9:.]+$/ && $5 ~ /^[+-][0-9]+$/ {
+          print $3, $4, $5; next
+        }
+        NF { exit 3 }
+        END { if (!seen) exit 3 }
+      ') || return 1
+      # An empty line would be read by `date` as today.
+      [ -n "$stamps" ] || return 0
+      printf '%s\n' "$stamps" | date -f - +%s | sort -n | tail -n 1
+    }
+
+    # From the top of the prefix and with the slash, so that generation 1 is
+    # not also generation 10. Object versions, where the bucket keeps them, are
+    # left to the bucket's own rule.
+    dba_generation_remove() {
+      walg 30m "" 3 st rm "gen-$1/"
+    }
+
+    # After a base backup: count the earlier generations past their time.
+    survey() {
+      dba_list_generations > /dev/null || dba_log "the earlier generations could not be looked over"
     }
 
     # When the newest complete base backup of a generation began, in epoch
@@ -251,6 +284,7 @@ let
       dba_metric last_base_timestamp_seconds "$after"
       walg 30m "gen-$gen" 3 delete retain FULL ${toString cfg.retainBaseBackups} --confirm \
         || { dba_log "the base backup is in storage, but deleting older ones failed"; exit 1; }
+      survey
     }
 
     cmd_status() {
@@ -287,6 +321,11 @@ let
         ;;
       status) cmd_status ;;
       next-generation) cmd_next_generation "''${2:-}" ;;
+      generations) dba_list_generations || exit 1 ;;
+      drop-generation)
+        dba_drop_generation "''${2:-}" "''${3:-}" || exit $?
+        survey
+        ;;
       wal-g)
         # WAL-G itself, with this generation's settings: a fetch, a listing.
         shift
@@ -294,7 +333,7 @@ let
         walg 6h "gen-$gen" 3 "$@"
         ;;
       *)
-        echo "usage: db-archive push [--final] | base [--force] | status | next-generation [--yes] | wal-g <arguments>" >&2
+        echo "usage: db-archive push [--final] | base [--force] | status | next-generation [--yes] | generations | drop-generation <N> [--yes] | wal-g <arguments>" >&2
         exit 2
         ;;
     esac

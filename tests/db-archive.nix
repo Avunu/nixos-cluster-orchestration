@@ -17,7 +17,11 @@
 #   - binary logs numbered again from the start are refused;
 #   - a data directory without its marker does not adopt an archive that holds
 #     data, nor one that could not be listed, and `next-generation` is the way on;
-#   - base backups are taken when due and the older ones removed;
+#   - base backups are taken when due, and the older ones removed with the
+#     binary logs from before the oldest kept;
+#   - an earlier generation is kept for as long as a restore reaches back, then
+#     deleted when asked, and neither a later generation nor this data
+#     directory's own ever is;
 #   - the timer keeps running through a storage outage and catches up after it;
 #   - a clean stop ships the last log, and a stop without storage still stops.
 #

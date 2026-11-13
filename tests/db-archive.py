@@ -223,6 +223,8 @@ def next_generation():
 
 def base_backups_and_retention():
     first = base_backups(2)
+    early = objects("gen-2/binlog_005")
+    assert early, "generation 2 holds no binary log from before its second base backup"
     rc, out = archive("base")
     assert rc == 0 and base_backups(2) == first, f"a base backup that was not due: rc {rc}, {base_backups(2)}"
     time.sleep(1)
@@ -233,6 +235,9 @@ def base_backups_and_retention():
     rc, out = archive("base --force")
     third = base_backups(2)
     assert rc == 0 and len(third) == 2 and first[0] not in third, f"rc {rc}, {first} -> {third}: {out}"
+    # The binary logs from before the oldest base backup kept go with the base backups.
+    left = sorted(set(early) & set(objects("gen-2/binlog_005")))
+    assert not left, f"binary logs older than every base backup kept are still stored: {left}"
 
     # What is stored can be read with the key, and not with another.
     maria.succeed("mkdir -p /root/fetched /root/fetched-wrong")
@@ -245,6 +250,66 @@ def base_backups_and_retention():
     left = maria.succeed("ls /root/fetched-wrong").split()
     maria.succeed(f"printf %s {KEY} > {KEY_FILE}")
     assert rc != 0 and "canarydb" not in left, f"a fetch with another key: rc {rc}, {left}: {out}"
+
+
+def earlier_generations():
+    """Generation 1 is an earlier one now. It is kept for as long as a restore reaches
+    back, which is a day here, and after that it is deleted when asked and not before."""
+    kept = objects("gen-1")
+    current = objects("gen-2")
+    assert kept and current, f"generation 1: {len(kept)} objects, generation 2: {len(current)}"
+    rc, out = archive("drop-generation 1 --yes")
+    control(
+        "generation-inside-the-window-is-kept",
+        rc != 0 and objects("gen-1") == kept,
+        f"rc {rc}, {len(kept)} -> {len(objects('gen-1'))} objects: {out}",
+    )
+    rc, out = archive("generations")
+    assert rc == 0 and "gen-1: last written" in out and "kept until" in out, f"rc {rc}, {out}"
+    assert "gen-2: this data directory's" in out, out
+    assert metrics().get("droppable_generations") == "0", metrics()
+
+    # Storage is files here. Generation 1 is made three days old, and the archive
+    # is given a later generation than this data directory's, as old.
+    maria.succeed(
+        f"find {STORAGE}/gen-1 -exec touch -d '3 days ago' {{}} + && cp -a {STORAGE}/gen-1 {STORAGE}/gen-10"
+    )
+    # rclone lists from its own cache of the directory.
+    s3(False)
+    s3(True)
+    later = objects("gen-10")
+    assert len(later) == len(kept)
+    rc, out = archive("generations")
+    assert rc == 0 and "drop-generation 1 --yes" in out and "gen-10: later" in out, f"rc {rc}, {out}"
+    assert metrics().get("droppable_generations") == "1", metrics()
+
+    rc, out = archive("drop-generation 10 --yes")
+    control(
+        "later-generation-is-not-dropped",
+        rc != 0 and objects("gen-10") == later,
+        f"rc {rc}, {len(later)} -> {len(objects('gen-10'))} objects: {out}",
+    )
+    rc, out = archive("drop-generation 2 --yes")
+    assert rc != 0 and objects("gen-2") == current, f"this data directory's own generation: rc {rc}, {out}"
+    rc, out = archive("drop-generation 1")
+    assert rc == 2 and objects("gen-1") == kept, f"without --yes: rc {rc}, {out}"
+    # Storage that does not answer has not said the generation is old.
+    s3(False)
+    rc, out = archive("drop-generation 1 --yes")
+    s3(True)
+    assert rc not in (0, 2) and objects("gen-1") == kept, f"without storage: rc {rc}, {out}"
+
+    rc, out = archive("drop-generation 1 --yes")
+    assert rc == 0 and not objects("gen-1"), f"rc {rc}, {len(objects('gen-1'))} objects left: {out}"
+    # Generation 1, and not also generation 10.
+    assert objects("gen-10") == later and objects("gen-2") == current, f"{out}: {objects()}"
+    assert metrics().get("droppable_generations") == "0", metrics()
+    rc, out = archive("drop-generation 1 --yes")
+    assert rc == 0 and "holds nothing" in out, f"a second time: rc {rc}, {out}"
+
+    maria.succeed(f"rm -rf {STORAGE}/gen-10 {STORAGE}/gen-1")
+    s3(False)
+    s3(True)
 
 
 def timer_survives_an_outage():
@@ -306,6 +371,7 @@ def main():
     marker_missing()
     next_generation()
     base_backups_and_retention()
+    earlier_generations()
     timer_survives_an_outage()
     clean_stop()
 

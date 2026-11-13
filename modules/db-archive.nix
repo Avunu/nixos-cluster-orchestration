@@ -53,7 +53,7 @@ let
     }
     # The source is a file the container's root wrote. Read it as data from a
     # stranger: no following a link, no waiting on a pipe, 64 KiB at most, and
-    # only the four lines this library writes, with numbers for values.
+    # only the five lines this library writes, with numbers for values.
     relay() {
       local app=$1 src dst tmp
       src=${runDir "$app"}/metrics.prom
@@ -65,7 +65,7 @@ let
       tmp=$(mktemp ${textDir}/.cluster_db_archive.XXXXXX) || return 0
       timeout 5 dd if="$src" iflag=nofollow,nonblock bs=64k count=1 status=none 2>/dev/null \
         | awk -v app="$app" '
-            /^cluster_db_archive_(last_ok_timestamp_seconds|last_base_timestamp_seconds|generation|refused) [0-9]+(\.[0-9]+)?$/ {
+            /^cluster_db_archive_(last_ok_timestamp_seconds|last_base_timestamp_seconds|generation|refused|droppable_generations) [0-9]+(\.[0-9]+)?$/ {
               printf "%s{app=\"%s\"} %s\n", $1, app, $2
             }' > "$tmp"
       if [ -s "$tmp" ]; then

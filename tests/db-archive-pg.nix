@@ -19,6 +19,9 @@
 #     it was;
 #   - base backups are taken when due and the older ones removed; one restores
 #     with the key and not with another, and comes back without a marker;
+#   - an earlier generation is kept for as long as a restore reaches back, then
+#     deleted when asked, and neither a later generation nor this data
+#     directory's own ever is;
 #   - WAL that cannot be archived is kept up to the limit and dropped beyond it,
 #     and the gap that leaves holds the freshness metric still until a base
 #     backup, taken without waiting for its interval, has closed it;

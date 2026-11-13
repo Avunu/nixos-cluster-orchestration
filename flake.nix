@@ -1894,6 +1894,30 @@
                     [ ''if [ "$current" -le "$have_n" ] && false; then'' ];
               }
             );
+            # An earlier generation is deleted while a restore can still reach into it.
+            db-archive-drops-inside-window = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "generation-inside-the-window-is-kept";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''[ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]'' ]
+                    [ "true" ];
+              }
+            );
+            # A generation later than this data directory's, another node's, is deleted from here.
+            db-archive-drops-later-generation = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "later-generation-is-not-dropped";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
+              }
+            );
             # The PostgreSQL archiver (tests/db-archive-pg.nix), edited the same way.
             #
             # A data directory without its marker adopts an archive that already holds data.
@@ -1965,6 +1989,30 @@
                   builtins.replaceStrings
                     [ ''! has_gap && [ "$((now - before))"'' ]
                     [ ''[ "$((now - before))"'' ];
+              }
+            );
+            # An earlier generation is deleted while a restore can still reach into it.
+            db-archive-pg-drops-inside-window = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-generation-inside-the-window-is-kept";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''[ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]'' ]
+                    [ "true" ];
+              }
+            );
+            # A generation later than this data directory's, another node's, is deleted from here.
+            db-archive-pg-drops-later-generation = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-later-generation-is-not-dropped";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
               }
             );
           };

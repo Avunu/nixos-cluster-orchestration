@@ -132,6 +132,13 @@ let
       name = "the app's own settings reach the archiver";
       ok = archive.flushSeconds == 30 && inner.systemd.timers.db-archive-push.timerConfig.OnUnitInactiveSec == "30s";
     }
+    {
+      name = "an app that sets nothing keeps eight daily base backups, a week of reach";
+      ok =
+        ledger.cluster.dbArchive.retainBaseBackups == 8
+        && ledger.cluster.dbArchive.baseIntervalHours == 24
+        && archive.retainBaseBackups == 8;
+    }
 
     # ── secrets ─────────────────────────────────────────────────────────────
     {

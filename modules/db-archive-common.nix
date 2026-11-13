@@ -13,12 +13,19 @@
 # be listed, stops the archiver with `cluster_db_archive_refused 1`: appending
 # another history to a generation would leave a restore that replays both.
 #
-# Four metrics, written to `metricsFile` without labels:
+# Within its generation a database keeps `retainBaseBackups` base backups, and so
+# reaches back `(retainBaseBackups - 1) * baseIntervalHours`: seven days as set.
+# An earlier generation is kept for as long after its last write, and then
+# `db-archive drop-generation <N> --yes` deletes it. Nothing deletes one unasked.
+#
+# Five metrics, written to `metricsFile` without labels:
 #   cluster_db_archive_last_ok_timestamp_seconds    everything written so far was
 #                                                   found in storage at this time
 #   cluster_db_archive_last_base_timestamp_seconds  the newest base backup
 #   cluster_db_archive_generation                   N
 #   cluster_db_archive_refused                      1 while the archiver refuses
+#   cluster_db_archive_droppable_generations        earlier generations past their
+#                                                   time, as of the last base backup
 {
   config,
   lib,
@@ -39,14 +46,22 @@ let
 
   shellLib = pkgs.writeText "db-archive-lib.sh" (cfg.mutate ''
     # Sourced by the engine's `db-archive` under `set -euo pipefail`. The engine
-    # defines dba_archive_entries: the names at the top of this database's
-    # prefix, one per line, and a non-zero status when storage did not answer.
+    # defines three functions, each with a non-zero status when storage did not
+    # answer:
+    #   dba_archive_entries        the names at the top of this database's
+    #                              prefix, one per line
+    #   dba_generation_newest <N>  when generation N's newest object was written,
+    #                              in epoch seconds; nothing when it holds none
+    #   dba_generation_remove <N>  delete every object of generation N
     #
     # Every step that decides something tests its own status. `set -e` is off
     # inside anything called on the left of `||`, which is how these are called.
     DBA_STATE=${lib.escapeShellArg cfg.stateDir}
     DBA_METRICS=${lib.escapeShellArg cfg.metricsFile}
     DBA_MARKER=${lib.escapeShellArg cfg.markerFile}
+    # How far back a restore reaches inside one generation, in seconds: from the
+    # oldest base backup kept.
+    DBA_WINDOW=${toString ((cfg.retainBaseBackups - 1) * cfg.baseIntervalHours * 3600)}
 
     dba_log() { echo "db-archive: $*" >&2; }
 
@@ -150,6 +165,96 @@ let
       fi
       printf '%s\n' "$((max + 1))"
     }
+
+    # ── earlier generations ─────────────────────────────────────────────────
+
+    dba_when() { date -u -d "@$1" '+%Y-%m-%d %H:%M UTC'; }
+
+    # Was this moment longer ago than a restore reaches back? A moment in the
+    # future was not.
+    dba_past_window() { [ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]; }
+
+    # dba_generation_newest's answer, taken only as a number or as nothing.
+    dba_newest() {
+      local t
+      t=$(dba_generation_newest "$1") || return 1
+      case "$t" in *[!0-9]*) return 1 ;; esac
+      printf '%s\n' "$t"
+    }
+
+    # The marker's generation, without starting one.
+    dba_marker_generation() {
+      local g
+      [ -e "$DBA_MARKER" ] || { dba_log "$DBA_MARKER is missing: this data directory has no generation yet"; return 1; }
+      g=$(cat "$DBA_MARKER") || { dba_log "$DBA_MARKER could not be read"; return 1; }
+      case "$g" in
+        "" | 0* | *[!0-9]*) dba_log "$DBA_MARKER does not hold a generation number"; return 1 ;;
+      esac
+      printf '%s\n' "$g"
+    }
+
+    # Every generation in the archive, one per line, and what may be done with
+    # it. Also counts the ones past their time for the metric.
+    dba_list_generations() {
+      local cur entries e n newest count=0
+      cur=$(dba_marker_generation) || return 1
+      entries=$(dba_archive_entries) || { dba_log "the archive could not be listed"; return 1; }
+      for e in $entries; do
+        case "$e" in
+          gen-*) n=''${e#gen-} ;;
+          *) continue ;;
+        esac
+        case "$n" in "" | 0* | *[!0-9]*) continue ;; esac
+        newest=$(dba_newest "$n") || { dba_log "generation $n could not be listed"; return 1; }
+        if [ -z "$newest" ]; then
+          echo "gen-$n: holds nothing"
+        elif [ "$n" -eq "$cur" ]; then
+          echo "gen-$n: this data directory's, last written $(dba_when "$newest")"
+        elif [ "$n" -gt "$cur" ]; then
+          echo "gen-$n: later than this data directory's, last written $(dba_when "$newest"). Not dropped from here"
+        elif dba_past_window "$newest"; then
+          count=$((count + 1))
+          echo "gen-$n: last written $(dba_when "$newest"). Can be dropped: db-archive drop-generation $n --yes"
+        else
+          echo "gen-$n: last written $(dba_when "$newest"), kept until $(dba_when "$((newest + DBA_WINDOW))")"
+        fi
+      done
+      dba_metric droppable_generations "$count"
+    }
+
+    # dba_drop_generation <N> [--yes]: delete an earlier generation that nothing
+    # inside the window can need. Never this data directory's own, and never a
+    # later one: that is another node's, written since this one was current.
+    # "Could not be listed" is not "old".
+    dba_drop_generation() {
+      local n=$1 yes=''${2:-} cur newest
+      case "$n" in
+        "" | 0* | *[!0-9]*) dba_log "drop-generation takes a generation's number"; return 2 ;;
+      esac
+      cur=$(dba_marker_generation) || return 1
+      if [ "$n" -ge "$cur" ]; then
+        dba_log "generation $n is not an earlier one than this data directory's, which is $cur. It is not dropped from here"
+        return 1
+      fi
+      newest=$(dba_newest "$n") \
+        || { dba_log "generation $n could not be listed, so when it was last written is not known"; return 1; }
+      [ -n "$newest" ] || { dba_log "generation $n holds nothing"; return 0; }
+      if ! dba_past_window "$newest"; then
+        dba_log "generation $n was last written $(dba_when "$newest"), inside the $((DBA_WINDOW / 3600)) hours a restore reaches back. It can be dropped from $(dba_when "$((newest + DBA_WINDOW))")"
+        return 1
+      fi
+      if [ "$yes" != --yes ]; then
+        echo "would delete every object of generation $n, last written $(dba_when "$newest"); repeat with --yes" >&2
+        return 2
+      fi
+      dba_log "deleting generation $n"
+      dba_generation_remove "$n" \
+        || { dba_log "deleting generation $n failed. What is left of it may not restore"; return 1; }
+      newest=$(dba_newest "$n") \
+        || { dba_log "generation $n was deleted, and could not be listed afterwards"; return 1; }
+      [ -z "$newest" ] || { dba_log "generation $n still holds objects after the delete"; return 1; }
+      dba_log "generation $n dropped"
+    }
   '');
 in
 {
@@ -230,7 +335,7 @@ in
     };
     retainBaseBackups = mkOption {
       type = types.ints.between 2 30;
-      default = 2;
+      default = 8;
     };
 
     stateDir = mkOption {

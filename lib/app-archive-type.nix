@@ -40,11 +40,14 @@ types.submodule {
     };
     retainBaseBackups = mkOption {
       type = types.ints.between 2 30;
-      default = 2;
+      default = 8;
       description = ''
         Base backups kept per generation, with the changes since the oldest of
-        them. At least two: with one, the only restorable copy is deleted the
-        moment its successor is written, before anything has read it back.
+        them. That is how far back the archive reaches: one interval less than
+        this many, so seven days with a daily base backup. An earlier generation
+        is kept as long after its last write. At least two: with one, the only
+        restorable copy is deleted the moment its successor is written, before
+        anything has read it back.
       '';
     };
   };

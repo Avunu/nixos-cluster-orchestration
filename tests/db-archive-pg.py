@@ -251,6 +251,69 @@ def base_backups_and_retention():
     assert rc == 0, f"with the key back: rc {rc}, {out}"
 
 
+def earlier_generations():
+    """Generation 1 is an earlier one now. It is kept for as long as a restore reaches
+    back, which is a day here, and after that it is deleted when asked and not before."""
+    kept = objects("gen-1")
+    # PostgreSQL goes on archiving to generation 2 all the while, so it may gain objects.
+    current = set(objects("gen-2"))
+    assert kept and current, f"generation 1: {len(kept)} objects, generation 2: {len(current)}"
+    rc, out = archive("drop-generation 1 --yes")
+    control(
+        "pg-generation-inside-the-window-is-kept",
+        rc != 0 and objects("gen-1") == kept,
+        f"rc {rc}, {len(kept)} -> {len(objects('gen-1'))} objects: {out}",
+    )
+    rc, out = archive("generations")
+    assert rc == 0 and "gen-1: last written" in out and "kept until" in out, f"rc {rc}, {out}"
+    assert "gen-2: this data directory's" in out, out
+    assert metrics().get("droppable_generations") == "0", metrics()
+
+    # Storage is files here. Generation 1 is made three days old, and the archive
+    # is given a later generation than this data directory's, as old.
+    pg.succeed(
+        f"find {STORAGE}/gen-1 -exec touch -d '3 days ago' {{}} + && cp -a {STORAGE}/gen-1 {STORAGE}/gen-10"
+    )
+    # rclone lists from its own cache of the directory.
+    s3(False)
+    s3(True)
+    later = objects("gen-10")
+    assert len(later) == len(kept)
+    rc, out = archive("generations")
+    assert rc == 0 and "drop-generation 1 --yes" in out and "gen-10: later" in out, f"rc {rc}, {out}"
+    assert metrics().get("droppable_generations") == "1", metrics()
+
+    rc, out = archive("drop-generation 10 --yes")
+    control(
+        "pg-later-generation-is-not-dropped",
+        rc != 0 and objects("gen-10") == later,
+        f"rc {rc}, {len(later)} -> {len(objects('gen-10'))} objects: {out}",
+    )
+    rc, out = archive("drop-generation 2 --yes")
+    assert rc != 0 and current <= set(objects("gen-2")), f"this data directory's own generation: rc {rc}, {out}"
+    rc, out = archive("drop-generation 1")
+    assert rc == 2 and objects("gen-1") == kept, f"without --yes: rc {rc}, {out}"
+    # Storage that does not answer has not said the generation is old.
+    s3(False)
+    rc, out = archive("drop-generation 1 --yes")
+    s3(True)
+    assert rc not in (0, 2) and objects("gen-1") == kept, f"without storage: rc {rc}, {out}"
+
+    rc, out = archive("drop-generation 1 --yes")
+    assert rc == 0 and not objects("gen-1"), f"rc {rc}, {len(objects('gen-1'))} objects left: {out}"
+    # Generation 1, and not also generation 10.
+    assert objects("gen-10") == later, f"generation 10 went with generation 1: {out}: {objects('gen-10')}"
+    lost = sorted(current - set(objects("gen-2")))
+    assert not lost, f"generation 2 lost objects: {lost}"
+    assert metrics().get("droppable_generations") == "0", metrics()
+    rc, out = archive("drop-generation 1 --yes")
+    assert rc == 0 and "holds nothing" in out, f"a second time: rc {rc}, {out}"
+    assert not not_ciphertext(), f"not ciphertext: {not_ciphertext()}"
+    pg.succeed(f"rm -rf {STORAGE}/gen-10 {STORAGE}/gen-1")
+    s3(False)
+    s3(True)
+
+
 def queue_is_bounded():
     """With storage away PostgreSQL keeps what it could not hand over. Up to the limit."""
     until(60, lambda: waiting() == 0)
@@ -343,6 +406,7 @@ def main():
     marker_missing()
     next_generation()
     base_backups_and_retention()
+    earlier_generations()
     queue_is_bounded()
     recovers_after_an_outage()
     clean_stop()

@@ -24,8 +24,9 @@
 # cluster, or pushed with another key, pgBackRest refuses by itself.
 #
 # `db-archive` (in the system path) is all of it: push, base, status,
-# next-generation, and `pgbackrest` for pgBackRest itself with the same
-# settings. See modules/db-archive-common.nix for generations. The marker is in
+# next-generation, generations, drop-generation, and `pgbackrest` for pgBackRest
+# itself with the same settings. See modules/db-archive-common.nix for
+# generations. The marker is in
 # the data directory and left out of base backups, so a restored data directory
 # has none and is not archived until it is given a generation.
 {
@@ -221,6 +222,40 @@ let
           else error("not a listing") end' 2>/dev/null
       }
 
+      # A generation's objects, wherever they are below it. A generation that
+      # is not there is the "." entry alone.
+      dba_generation_newest() {
+        local out
+        render "$PREFIX" "$TOP" || return 1
+        out=$(pgbr 300 "$TOP" --io-timeout=20 --log-level-console=off repo-ls --recurse --output=json "gen-$1" 2>/dev/null) || return 1
+        [ -n "$out" ] || return 1
+        printf '%s' "$out" | jq -r '
+          if type == "object" and has(".") then [ .[] | select(.type == "file") | .time ] | max // empty
+          else error("not a listing") end' 2>/dev/null
+      }
+
+      # `repo-rm` and not `stanza-delete`: it asks for no key, so it also
+      # removes a generation written under an earlier one, and it stops
+      # nothing. pgBackRest keeps it for its own use; checks.db-archive-pg is
+      # what says it does this with the pinned version. Object versions, where
+      # the bucket keeps them, are left to the bucket's own rule.
+      dba_generation_remove() {
+        render "$PREFIX" "$TOP" || return 1
+        pgbr 30m "$TOP" --log-level-console=off repo-rm --recurse "gen-$1"
+      }
+
+      # The earlier generations are looked at with a settings file of their
+      # own, so that neither a listing nor a delete holds up a push.
+      earlier() (
+        TOP=$RUN/earlier.conf
+        "$@"
+      )
+
+      # After a base backup: count the earlier generations past their time.
+      survey() {
+        earlier dba_list_generations > /dev/null || dba_log "the earlier generations could not be looked over"
+      }
+
       # One run at a time decides the generation and writes the settings.
       lock() {
         mkdir -p "$DBA_STATE"
@@ -349,6 +384,7 @@ let
         [ "$after" -gt "$before" ] || { dba_log "the backup exited 0, but storage lists no new base backup"; exit 1; }
         rm -f "$GAP.closing"
         dba_metric last_base_timestamp_seconds "$after"
+        survey
       }
 
       cmd_status() {
@@ -391,6 +427,11 @@ let
           ;;
         status) cmd_status ;;
         next-generation) cmd_next_generation "''${2:-}" ;;
+        generations) earlier dba_list_generations || exit 1 ;;
+        drop-generation)
+          earlier dba_drop_generation "''${2:-}" "''${3:-}" || exit $?
+          survey
+          ;;
         pgbackrest)
           # pgBackRest itself, with this generation's settings: a restore, a listing.
           shift
@@ -400,7 +441,7 @@ let
           stanza 6h "$@"
           ;;
         *)
-          echo "usage: db-archive push [--final] | base [--force] | status | next-generation [--yes] | pgbackrest <arguments>" >&2
+          echo "usage: db-archive push [--final] | base [--force] | status | next-generation [--yes] | generations | drop-generation <N> [--yes] | pgbackrest <arguments>" >&2
           exit 2
           ;;
       esac
