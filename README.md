@@ -185,6 +185,7 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount and the metadata node refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
 | Logs | Loki keeps its store on the `metrics` node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
 | Backups | restic, with each app's repository at a salted hash of its name. |
+| The database archive | Encrypted inside the app's container before it leaves, with a key of the app's own, at a salted hash of its name. There is no unencrypted mode: no key, no upload. See [The database archive](#the-database-archive). |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
 
 Unattended unlock needs no person and no network, and never stands in a person's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
@@ -209,6 +210,7 @@ Kept outside any repository, off the cluster, and away from the laptop that hold
 - the offline age identity, whose public key is in `recipients`;
 - a dated `git bundle` of the private repository (`git bundle create site-<date>.bundle --all`);
 - direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB);
+- `<app>-db-archive/key` for each app that [archives its database](#the-database-archive): losing it loses that archive;
 - `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target` and `backup.repoSalt`.
 
 With the bundle and the offline identity, `clan vars get` gives back every other secret: `git clone site-<date>.bundle site`, then in it `AGE_KEYFILE=<offline identity> clan vars get <node> luks/passphrase`. To let a new operator in, add their public key to `recipients`, commit, and run `clan vars fix <machine>` for each machine with the offline identity; a key not yet in `recipients` reads nothing. With the JuiceFS key, the S3 pair and the bucket alone, the volume's metadata can be rebuilt anywhere (see [Restore without a node](#restore-without-a-node)).
@@ -439,6 +441,7 @@ What the node held, and what replaces it:
 | `juicefs-pg` | By hand, in a window: every mount and the metadata role change together. |
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
 | `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
+| `<app>-db-archive` and `<app>-db-archive-s3`, for each app that archives its database | A new S3 pair per app from the provider, `avc secrets rotate <app>-db-archive-s3`, then delete the old pairs. The archive key is bound to data: a new key and a new generation, by "Keys" in [The database archive](#the-database-archive). What was archived under the old key counts as read. |
 | `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
 
 The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
@@ -577,7 +580,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.flakeUrl` | What nodes rebuild from, as `github:owner/repo`. Also how `avc` finds the deploy remote. |
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
-| `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
+| `objectStorage` | `{ endpoint; region; juicefsBucket; dbArchiveBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. `dbArchiveBucket` is only for apps with `archive.enable`, and must be a bucket of its own ([The database archive](#the-database-archive)). Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
 | `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it: a new salt moves every app to a new, empty repository, which is wanted only in [A node left your control](#a-node-left-your-control). |
@@ -729,6 +732,8 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `alerting-watchdog/token` | The dead-man heartbeat | Generated |
 | `cloudflare/provision-token` | The operator's own Cloudflare token for site provisioning; never deployed to a node | Prompt |
 | `<app>-cf/cloudflared` | Each app's tunnel | Prompt, from `cloudflared tunnel create` |
+| `<app>-db-archive/key` | The key an app's [database archive](#the-database-archive) is encrypted with, only for apps with `archive.enable`. Never regenerate it: a new one reads nothing archived so far | Generated |
+| `<app>-db-archive-s3/{access-key,secret-key}` | The same apps' access to the archive bucket, held inside the app's container | Prompt, a key of the app's own that reaches the archive bucket and nothing else |
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
 
@@ -823,6 +828,50 @@ juicefs mount -d sqlite3://meta.db /mnt/rescue --read-only
 ```
 
 Without the passphrase, with the wrong one, or with the wrong PEM, the load or the mount fails rather than reading garbage. For the backups: `restic -r <target>/apps/<hash> snapshots` with `restic/password` and the target's credentials.
+
+### The database archive
+
+A nightly backup can be a day old. `archive.enable = true` in an app's entry also archives its database continuously to object storage: a base backup and every change since, encrypted inside the app's container before it leaves. MariaDB is archived with WAL-G: a timer closes the binary log and ships it every `archive.flushSeconds` (60 by default), if anything was written. PostgreSQL is archived with pgBackRest: PostgreSQL hands over each WAL segment as it closes one, which it does at least every `flushSeconds` while there are changes. A clean stop of the database ships the last of them. A base backup is taken when the newest is older than `archive.baseIntervalHours` (24), and `archive.retainBaseBackups` (8) are kept per generation, with the changes since the oldest.
+
+**How far back it reaches.** To any moment since the oldest base backup kept: one interval less than the number kept, so seven days as set. Both are per app, in its `archive` entry. The archive is for the recent past, to the second; the restic backups above are the long history, to the night. Each base backup is a whole copy of the database, compressed, so eight of them cost about eight times that plus a week of changes, per app. A base backup past the count is removed by the archiver when its successor is in storage, with the changes from before the oldest kept. A shorter interval would shorten what a restore has to replay, at a base backup that often; nothing has timed a restore yet, so the interval is a day.
+
+**It is an archive, and nothing restores from it yet.** No command or timer in the library brings a database back from it, after a mistake or after a node is lost, so the restic backups above remain the copy that is rehearsed. `checks.db-archive` and `checks.db-archive-pg` prove that the archive is written, encrypted and complete through the failures they stage, and that a base backup comes back through the tool itself with the key and not with another.
+
+To turn it on for an app:
+
+1. Create a bucket for archives and nothing else, and name it in `objectStorage.dbArchiveBucket`. Evaluation refuses the JuiceFS volume's bucket and the backup target's, because every archived app's container holds an S3 key to this one.
+2. At the provider, make a key pair for the app that reaches this bucket and nothing else, and only the app's own path in it if the provider can scope a key that far. `clan vars generate <node>` asks for it (`<app>-db-archive-s3`) and makes the archive key (`<app>-db-archive`).
+3. Ship it, then restart the app once: `nomad job restart app-<name>`. The credentials are bind mounts, which a running container does not gain on a deploy, and PostgreSQL reads `archive_mode` only when it starts.
+4. Put `<app>-db-archive/key` in the [offline kit](#the-offline-kit).
+
+PostgreSQL needs an `https` endpoint, since pgBackRest speaks to S3 over TLS only.
+
+**Where it goes.** `<dbArchiveBucket>/db/<hash>/gen-<N>/`, where the hash is of `backup.repoSalt` and the app's name, so the provider does not read app names off the listing: `printf %s "db-archive:$salt$app" | sha256sum`.
+
+**Generations.** N is the generation of the data directory, kept in a marker file inside it (`db-archive.generation`), so the two are lost together. A data directory without a marker starts generation 1 only on an archive that was listed and found empty. On an archive that holds data, or one that could not be listed, the archiver refuses and uploads nothing (`cluster_db_archive_refused 1`): a second history appended to a generation would leave a restore that replays both. It refuses the same way when MariaDB's binary logs are numbered again from the start. The database keeps running; only its archive stops. If the data directory in front of you is the one to keep archiving, say so, in the container:
+
+```sh
+nixos-container run <app> -- db-archive status                     # generation, path, metrics, base backups
+nixos-container run <app> -- db-archive next-generation            # says which generation it would start
+nixos-container run <app> -- db-archive next-generation --yes      # starts it, with a base backup of its own
+nixos-container run <app> -- db-archive push                       # ship now
+nixos-container run <app> -- db-archive base --force               # a base backup now
+nixos-container run <app> -- db-archive generations                # each generation, its last write, and whether it can go
+nixos-container run <app> -- db-archive drop-generation <N>        # says what it would delete
+nixos-container run <app> -- db-archive drop-generation <N> --yes  # deletes it
+```
+
+`db-archive wal-g <arguments>` (MariaDB) and `db-archive pgbackrest <arguments>` (PostgreSQL) run the tool itself with the generation's settings.
+
+An earlier generation stays as it was, and is the only archive of its days, so it is kept for as long as a restore reaches back, counted from its last write. After that `drop-generation` deletes it, and nothing deletes one unasked: `cluster_db_archive_droppable_generations` counts the ones waiting, as of the last base backup. The command refuses the data directory's own generation, a later one (another node's, written since this one was current), one still inside that time, and one that storage did not list. No flag overrides it; deleting sooner is done at the provider. It needs no archive key, so it also removes a generation written under an earlier one.
+
+**What the archive does not hold.** Writes newer than the last shipment are only on the node's disks: up to `flushSeconds` of them, and everything written while storage is unreachable. MariaDB keeps its binary logs for three days, and an outage longer than that leaves a hole that the next base backup closes. PostgreSQL keeps WAL it could not ship up to `cluster.dbArchive.postgres.queueMaxMiB` (4096, set in the app's `module`). Beyond that it lets the oldest segment go rather than fill the disk and stop the database, records it in `db-archive.gap` in the data directory, and takes a base backup as soon as storage takes segments again. The changes in between are in no archive. A stop while storage is away is still a stop, with the last log left on the node: in the check, PostgreSQL takes 54 seconds over it, of the 90 a container is given.
+
+**Watching it.** Each archived app's node exports five metrics with an `app` label: `cluster_db_archive_last_ok_timestamp_seconds` (the last time everything written was found in storage, which stands still during an outage, a refusal or a gap), `cluster_db_archive_last_base_timestamp_seconds`, `cluster_db_archive_generation`, `cluster_db_archive_refused` and `cluster_db_archive_droppable_generations`. No alert rule reads them yet, so a stalled archive shows in a query and not in an email.
+
+**Keys.** The archive key is bound to data, like `restic/password`: `secrets/policy.toml` marks it never, and a new value reads nothing archived so far. If it has to change, as after [a node left your control](#a-node-left-your-control), change it by starting a generation under the new one: `clan vars generate <node> --generator <app>-db-archive --regenerate`, ship it, `nomad job restart app-<name>`, and at once `db-archive next-generation --yes` in its container. Do not leave out the last step, or one generation holds data under two keys. The earlier generations open with the old key only, so it stays in the kit until they are dropped. They are kept as long as any other: they are the only archive of those days, and deleting them takes nothing back from whoever read them. The one case for deleting sooner, at the provider, is a machine kept by whoever can also read the bucket without its S3 key. Each of those steps is what a check proves by itself; the sequence has not been rehearsed.
+
+The S3 key is inside the container, so a compromised app can delete or overwrite its own archive, and with a key that reaches the whole bucket, the other apps' archives too. It cannot read theirs. The key has to be allowed to delete objects, because the archiver removes old base backups with it. As for the backup target, a bucket with versioning and a key that cannot delete object versions leaves such an app able to hide objects but not to destroy history. With versioning, give the bucket a rule that expires noncurrent versions after the time above, or nothing deleted ever leaves it. Never a rule that expires current objects by age: both tools write files once that every later restore reads. Neither versioning nor such a rule is set or checked by the library, and no check runs against a versioned bucket.
 
 ### Monitoring and alerting
 
@@ -1005,6 +1054,9 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `cluster-watchdog` | The dead-man's logic, and the audit Worker's schemas, tokens and emails. |
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |
 | `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM. |
+| `db-archive` | The database archiver for MariaDB against an S3 server, in a VM: generation 1 by the timer alone; what reaches storage is encrypted, and comes back with its key and not with another; a push is recorded only once its log is listed in storage; no key, no upload; renumbered logs, an archive that already holds data and one that could not be listed are refused; base backups and retention, with the binary logs from before the oldest base backup kept; an earlier generation kept for as long as a restore reaches back and then deleted when asked, and never a later one or the data directory's own; an outage, and a stop with and without storage. |
+| `db-archive-pg` | The same for PostgreSQL, where PostgreSQL hands over each WAL segment itself: every stored object is ciphertext; nothing is uploaded while the archiver refuses; WAL that cannot be shipped is kept up to its limit and dropped beyond it, and the gap holds the freshness metric still until a base backup closes it; a restored base backup carries no marker; earlier generations kept and dropped by the same rule. |
+| `db-archive-wiring` | What `archive.enable` gives an app's container and what it refuses to evaluate: the bucket and salted path, the per-app generators, read-only credential mounts, each engine's settings, eight daily base backups unless the app says otherwise, and no bucket shared with JuiceFS or the backups. Evaluation only. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
 | `cluster-single` | `node1`'s real machine module boots and walks the whole cold start, twice: secrets, networking, the mesh, etcd, encrypted JuiceFS on S3, Nomad with TLS and scoped tokens, every app's job, monitoring, the audit producers. Jobs register but aren't placed. About 5 GB of RAM. |
 | `cluster` | Three voters form quorums, share one JuiceFS volume, and run probe containers with cross-node reachability, pinning and fencing. About 9 GB of RAM. |
@@ -1054,7 +1106,7 @@ These are accepted deliberately.
 3. **Request body cap.** Cloudflare's limit (100 MB on Free and Pro) applies to everything proxied, tunnel included.
 4. **Config changes bounce the connector.** A container restart drops its tunnel briefly.
 5. **`br-wan` puts containers on the public L2 segment.** Their inbound filtering is the container's own firewall, with the host pinning each port's MAC and addresses.
-6. **Backups are nightly, not point-in-time.** Local ZFS snapshots narrow that to 15 minutes, but only for losses on the node itself.
+6. **Restores are from nightly backups, not point-in-time.** Local ZFS snapshots narrow that to 15 minutes, but only for losses on the node itself. [The database archive](#the-database-archive) holds every change of an app that turns it on, and nothing here restores from it yet.
 7. **The JuiceFS metadata engine is a single point of failure.** If the `juicefs-meta` node dies, every node's `/mnt/jfs` is stranded until it returns.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
 9. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.

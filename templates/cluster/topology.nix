@@ -70,6 +70,9 @@
     endpoint = "https://s3.example.net";
     region = "region-1";
     juicefsBucket = "my-cluster-juicefs";
+    # Only for apps with `archive.enable`: a bucket of its own, since each such
+    # app's container holds an S3 key to it.
+    # dbArchiveBucket = "my-cluster-db-archive";
   };
 
   logging.retention = "720h";
