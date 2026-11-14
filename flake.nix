@@ -79,6 +79,8 @@
         storageJuicefs = ./modules/storage-juicefs.nix;
         dbPostgres = ./modules/db-postgres.nix;
         dbMariadb = ./modules/db-mariadb.nix;
+        # clusterApps.<app>.archive: the host's half of the database archive.
+        dbArchive = ./modules/db-archive.nix;
         monitoring = ./modules/monitoring.nix;
         logging = ./modules/logging.nix;
         vars = ./modules/vars.nix;
@@ -438,6 +440,41 @@
             import ./tests/backup-roundtrip.nix {
               inherit pkgs;
               lib = nixpkgs.lib;
+            }
+          );
+
+          # The database archiver against an S3 server in a VM: what reaches storage is
+          # encrypted and confirmed there, and what it refuses to do.
+          checks.db-archive = detach (
+            _:
+            import ./tests/db-archive.nix {
+              inherit pkgs;
+              lib = nixpkgs.lib;
+            }
+          );
+
+          # The same for PostgreSQL: WAL handed over by PostgreSQL itself, a bounded queue
+          # of it when storage is away, and the base backup that closes a gap.
+          checks.db-archive-pg = detach (
+            _:
+            import ./tests/db-archive-pg.nix {
+              inherit pkgs;
+              lib = nixpkgs.lib;
+            }
+          );
+
+          # What `clusterApps.<app>.archive` gives a container, and what it refuses.
+          checks.db-archive-wiring = detach (
+            _:
+            import ./tests/db-archive-wiring.nix {
+              inherit pkgs;
+              lib = nixpkgs.lib;
+              topology = fixtureTopology;
+              clusterLib = import ./lib { inherit (nixpkgs) lib; };
+              clanCoreModule = clan-core.nixosModules.clanCore;
+              appContainerModule = ./modules/app-container.nix;
+              overlayNetworkModule = ./modules/overlay-network.nix;
+              dbArchiveModule = ./modules/db-archive.nix;
             }
           );
 
@@ -1762,6 +1799,220 @@
                       }
                     );
                   };
+              }
+            );
+            # The database archiver (tests/db-archive.nix). `cluster.dbArchive.mutate` edits
+            # the shared library's text and the engine's, so an edit cannot be asserted
+            # against either alone: one that changes nothing leaves its control true, and
+            # the mutant fails as unproven.
+            #
+            # A data directory without its marker adopts an archive that already holds data.
+            db-archive-adopts-existing-archive = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "marker-missing-over-data-refused";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''if [ -n "$entries" ]; then'' ]
+                    [ ''if [ -n "$entries" ] && false; then'' ];
+              }
+            );
+            # Storage that did not answer counts as an empty archive.
+            db-archive-unlisted-is-empty = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "unlisted-archive-is-not-empty";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''out=$(walg 30 "" 1 st ls 2>/dev/null) || return 1'' ]
+                    [ ''out=$(walg 30 "" 1 st ls 2>/dev/null) || return 0'' ];
+              }
+            );
+            # WAL-G's cache is left as found: one that names the log being written uploads nothing.
+            db-archive-keeps-walg-cache = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "walg-cache-is-not-trusted";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings [ ''write_walg_cache "$have" ||'' ] [ "true ||" ];
+              }
+            );
+            # The same, and WAL-G's exit status is taken as proof of an upload.
+            db-archive-trusts-exit-status = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "recorded-push-is-in-storage";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [
+                      ''write_walg_cache "$have" ||''
+                      ''if ! in_storage "$gen" "$closed"; then''
+                    ]
+                    [
+                      "true ||"
+                      ''if ! in_storage "$gen" "$closed" && false; then''
+                    ];
+              }
+            );
+            # An empty or short archive key is passed on to WAL-G.
+            db-archive-empty-key = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "no-key-no-upload";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [
+                      ''[ -n "$v" ] ||''
+                      ''[ "''${#key}" -eq 64 ] ||''
+                    ]
+                    [
+                      "true ||"
+                      "true ||"
+                    ];
+              }
+            );
+            # Binary logs numbered again from the start are appended to the generation.
+            db-archive-appends-renumbered-logs = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "renumbered-logs-refused";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''if [ "$current" -le "$have_n" ]; then'' ]
+                    [ ''if [ "$current" -le "$have_n" ] && false; then'' ];
+              }
+            );
+            # An earlier generation is deleted while a restore can still reach into it.
+            db-archive-drops-inside-window = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "generation-inside-the-window-is-kept";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''[ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]'' ]
+                    [ "true" ];
+              }
+            );
+            # A generation later than this data directory's, another node's, is deleted from here.
+            db-archive-drops-later-generation = detach (
+              _:
+              import ./tests/db-archive.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "later-generation-is-not-dropped";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
+              }
+            );
+            # The PostgreSQL archiver (tests/db-archive-pg.nix), edited the same way.
+            #
+            # A data directory without its marker adopts an archive that already holds data.
+            db-archive-pg-adopts-existing-archive = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-marker-missing-over-data-refused";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''if [ -n "$entries" ]; then'' ]
+                    [ ''if [ -n "$entries" ] && false; then'' ];
+              }
+            );
+            # Storage that did not answer counts as an empty archive.
+            db-archive-pg-unlisted-is-empty = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-unlisted-archive-is-not-empty";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ "repo-ls --output=json 2>/dev/null) || return 1" ]
+                    [ "repo-ls --output=json 2>/dev/null) || return 0" ];
+              }
+            );
+            # The repository is not encrypted.
+            db-archive-pg-no-cipher = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-storage-is-encrypted";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [
+                      "repo1-cipher-type=aes-256-cbc"
+                      ''printf 'repo1-cipher-pass=%s\n' "$key"''
+                    ]
+                    [
+                      "repo1-cipher-type=none"
+                      ":"
+                    ];
+              }
+            );
+            # WAL that cannot be archived is kept without limit.
+            db-archive-pg-unbounded-queue = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-wal-queue-is-bounded";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''if [ "$((waiting * size))" -gt'' ]
+                    [ ''if false && [ "$((waiting * size))" -gt'' ];
+              }
+            );
+            # A gap in the archive waits for the next base backup that is due anyway.
+            db-archive-pg-ignores-gap = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-gap-forces-base-backup";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''! has_gap && [ "$((now - before))"'' ]
+                    [ ''[ "$((now - before))"'' ];
+              }
+            );
+            # An earlier generation is deleted while a restore can still reach into it.
+            db-archive-pg-drops-inside-window = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-generation-inside-the-window-is-kept";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings
+                    [ ''[ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]'' ]
+                    [ "true" ];
+              }
+            );
+            # A generation later than this data directory's, another node's, is deleted from here.
+            db-archive-pg-drops-later-generation = detach (
+              _:
+              import ./tests/db-archive-pg.nix {
+                inherit pkgs;
+                lib = nixpkgs.lib;
+                mutant = "pg-later-generation-is-not-dropped";
+                extraModule.cluster.dbArchive.mutate =
+                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
               }
             );
           };

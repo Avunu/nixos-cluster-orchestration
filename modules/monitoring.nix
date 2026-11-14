@@ -22,6 +22,8 @@
 let
   textDir = "/var/lib/prometheus-node-exporter-text";
   known = lib.attrNames config.clusterApps;
+  # modules/db-archive.nix's relay writes these only for apps that archive.
+  archived = lib.attrNames (lib.filterAttrs (_: a: a.archive.enable or false) config.clusterApps);
   net = clusterLib.net;
   meshIp = net.meshIp topology node;
 in
@@ -47,7 +49,7 @@ in
   systemd.tmpfiles.rules = [ "d ${textDir} 0755 root root -" ];
 
   # Per-app textfile metrics outlive the app: once an app leaves apps/, nothing
-  # rewrites its cluster_backup_* or cluster_app_deploy_* file, so its
+  # rewrites its cluster_backup_*, cluster_app_deploy_* or cluster_db_archive_* file, so its
   # BackupStale and AppDeployDegraded alerts would fire forever (demo-erp
   # did, for a week after its removal). Drop the files of apps no longer
   # declared on every switch. Only metrics are removed; the app's state under
@@ -64,6 +66,16 @@ in
       case "$known" in
         *" $app "*) ;;
         *) echo "prune-app-metrics: removing $b ($app is no longer declared)"; rm -f "$f" ;;
+      esac
+    done
+    archived=" ${lib.concatStringsSep " " archived} "
+    for f in ${textDir}/cluster_db_archive_*.prom; do
+      [ -e "$f" ] || continue
+      b=''${f##*/}
+      app=''${b#cluster_db_archive_}; app=''${app%.prom}
+      case "$archived" in
+        *" $app "*) ;;
+        *) echo "prune-app-metrics: removing $b ($app does not archive its database)"; rm -f "$f" ;;
       esac
     done
   '';

@@ -73,6 +73,12 @@ in
   # a new, empty repository: the old ones stay where they were, and nothing finds them.
   appRepoPath = salt: app: "apps/${builtins.hashString "sha256" (salt + app)}";
 
+  # Where an app's database archive sits in the archive bucket (modules/db-archive.nix):
+  # `db/<sha256>`, for the same reason. The hash is not the repository path's: the
+  # same app's two paths, side by side, do not match. The salt is as fixed here as
+  # there. A new one starts every app on a new, empty archive.
+  dbArchivePrefix = salt: app: "db/${builtins.hashString "sha256" ("db-archive:" + salt + app)}";
+
   supportedTypes = lib.attrNames types;
   repository = t: path: (backend t).repository t path;
   options = t: (backend t).options t;
