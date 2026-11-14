@@ -16,7 +16,6 @@ from avc.core import proc
 class App:
     name: str
     kind: str | None
-    home_node: str | None
     job: str
     tunnel: str
     hostnames: list[str]
@@ -39,7 +38,6 @@ def parse_index(data: dict[str, Any]) -> Index:
         name: App(
             name=name,
             kind=a.get("kind"),
-            home_node=a.get("homeNode"),
             job=a["job"],
             tunnel=a.get("tunnel", ""),
             hostnames=a.get("hostnames", []),

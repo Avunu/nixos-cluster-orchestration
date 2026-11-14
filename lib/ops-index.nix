@@ -89,7 +89,6 @@ in
 
   apps = lib.mapAttrs (name: a: {
     kind = lib.findFirst (k: (a.${k} or null) != null) null kinds;
-    inherit (a) homeNode;
     job = "app-${name}";
     tunnel = a.tunnel.id;
     hostnames = lib.attrNames a.tunnel.ingress;

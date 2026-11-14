@@ -302,17 +302,17 @@ class Agent:
             return out.read().strip().splitlines()[-1]
 
     def clone_names(self, name: str) -> tuple[str, str, str]:
+        """The app's dataset on this node (modules/app-state.nix), and the slot's clone."""
         src = run("findmnt", "-n", "-o", "SOURCE", CFG["stateMount"]).stdout.strip()
         parent = f"{src.split('/')[0]}/preview"
-        return (f"{src}@preview-{name}", parent, f"{parent}/{name}")
+        return (f"{src}/apps/{self.slot_cfg[name]['app']}", parent, f"{parent}/{name}")
 
     def unseed(self, name: str) -> None:
         """The slot's copy of everything, gone. The container is stopped first."""
         run("systemctl", "stop", f"container@{name}.service", timeout=START_TIMEOUT)
-        snap, _parent, clone = self.clone_names(name)
-        for ds in (clone, snap):
-            if run("zfs", "list", "-H", "-o", "name", ds, check=False).returncode == 0:
-                run("zfs", "destroy", ds)
+        _state, _parent, clone = self.clone_names(name)
+        if run("zfs", "list", "-H", "-o", "name", clone, check=False).returncode == 0:
+            run("zfs", "destroy", clone)
         files = pathlib.Path(CFG["jfsMount"], "previews", name)
         if files.exists():
             run("juicefs", "rmr", str(files), timeout=3600)
@@ -321,15 +321,28 @@ class Agent:
 
     def seed(self, name: str) -> None:
         self.unseed(name)
-        snap, parent, clone = self.clone_names(name)
+        state, parent, clone = self.clone_names(name)
+        app = self.slot_cfg[name]["app"]
+        # The newest snapshot this node has of the app's state: its own of a minute ago
+        # where the app runs here, a replica's elsewhere. Not one made now: a snapshot
+        # of this node's own on a replica would stop the next one from arriving. One
+        # instant for every file of the database either way, so it comes up as after a
+        # power cut: recovered, and consistent. The clone shares its blocks with the
+        # snapshot until it writes.
+        listed = run("zfs", "list", "-H", "-t", "snapshot", "-d", "1", "-o", "name", "-s", "createtxg", state, check=False)
+        snaps = [s for s in listed.stdout.split() if "@repl-" in s]
+        if not snaps:
+            raise Failed(f"This node has no copy of {app}'s data to start from yet (`cluster-state status`).")
         if run("zfs", "list", "-H", "-o", "name", parent, check=False).returncode != 0:
             run("zfs", "create", "-o", "mountpoint=none", "-o", "com.sun:auto-snapshot=false", parent)
-        # One instant for every file of the database, so it comes up as after a power
-        # cut: recovered, and consistent. The clone shares its blocks with production
-        # until either side writes.
-        run("zfs", "snapshot", snap)
-        run("zfs", "clone", "-o", f"mountpoint={CFG['cloneRoot']}/{name}", "-o", "com.sun:auto-snapshot=false", snap, clone)
-        base = pathlib.Path(CFG["jfsMount"], "clients", self.slot_cfg[name]["app"])
+        run(
+            "zfs", "clone",
+            "-o", f"mountpoint={CFG['cloneRoot']}/{name}/clients/{app}",
+            "-o", "readonly=off",
+            "-o", "com.sun:auto-snapshot=false",
+            snaps[-1], clone,
+        )  # fmt: skip
+        base = pathlib.Path(CFG["jfsMount"], "clients", app)
         if base.exists():
             dst = pathlib.Path(CFG["jfsMount"], "previews", name)
             dst.parent.mkdir(parents=True, exist_ok=True)

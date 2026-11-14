@@ -42,10 +42,13 @@
 # one that has. Nothing of them leaves the node except through restic, encrypted.
 #
 # ── where it runs ───────────────────────────────────────────────────────────
-# An app is backed up on its homeNode -- the only node its database can be
-# dumped on (monolith/split tiers are pinned there; so is every WordPress site,
-# lib/mk-wordpress-site.nix). An unpinned app falls back to the node tagged
-# `backup`. While a backup or restore runs, pull-deploys are held
+# Every node can back up every app, and the one that does is the one the app's
+# container is running on when the timer fires: the only node its database can be
+# dumped on, and Nomad's choice, not this module's (modules/app-state.nix). The
+# rehearsal and the prune follow the same rule. An app running nowhere is backed up
+# by nobody, and BackupStale says so; the metrics are per node, so the alerts take
+# the newest any node has (lib/alert-rules.nix). While a backup or restore runs,
+# pull-deploys are held
 # (/run/cluster-upgrade.hold.d, modules/pull-deploy-core.nix): a deploy reloads the
 # container, which restarts the very units a dump is reading from.
 #
@@ -71,14 +74,15 @@ let
   bt = clusterLib.backupTarget;
   jfsMount = clusterLib.juicefs.mountPoint;
 
-  isBackupNode = builtins.elem "backup" (node.tags or [ ]);
-
-  # Apps whose backup runs on THIS node.
-  apps = lib.filterAttrs (
-    _n: app:
-    app.backup.enable && (if app.homeNode != null then app.homeNode == nodeName else isBackupNode)
-  ) config.clusterApps;
+  # Every node has every app's profile and units; which node uses them is decided
+  # when they run (`runs_here`, below).
+  apps = lib.filterAttrs (_n: app: app.backup.enable) config.clusterApps;
   appNames = lib.attrNames apps;
+
+  # modules/app-state.nix, where it is imported and on: a restore into a stopped
+  # app's local state has to mount the app's dataset first, and hand it back after.
+  stateTool =
+    if (config.cluster.state.enable or false) then "${config.cluster.state.package}/bin/cluster-state" else "";
 
   guest = n: config.containers.${n}.config;
 
@@ -249,6 +253,7 @@ let
         lib.escapeShellArg (if app.backup.verifyQuery != null then app.backup.verifyQuery else "")
       }
       LOCAL_SNAPSHOT=${if app.backup.localSnapshot then "1" else "0"}
+      STATE_TOOL=${lib.optionalString (app.localState != { }) stateTool}
       PRE_SCRIPT=${
         lib.optionalString (app.backup.preCommand != null) (
           pkgs.writeShellScript "cluster-backup-pre-${n}" ''
@@ -339,6 +344,9 @@ let
       printf '%s\n' "$@" > "$f.tmp"
       mv "$f.tmp" "$f"
     }
+
+    # Whether this node is the one to act on an app: the one running it.
+    runs_here() { systemctl is-active --quiet "container@$1.service"; }
 
     hold() { mkdir -p ${holdDir}; touch "${holdDir}/$1"; }
     unhold() { rm -f "${holdDir}/$1"; }
@@ -528,6 +536,8 @@ let
     rc=0
     for prof in "$@"; do
       source "$prof"
+      # One node prunes a repository: the one running the app.
+      runs_here "$APP" || continue
       echo "== $APP"
       if ! r cat config >/dev/null 2>&1; then echo "$APP: no repository yet; skipped"; continue; fi
       r unlock >/dev/null 2>&1 || true
@@ -668,7 +678,8 @@ let
       --to-scratch DIR only extract the snapshot into DIR; nothing is touched
       --yes            actually do it (without it, the plan is printed and nothing runs)
 
-    Runs on the app's homeNode. Pull-deploys are held for the duration. A ZFS
+    Runs on the node the app is running on, or on any node while it runs on
+    none. Pull-deploys are held for the duration. A ZFS
     snapshot of the app's local state is taken first; the JuiceFS files it
     replaces stay in /mnt/jfs/.trash for the trash period. A localSnapshot
     app's local state can be restored with its container stopped (a node
@@ -682,16 +693,8 @@ let
     })
     prof=''${PROFILES[$app]:-}
     if [ -z "$prof" ]; then
-      echo "cluster-restore: '$app' is not backed up on this node ($(hostname))." >&2
-      echo "  apps here: ${lib.concatStringsSep " " appNames}" >&2
-      ${lib.concatStringsSep "\n      " (
-        lib.mapAttrsToList (
-          n: a:
-          lib.optionalString (
-            a.homeNode != null
-          ) ''[ "$app" = ${n} ] && echo "  ${n} runs on its homeNode: ${a.homeNode}" >&2''
-        ) config.clusterApps
-      )}
+      echo "cluster-restore: '$app' is not a backed-up app." >&2
+      echo "  apps: ${lib.concatStringsSep " " appNames}" >&2
       exit 2
     fi
     source "$prof"
@@ -727,6 +730,13 @@ let
     [ "$localstate" = 1 ] && for p in "''${LOCAL_PATHS[@]}"; do echo "  - local state: replace $p"; done
     running=0
     systemctl is-active --quiet "container@$APP" && running=1
+    if [ "$running" = 0 ] && [ -n "$STATE_TOOL" ]; then
+      elsewhere=$("$STATE_TOOL" where "$APP") || { echo "cluster-restore: could not ask the other nodes whether $APP is running" >&2; exit 1; }
+      if [ -n "$elsewhere" ]; then
+        echo "cluster-restore: $APP is running on $elsewhere; restore it there" >&2
+        exit 1
+      fi
+    fi
     stop=0
     { [ "$db" = 1 ] || [ "$localstate" = 1 ]; } && [ "$running" = 1 ] && [ "''${#APP_UNITS[@]}" -gt 0 ] && stop=1
     [ "$stop" = 1 ] && echo "  - stop ''${APP_UNITS[*]} first, start them again after (deploy-time migrations re-run)"
@@ -747,13 +757,19 @@ let
     hold "restore-$APP"
     work=$(mktemp -d /var/lib/cluster-backup/restore/"$APP".XXXXXX)
     trap 'unhold "restore-$APP"; rm -rf "$work"' EXIT
+    # A stopped app's dataset is mounted nowhere. Take it, as a start would, and hand
+    # it back with a snapshot, so that wherever the app starts next has what was restored.
+    if [ "$localstate" = 1 ] && [ "$running" = 0 ] && [ -n "$STATE_TOOL" ]; then
+      "$STATE_TOOL" acquire "$APP" || { echo "cluster-restore: could not take $APP's state on this node" >&2; exit 1; }
+      trap '"$STATE_TOOL" release "$APP"; unhold "restore-$APP"; rm -rf "$work"' EXIT
+    fi
 
     ensure_repo || exit 1
     echo "== fetching snapshot"
     r restore "$snapshot" --host "$APP" --target "$work" || { echo "restic restore failed" >&2; exit 1; }
 
-    # Safety point for the local state (the database's datadir). Copied out of,
-    # never rolled back to: rpool/state holds every app on this node.
+    # Safety point for the local state (the database's datadir). Copied out of, not
+    # rolled back to. In the app's own dataset it goes to the other nodes with the rest.
     stamp=$(date +%Y%m%d-%H%M%S)
     for p in "''${LOCAL_PATHS[@]}"; do
       ds=$(zfs list -H -o name "$p" 2>/dev/null) || { echo "note: $p is not on ZFS; no safety snapshot" >&2; continue; }
@@ -859,7 +875,7 @@ let
   cluster-backup = pkgs.writeShellScriptBin "cluster-backup" ''
     set -euo pipefail
     if [ $# -eq 0 ]; then
-      echo "backing up every app on $(hostname): ${lib.concatStringsSep " " appNames}"
+      echo "backing up every app running on $(hostname), of: ${lib.concatStringsSep " " appNames}"
       exec systemctl start cluster-backup.service
     fi
     for app in "$@"; do
@@ -906,11 +922,6 @@ in
   };
 
   config = lib.mkIf (apps != { }) {
-    assertions = lib.mapAttrsToList (n: app: {
-      assertion = app.localState == { } || app.homeNode != null;
-      message = "clusterApps.${n}: an app with localState must set homeNode -- its database can only be backed up and restored where that state lives.";
-    }) config.clusterApps;
-
     users.users.cluster-backup-verify = {
       isSystemUser = true;
       group = "cluster-backup-verify";
@@ -957,21 +968,31 @@ in
         # uplink to the target sane, and every app keeps its own unit, journal
         # and failed state.
         cluster-backup = {
-          description = "Back up every app on this node";
+          description = "Back up every app running on this node";
           serviceConfig.Type = "oneshot";
+          # An app running elsewhere is that node's: its last status here says
+          # nothing any more, and BackupPartial would go on repeating it.
           script = ''
             rc=0
-            ${lib.concatMapStringsSep "\n" (n: "systemctl start cluster-backup-${n}.service || rc=1") appNames}
+            one() {
+              if systemctl is-active --quiet "container@$1.service"; then
+                systemctl start "cluster-backup-$1.service" || rc=1
+              else
+                rm -f ${metricsDir}/cluster_backup_"$1"_run.prom
+              fi
+            }
+            ${lib.concatMapStringsSep "\n" (n: "one ${n}") appNames}
             exit $rc
           '';
         };
         cluster-backup-verify = {
-          description = "Restore rehearsal for every app on this node";
+          description = "Restore rehearsal for every app running on this node";
           serviceConfig.Type = "oneshot";
           script = ''
             rc=0
             ${lib.concatMapStringsSep "\n" (
-              n: "systemctl start cluster-backup-verify-${n}.service || rc=1"
+              n:
+              "systemctl is-active --quiet container@${n}.service && { systemctl start cluster-backup-verify-${n}.service || rc=1; }"
             ) appNames}
             exit $rc
           '';

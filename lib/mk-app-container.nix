@@ -8,9 +8,10 @@
 #       starts and stops container@<name>) collected into
 #       system.build.nomadJobs.<name>.
 #
-# Tier semantics (per plan):
-#   monolith/split -> pinned to app.homeNode (its localState lives there), count=1.
-#   replica/scale  -> DB tier layered by db-* modules; app spreads via Nomad.
+# Nomad chooses the node. An app with `localState` runs as one allocation, and its
+# state follows it there (modules/app-state.nix); one without spreads as `nomad` says.
+# The two constraints an app can carry are derived, not named: a ready JuiceFS mount,
+# and for `network.hostAccess` the metrics node, the only one that routes to itself.
 { lib }:
 let
   inherit (lib)
@@ -22,7 +23,12 @@ let
     optionals
     ;
   net = import ./net.nix { inherit lib; };
-  inherit (import ./nomad.nix) maxKillTimeoutSeconds appsNamespace appsUser;
+  inherit (import ./nomad.nix)
+    maxKillTimeoutSeconds
+    stopOnClientAfterSeconds
+    appsNamespace
+    appsUser
+    ;
 in
 {
   app, # one clusterApps.<name> submodule value
@@ -30,7 +36,7 @@ in
   pkgs,
   topology,
   node, # THIS host's topology node — the container's IPv6 GUA comes from the
-  # node it actually runs on, not from app.homeNode.
+  # node it actually runs on.
   # Whether this app is in a peerAccess flow (modules/app-container.nix): then its
   # br-app veth is vp-<iid>, which the host firewall names, not nspawn's vb-<name>.
   peerPort ? false,
@@ -39,8 +45,11 @@ let
   n = app.name;
 
   usesJfs = app.juicefsPaths != { };
-  pinned = app.homeNode != null;
-  home = if pinned then topology.nodes.${app.homeNode} else null;
+  # One writer: a database's directory, wherever Nomad puts the app.
+  stateful = app.localState != { };
+  # Loki and Prometheus answer on the metrics node's mesh address, which only that
+  # node's own containers can route to (modules/app-container.nix, hostAccess).
+  metricsOnly = app.network.hostAccess != [ ];
 
   # A preview slot (modules/apps.nix, modules/ci-agent.nix): declared like any app, so
   # everything the host decides about a container is decided here, at evaluation, and
@@ -84,12 +93,9 @@ let
   # The credentials secret rides the existing secrets bind-mount mechanism, so
   # the connector needs no special handling — it is just another guest secret.
   #
-  # Deliberately NOT gated on "can this app run here". Every node builds an
-  # identical container for every app — that is the core of the design (dormant
-  # everywhere, Nomad decides when, not whether it exists). Mounting secrets
-  # only on an app's homeNode would make the container definition differ per
-  # node, so escalating a monolith to a replica tier, or removing a pin, would
-  # start it somewhere with no credentials and fail silently. App secrets are
+  # Every node builds an identical container for every app — that is the core of
+  # the design (dormant everywhere, Nomad decides when and where, not whether it
+  # exists). So every node has every app's secrets, and app secrets are
   # `share = true` for the same reason.
   credsGuestName = "cloudflared";
 
@@ -280,10 +286,10 @@ let
 
   constraints =
     app.nomad.constraints
-    ++ optional pinned {
+    ++ optional metricsOnly {
       LTarget = "\${node.unique.name}";
       Operand = "=";
-      RTarget = home.hostName;
+      RTarget = (net.soleTaggedNode topology "metrics").hostName;
     }
     ++ optional usesJfs {
       LTarget = "\${meta.jfs_ready}";
@@ -295,7 +301,7 @@ let
       RTarget = "true";
     };
 
-  count = if pinned then 1 else app.nomad.count;
+  count = if stateful then 1 else app.nomad.count;
 
   # Nomad jobspec (JSON) — submitted by nomad-bootstrap.service (Phase 7).
   job = {
@@ -344,7 +350,12 @@ let
               }
             ];
           }
-          // optionalAttrs (app.nomad.max > app.nomad.min && !pinned) {
+          // optionalAttrs stateful {
+            # Cut off from the servers, this node stops the app by itself, because
+            # they will have started it elsewhere (lib/nomad.nix). Nanoseconds.
+            Disconnect.StopOnClientAfter = stopOnClientAfterSeconds * 1000000000;
+          }
+          // optionalAttrs (app.nomad.max > app.nomad.min && !stateful) {
             Scaling = {
               Min = app.nomad.min;
               Max = app.nomad.max;
@@ -489,9 +500,6 @@ let
     };
   };
 in
-assert lib.assertMsg (
-  (app.tier == "monolith" || app.tier == "split") -> pinned
-) "clusterApps.${n}: tier \"${app.tier}\" requires homeNode (its local state lives there)";
 assert lib.assertMsg (app.nomad.killTimeoutSeconds >= app.stopTimeoutSeconds)
   "clusterApps.${n}: nomad.killTimeoutSeconds (${toString app.nomad.killTimeoutSeconds}) is shorter than stopTimeoutSeconds (${toString app.stopTimeoutSeconds}) — Nomad would SIGKILL the wrapper while the container is still stopping cleanly.";
 assert lib.assertMsg (app.nomad.killTimeoutSeconds <= maxKillTimeoutSeconds)
@@ -647,8 +655,10 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
   };
 
   # (b) rendered Nomad job for the bootstrap oneshot to register.
-  # Not for a slot: the agent starts and stops it, on the one node that has its data.
+  # Not for a slot: the agent starts and stops it, on the node the Worker gave it.
   system.build.nomadJobs = optionalAttrs (!isPreview) {
     ${n} = pkgs.writeText "nomad-${n}.json" (builtins.toJSON job);
   };
+  # The same job as a value, for whatever asks where an app may run without building.
+  system.build.nomadJobSpecs = optionalAttrs (!isPreview) { ${n} = job; };
 }

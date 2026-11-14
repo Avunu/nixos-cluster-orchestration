@@ -1,7 +1,6 @@
 # demo-idm — the freeipa kind, with Authelia in front of it.
 { ... }:
 {
-  homeNode = "node1";
   freeipa = {
     hostname = "idm.example.com";
     domain = "example.com";

@@ -26,10 +26,9 @@ types.submodule {
       description = ''
         TCP ports this app may reach on the `metrics` node's mesh address (Loki,
         Prometheus). Only from the metrics node itself: no other node routes a
-        container to a mesh address. So the app must be pinned there (`homeNode`
-        carrying the `metrics` tag), and its name must be at most 12 characters,
-        because its identity is nspawn's veth `vb-<name>`, which nspawn shortens
-        unpredictably beyond that. Both are asserted.
+        container to a mesh address. So the app's job is constrained to that node,
+        and its name must be at most 12 characters, because its identity is nspawn's
+        veth `vb-<name>`, which nspawn shortens unpredictably beyond that (asserted).
       '';
     };
     peerAccess = mkOption {

@@ -67,10 +67,6 @@ let
                   type = lib.types.str;
                   default = name;
                 };
-                homeNode = lib.mkOption {
-                  type = lib.types.nullOr lib.types.str;
-                  default = null;
-                };
                 localState = lib.mkOption {
                   type = lib.types.attrsOf lib.types.str;
                   default = { };
@@ -190,9 +186,19 @@ pkgs.testers.runNixOSTest {
         };
       };
 
+      # Every app has a container on every node; the node that backs an app up is the
+      # one where it is running.
+      containers.filesonly = {
+        autoStart = true;
+        config.system.stateVersion = "25.11";
+      };
+      containers.elsewhere = {
+        autoStart = false;
+        config.system.stateVersion = "25.11";
+      };
+
       clusterApps = {
         zfsapp = {
-          homeNode = "machine";
           localState."/var/lib/zfsapp" = "/state/clients/zfsapp/data";
           backup = {
             engine = "none";
@@ -208,23 +214,20 @@ pkgs.testers.runNixOSTest {
           };
         };
         pgapp = {
-          homeNode = "machine";
           localState."/var/lib/postgresql" = "/var/lib/nixos-containers/pgapp/var/lib/postgresql";
           juicefsPaths."/srv" = "clients/pgapp/files";
         };
         myapp = {
-          homeNode = "machine";
           localState."/var/lib/mysql" = "/var/lib/nixos-containers/myapp/var/lib/mysql";
           juicefsPaths."/srv" = "clients/myapp/files";
         };
         filesonly = {
-          homeNode = "machine";
           juicefsPaths."/srv" = "clients/filesonly/files";
           backup.engine = "none";
         };
-        # Pinned elsewhere: must NOT be backed up here.
+        # Running on another node, which here is a container that is not started:
+        # must NOT be backed up here.
         elsewhere = {
-          homeNode = "some-other-node";
           juicefsPaths."/srv" = "clients/elsewhere/files";
           backup.engine = "none";
         };
@@ -288,9 +291,9 @@ pkgs.testers.runNixOSTest {
         # A snapshot a crashed run left behind must not break the next one.
         machine.succeed("zfs snapshot tank/state@cluster-backup-zfsapp")
 
-    with subtest("only this node's apps get units"):
-        machine.succeed("systemctl cat cluster-backup-pgapp.service cluster-backup-myapp.service cluster-backup-filesonly.service")
-        machine.fail("systemctl cat cluster-backup-elsewhere.service")
+    with subtest("every app has units on every node"):
+        machine.succeed("systemctl cat cluster-backup-pgapp.service cluster-backup-myapp.service cluster-backup-filesonly.service cluster-backup-elsewhere.service")
+        machine.wait_for_unit("container@filesonly.service")
 
     with subtest("backup every app"):
         machine.succeed("cluster-backup")
@@ -301,7 +304,9 @@ pkgs.testers.runNixOSTest {
         repos = machine.succeed("ls /srv/s3/backups/apps/").split()
         for app in ["pgapp", "myapp", "filesonly", "zfsapp"]:
             assert app in repos, repos
+        # Not running here, so another node's to back up: nothing done, nothing said.
         assert "elsewhere" not in repos, repos
+        machine.fail("ls /var/lib/prometheus-node-exporter-text/ | grep -q elsewhere")
         machine.succeed("cluster-backup-list pgapp | grep -q engine:postgresql")
         machine.succeed("cluster-backup-list myapp | grep -q engine:mariadb")
         # The preCommand ran inside the container; the run's snapshot is gone.
@@ -386,9 +391,9 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl start container@zfsapp.service")
         machine.wait_until_succeeds("nixos-container run zfsapp -- systemctl is-active zfsapp-web.service")
 
-    with subtest("restore refuses an app that lives elsewhere"):
-        out = machine.fail("cluster-restore elsewhere --yes 2>&1")
-        assert "some-other-node" in out, out
+    with subtest("restore refuses an app nothing declares"):
+        out = machine.fail("cluster-restore nosuchapp --yes 2>&1")
+        assert "not a backed-up app" in out, out
 
     with subtest("restore rehearsal and maintenance"):
         machine.succeed("systemctl start cluster-backup-verify.service")

@@ -4,7 +4,7 @@
 #   grafana = { hostname; adminGroup; editorGroup; };
 #   oidc.idp = "<the FreeIPA app whose Authelia signs users in>";
 #
-# A monolith pinned to the `metrics` node, where Loki and Prometheus run, with
+# One container, held to the `metrics` node, where Loki and Prometheus run, with
 # its own tunnel. Nothing about it is special to the platform: it is one more
 # container, which may reach those two services on that node's mesh address and
 # nothing else on the host (network.hostAccess; modules/overlay-network.nix).
@@ -215,10 +215,9 @@ in
 
           config = lib.mkIf (config.grafana != null) {
             tier = lib.mkDefault "monolith";
-            # Beside Loki and Prometheus, which it reaches on that node's mesh address.
-            homeNode = lib.mkDefault metricsNode.hostName;
             # The only host ports it may reach, by its bridge port: so its name is at
-            # most 12 characters, and it stays on a metrics node (both asserted).
+            # most 12 characters (asserted), and its job is constrained to the metrics
+            # node, beside Loki and Prometheus (lib/mk-app-container.nix).
             network.hostAccess = [
               net.lokiPort
               net.prometheusPort

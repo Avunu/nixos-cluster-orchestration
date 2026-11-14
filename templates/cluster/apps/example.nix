@@ -3,7 +3,6 @@
 { inputs, ... }:
 {
   enable = false;
-  homeNode = "node1";
   odoo = {
     package = inputs.my-odoo-project.packages.x86_64-linux.default;
     hostname = "odoo.example.com";

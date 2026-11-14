@@ -46,8 +46,10 @@ let
         example = "10.20.1.2";
         description = ''
           Static IPv4 for this container on br-app, and the only address MariaDB
-          binds. Must sit below the home node's DHCP pool (appDhcpPoolOffset) and
-          above the bridge gateway, i.e. .2 through .9 with the defaults.
+          binds. Must sit in one node's app subnet, below its DHCP pool
+          (appDhcpPoolOffset) and above the bridge gateway, i.e. .2 through .9 with
+          the defaults. That node is where this app runs: an address does not move
+          between nodes' subnets, so this is the one kind Nomad cannot place.
 
           This is the host every WordPress plane is handed as DB_HOST, so
           changing it means rewriting every site's database.host.
@@ -132,7 +134,14 @@ in
           { name, config, ... }:
           let
             w = config.wpdb;
-            node = topology.nodes.${config.homeNode};
+            # The node whose app subnet the address is in (a /24, lib/net.nix).
+            net24 = a: lib.concatStringsSep "." (lib.take 3 (lib.splitString "." a));
+            owners = lib.filter (n: net24 n.appBridgeIp == net24 w.address) (lib.attrValues topology.nodes);
+            node =
+              if lib.length owners == 1 then
+                lib.head owners
+              else
+                throw "clusterApps.${name}: wpdb.address ${w.address} is in ${toString (lib.length owners)} nodes' app subnets; it must be in exactly one (nodes.<n>.appSubnet).";
             prefix = lib.last (lib.splitString "/" node.appSubnet);
           in
           {
@@ -143,8 +152,16 @@ in
             };
 
             config = lib.mkIf (config.wpdb != null) {
-              # Its data is on local disk, so it cannot move node.
               tier = lib.mkDefault "monolith";
+              # Its address is in one node's subnet (see `address`), so it runs there.
+              # Its data is replicated like any app's all the same.
+              nomad.constraints = [
+                {
+                  LTarget = "\${node.unique.name}";
+                  Operand = "=";
+                  RTarget = node.hostName;
+                }
+              ];
 
               module = {
                 services.mysql = {
@@ -249,7 +266,7 @@ in
               # get the same stored value, so they cannot disagree.
               secrets = lib.mapAttrs' (slug: d: lib.nameValuePair "${slug}-db-password" d.secret) sites;
 
-              # Local disk on the home node, on the auto-snapshotted dataset.
+              # Local disk, in the app's own dataset (modules/app-state.nix).
               localState."/var/lib/mysql" = "/state/clients/${name}/mysql";
 
               # backup-core detects `mariadb` from services.mysql.enable inside

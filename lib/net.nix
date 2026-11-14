@@ -90,7 +90,7 @@ rec {
     concatStringsSep "." (octets ++ [ (toString node.index) ]);
 
   # The TCP ports a node serves on the mesh, by role. Appendix E of the design:
-  # every node its exporters and its log shipper; `metrics` Loki and Prometheus;
+  # every node its exporters, its log shipper and its app state; `metrics` Loki and Prometheus;
   # `etcd` etcd; `juicefs-meta` the metadata engine. The host firewall accepts
   # exactly these on the mesh interface, and nothing of them anywhere else.
   meshPortsFor =
@@ -99,6 +99,7 @@ rec {
       nodeExporterPort
       smartctlExporterPort
       vectorMetricsPort
+      statePort
     ]
     ++ lib.optionals (hasTag "metrics" node) [
       lokiPort
@@ -184,6 +185,11 @@ rec {
   # https, by address: every agent certificate carries IP:<controlIp> for exactly
   # this (lib/nomad-pki.nix), and every caller presents a client certificate.
   nomadAddr = node: "https://${node.controlIp}:${toString nomadHttpPort}";
+
+  # ── App state ───────────────────────────────────────────────────────────────
+  # Where each node answers its peers about the app state it holds, and sends it
+  # (modules/app-state.nix). On the mesh, like everything but Nomad.
+  statePort = 8731;
 
   # ── Observability ───────────────────────────────────────────────────────────
   # Named here rather than in the modules because the exporter port is bound by

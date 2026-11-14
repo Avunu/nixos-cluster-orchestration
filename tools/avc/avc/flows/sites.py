@@ -137,7 +137,7 @@ def r2_rotate(ctx: Ctx, slug: str) -> None:
         ctx,
         f"chore(secrets): rotate {slug} R2 key",
         paths=["vars/", "secrets/"],
-        post=[ship.restart(f"app-{slug}", ctx.index.apps[slug].home_node or ctx.index.leader)]
+        post=[ship.restart(f"app-{slug}", ctx.index.leader)]
         if slug in ctx.index.apps
         else [],
     )

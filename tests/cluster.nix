@@ -20,7 +20,7 @@
 #     JuiceFS bind-mounted in; containers on different nodes reach each other
 #     over the app-VLAN routes, on the one port the probe declares (network.peerAccess:
 #     container to container is default-deny, modules/overlay-network.nix)
-#   - a pinned app lands on its homeNode only, and a container started behind
+#   - an app held to node2 by a Nomad constraint lands there only, and a container started behind
 #     Nomad's back elsewhere is fenced (modules/nomad-bootstrap.nix), by the fence's
 #     own scoped token; a healthy fence stops nothing that Nomad placed
 #   - with no leader (Nomad stopped on two of three voters), the fence on the third
@@ -130,7 +130,14 @@ let
         # (modules/kinds/freeipa.nix), so `vector-still-ships` covers both places a
         # container journal can live behind a directory a task can't read.
         pinned = {
-          homeNode = "node2";
+          # Nomad's own way to say where; nothing in the library names a node.
+          nomad.constraints = [
+            {
+              LTarget = "\${node.unique.name}";
+              Operand = "=";
+              RTarget = "node2";
+            }
+          ];
           tier = "monolith";
           localState."/var/lib/pinned" = "/state/clients/pinned";
           localState."/var/log/journal" = "/state/clients/pinned-journal";
@@ -305,7 +312,7 @@ pkgs.testers.runNixOSTest {
                 timeout=120,
             )
 
-        with subtest("the pinned app runs on its homeNode only, with its secret and local state"):
+        with subtest("the app held to node2 runs there only, with its secret and local state"):
             def pinned_on_node2(_):
                 allocs = nomad_api(node1, NODE1, f"/v1/job/app-pinned/allocations?namespace={NS}")
                 running = [a for a in allocs if a["ClientStatus"] == "running"]

@@ -3,7 +3,7 @@
 #   odoo = { package; hostname; workers; … };
 #
 # A Tier-0 monolith: Odoo (odoo-nix) + nginx over a unix socket + a local
-# PostgreSQL with socket peer auth, in one container pinned to its homeNode.
+# PostgreSQL with socket peer auth, in one container, on whichever node Nomad picks.
 # The filestore and runtime odoo.conf are on JuiceFS (they follow the app);
 # PostgreSQL's data is on the node's local ZFS, never JuiceFS.
 #
@@ -142,7 +142,7 @@ in
 
             # Runtime odoo.conf + the filestore -- shared, follows the app.
             juicefsPaths."/var/lib/odoo" = "${pv.jfsRoot}/odoo";
-            # PostgreSQL data -- local disk on the home node, never JuiceFS.
+            # PostgreSQL data -- local disk, in the app's own dataset, never JuiceFS.
             localState."/var/lib/postgresql" = "${pv.stateRoot}/clients/${pv.base}/postgresql";
 
             secrets.admin-passwd = {

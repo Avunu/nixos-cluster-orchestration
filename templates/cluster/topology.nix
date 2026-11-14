@@ -142,7 +142,6 @@
         "nomad-leader"
         "juicefs-meta"
         "metrics"
-        "backup"
       ];
       hostId = "00000000"; # ZFS: head -c4 /dev/urandom | od -A none -t x4
 

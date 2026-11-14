@@ -3,7 +3,7 @@
 #   frappe = { package; site; webThreads; };
 #
 # A Tier-0 monolith: frappe-nix's bench + a local MariaDB + a local Redis in
-# one container pinned to its homeNode, nginx serving the site over a unix
+# one container on whichever node Nomad picks, nginx serving the site over a unix
 # socket. The site directory (sites/, uploads, site_config, backups) is on
 # JuiceFS and follows the app; MariaDB's data is on the node's local ZFS.
 #
@@ -174,7 +174,7 @@ in
 
             # The whole site directory -- shared, follows the app.
             juicefsPaths."/var/lib/frappe/${f.site}" = "${pv.jfsRoot}/frappe";
-            # MariaDB data -- local disk on the home node, never JuiceFS.
+            # MariaDB data -- local disk, in the app's own dataset, never JuiceFS.
             localState."/var/lib/mysql" = "${pv.stateRoot}/clients/${pv.base}/mysql";
 
             secrets = {

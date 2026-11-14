@@ -21,6 +21,9 @@
 #   disks        the qemu VM module overrides disko's fileSystems/swap; the disk
 #                layout is covered by tests/install-boot.nix instead.
 #   pull loop    the timer is unhooked: it would fetch github: and fail offline.
+#   app state    with no ZFS, /state is a directory, so `cluster.state` is off: an
+#                app's local state is wherever the app starts, and does not follow
+#                it. tests/app-state.nix has the pools, and proves that it does.
 #
 # A function of the topology: Nomad's server certificates follow the `nomad-server`
 # tag (tests/lib/fixture-pki.nix), so tests/cluster.nix, which promotes node2 and
@@ -242,6 +245,8 @@ let
       # Offline: a tick of the pull loop would only fail on fetching github:.
       # The unit itself stays, so its configuration is still built.
       systemd.timers.cluster-upgrade.wantedBy = lib.mkForce [ ];
+      # No ZFS in these VMs: see the header.
+      cluster.state.enable = false;
 
       # QEMU reports no CPU frequency on some hosts, which leaves Nomad
       # fingerprinting 0 MHz and every allocation "exhausted" on cpu.

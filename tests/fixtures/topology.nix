@@ -126,7 +126,6 @@
         "nomad-leader"
         "juicefs-meta"
         "metrics"
-        "backup"
       ];
       hostId = "f0000001";
 

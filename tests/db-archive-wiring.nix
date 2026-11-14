@@ -59,20 +59,17 @@ let
 
           clusterApps.shop = {
             tier = "monolith";
-            homeNode = "node1";
             module = mariaApp;
             archive.enable = true;
             archive.flushSeconds = 30;
           };
           clusterApps.ledger = {
             tier = "monolith";
-            homeNode = "node1";
             module = pgApp;
             archive.enable = true;
           };
           clusterApps.plain = {
             tier = "monolith";
-            homeNode = "node1";
             module = mariaApp;
           };
         }
@@ -293,7 +290,6 @@ let
           bad = systemWith topology {
             clusterApps.empty = {
               tier = "monolith";
-              homeNode = "node1";
               module = {
                 systemd.services.stub.script = "sleep infinity";
               };

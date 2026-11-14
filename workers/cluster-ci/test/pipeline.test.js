@@ -47,8 +47,8 @@ function harness({ failTunnel = false } = {}) {
     now: () => 1000,
     log: () => {},
   });
-  const agent = (previews = [], version = 0) =>
-    pipeline.sync("node1", {
+  const agent = (previews = [], version = 0, node = "node1") =>
+    pipeline.sync(node, {
       version,
       flake: `github:${SITE}`,
       apps: [{ app: "shop", repo: REPO, slots: 2 }],
@@ -93,6 +93,19 @@ test("a push to the branch moves the same preview, and edits the same comment", 
   assert.equal(first[3], null);
   assert.equal(second[3], 101);
   assert.equal((await h.agent()).previews[0].sha, "b".repeat(40));
+});
+
+test("every node offers the app, and each branch goes to the node with fewer previews", async () => {
+  const h = harness();
+  await h.agent([], 0, "node2");
+  await h.agent([], 0, "node1");
+  await h.pr("opened", { number: 1, ref: "one" });
+  await h.pr("opened", { number: 2, ref: "two" });
+  await h.pr("synchronize", { number: 1, ref: "one", sha: "b".repeat(40) });
+  const on = async (node) => (await h.agent([], 0, node)).previews.map((p) => `${p.branch}@${p.sha[0]}`);
+  // A tie goes to the first name; the second branch to the other node; a push moves nothing.
+  assert.deepEqual(await on("node1"), ["one@b"]);
+  assert.deepEqual(await on("node2"), ["two@a"]);
 });
 
 test("a fork gets nothing, and neither does a repository no app previews", async () => {

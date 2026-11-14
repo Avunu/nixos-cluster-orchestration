@@ -252,18 +252,19 @@ let
           type = types.attrsOf types.str;
           default = { };
           description = ''
-            guestPath -> host path on LOCAL disk (DB data, never JuiceFS).
-            Ties the stack to its homeNode; dirs are created before start.
+            guestPath -> host path on LOCAL disk (DB data, never JuiceFS), under
+            /state/clients/<app>/. That directory is a ZFS dataset of the app's own,
+            mounted on the node Nomad runs the app on and replicated to the others
+            (modules/app-state.nix), so the app runs as one allocation and its
+            state follows it. Dirs are created before start.
           '';
         };
+        # Gone: Nomad chooses the node. Kept as a name so that a site which still
+        # sets it is told what to do, by the assertion below.
         homeNode = mkOption {
           type = types.nullOr types.str;
           default = null;
-          description = ''
-            Topology node key (e.g. "node1") this stack is pinned to. Required
-            for monolith/split tiers (their localState lives on that node).
-            Renders a Nomad constraint on the node's hostname.
-          '';
+          visible = false;
         };
         # `address` is gone: with the connector inside the container reaching the
         # app over a unix socket, nothing needs to reach a container inbound, so
@@ -328,7 +329,7 @@ let
             "scale"
           ];
           default = "replica";
-          description = "Per-client escalation tier (see plan). Default = replica (Tier 2).";
+          description = "Per-client escalation tier (see plan). Default = replica (Tier 2). Nothing reads it for placement: that is Nomad's.";
         };
         ha = mkOption {
           type = types.bool;
@@ -510,30 +511,26 @@ in
       assertions =
         clusterLib.net.guaAssertions (lib.attrNames config.clusterApps)
         ++ lib.concatMap (f: f.assertions or [ ]) frags
+        ++ lib.mapAttrsToList (n: a: {
+          assertion = a.homeNode == null;
+          message =
+            "clusterApps.${n}: homeNode is gone. Nomad chooses the node an app runs on, and"
+            + " an app's local state follows it (modules/app-state.nix). Remove the line; the"
+            + " app's data on ${toString a.homeNode} is taken into a dataset the next time it"
+            + " starts there (README, \"Upgrading a running cluster\").";
+        }) config.clusterApps
         # hostAccess (design 1.12): the identity is nspawn's vb-<name>, exact only up
-        # to 12 characters; and only the metrics node's own containers have a path to
-        # its mesh address, so the app must be pinned there.
-        ++ lib.concatLists (
-          lib.mapAttrsToList (n: a: [
-            {
-              assertion = lib.stringLength n <= 12;
-              message =
-                "clusterApps.${n}: network.hostAccess needs a name of at most 12 characters"
-                + " (this one has ${toString (lib.stringLength n)}). The host firewall names the"
-                + " container by its veth, vb-<name>, and nspawn shortens a longer one"
-                + " unpredictably, so the rule would never match. Rename the app.";
-            }
-            {
-              assertion = a.homeNode != null && net.hasTag "metrics" (topology.nodes.${a.homeNode} or { });
-              message =
-                "clusterApps.${n}: network.hostAccess reaches the metrics node's mesh address,"
-                + " which only a container on that node can route to. Pin it there: homeNode"
-                + " must be a node tagged `metrics` (it is ${
-                   if a.homeNode == null then "unset" else "\"${a.homeNode}\""
-                 }).";
-            }
-          ]) hostAccessApps
-        );
+        # to 12 characters. Only the metrics node's own containers have a path to its
+        # mesh address, so the app's job is constrained to that node
+        # (lib/mk-app-container.nix).
+        ++ lib.mapAttrsToList (n: _: {
+          assertion = lib.stringLength n <= 12;
+          message =
+            "clusterApps.${n}: network.hostAccess needs a name of at most 12 characters"
+            + " (this one has ${toString (lib.stringLength n)}). The host firewall names the"
+            + " container by its veth, vb-<name>, and nspawn shortens a longer one"
+            + " unpredictably, so the rule would never match. Rename the app.";
+        }) hostAccessApps;
 
       # The host firewall (modules/overlay-network.nix) reads this, and nothing else
       # of the apps.
@@ -546,6 +543,9 @@ in
       # conflicting definitions rather than deep-merge (unlike containers /
       # systemd.services, which are attrsOf). Union them into ONE definition.
       system.build.nomadJobs = lib.foldl' (acc: f: acc // (f.system.build.nomadJobs or { })) { } frags;
+      system.build.nomadJobSpecs = lib.foldl' (
+        acc: f: acc // (f.system.build.nomadJobSpecs or { })
+      ) { } frags;
 
       # What a raw_exec task (nomad-apps, lib/mk-app-container.nix) may ask of
       # systemd: start and stop a container@ unit this host declares, and nothing

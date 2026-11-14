@@ -109,6 +109,9 @@
         # The weekly look for the canary where client data must not be in plaintext.
         canaryScan = ./modules/canary-scan.nix;
         backup = ./modules/backup.nix;
+        # An app's local state as a dataset of its own, replicated to every node, so
+        # that Nomad can run the app on any of them.
+        appState = ./modules/app-state.nix;
         # Deploys the moment the site's branch moves, and a preview per pull request:
         # the node's half of workers/cluster-ci.
         ciAgent = ./modules/ci-agent.nix;
@@ -470,6 +473,16 @@
           checks.backup-roundtrip = detach (
             _:
             import ./tests/backup-roundtrip.nix {
+              inherit pkgs;
+              lib = nixpkgs.lib;
+            }
+          );
+
+          # An app's local state following it between three nodes with real ZFS: a
+          # move that loses nothing, a dead holder, its return, and what is refused.
+          checks.app-state = detach (
+            _:
+            import ./tests/app-state.nix {
               inherit pkgs;
               lib = nixpkgs.lib;
             }

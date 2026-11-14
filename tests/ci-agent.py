@@ -39,6 +39,10 @@ if name == "nix":
 elif name == "findmnt":
     print("rpool/state")
 elif name == "zfs":
+    if argv[0] == "list" and "-t" in argv:
+        if not (d / "no-state").exists():
+            print(argv[-1] + "@backup-1\n" + argv[-1] + "@repl-100\n" + argv[-1] + "@repl-200")
+        sys.exit(0)
     if argv[0] == "list":
         sys.exit(0 if argv[-1] in sets else 1)
     if argv[0] in ("snapshot", "clone", "create"):
@@ -217,9 +221,9 @@ class AgentTest(unittest.TestCase):
             "nix build",
             "systemctl stop container@shop-pv1.service",
             "zfs create -o mountpoint=none -o com.sun:auto-snapshot=false rpool/preview",
-            "zfs snapshot rpool/state@preview-shop-pv1",
-            "zfs clone -o mountpoint=/state-preview/shop-pv1 -o com.sun:auto-snapshot=false"
-            " rpool/state@preview-shop-pv1 rpool/preview/shop-pv1",
+            # The app's own dataset, at the newest snapshot replication made of it.
+            "zfs clone -o mountpoint=/state-preview/shop-pv1/clients/shop -o readonly=off"
+            " -o com.sun:auto-snapshot=false rpool/state/apps/shop@repl-200 rpool/preview/shop-pv1",
             f"juicefs clone {self.tmp}/jfs/clients/shop {self.tmp}/jfs/previews/shop-pv1",
             f"nix-env -p {self.tmp}/profiles/shop-pv1/system --set /nix/store/built-aaaaaaaa",
             "systemctl restart container@shop-pv1.service",
@@ -248,7 +252,7 @@ class AgentTest(unittest.TestCase):
         ran = self.ran(clear=True)
         self.assertTrue(any(f"github:acme/shop/{SHA_B}" in line for line in ran))
         self.assertIn("systemctl restart container@shop-pv1.service", ran)
-        self.assertFalse([line for line in ran if line.startswith(("zfs snapshot", "zfs destroy", "juicefs"))], ran)
+        self.assertFalse([line for line in ran if line.startswith(("zfs clone", "zfs destroy", "juicefs"))], ran)
 
         # /preview reset: the same commit on a fresh copy.
         (self.tmp / "jfs/previews/shop-pv1/odoo/filestore").write_text("the preview's")
@@ -256,7 +260,7 @@ class AgentTest(unittest.TestCase):
         self.until(lambda: (p := self.said("shop/feat-x")) and p["seed"] == 2 and p["state"] == "live")
         ran = self.ran(clear=True)
         self.assertIn("zfs destroy rpool/preview/shop-pv1", ran)
-        self.assertIn("zfs destroy rpool/state@preview-shop-pv1", ran)
+        self.assertFalse([line for line in ran if line.startswith("zfs snapshot")], ran)
         self.assertEqual((self.tmp / "jfs/previews/shop-pv1/odoo/filestore").read_text(), "production's")
 
         # A second branch finds the app's one slot taken, and says so.
@@ -271,7 +275,10 @@ class AgentTest(unittest.TestCase):
         self.state("shop/feat-y", "live", SHA_A)
         self.assertIsNone(self.said("shop/feat-x"))
         ran = self.ran(clear=True)
-        self.assertLess(ran.index("zfs destroy rpool/preview/shop-pv1"), ran.index("zfs snapshot rpool/state@preview-shop-pv1"))
+        self.assertLess(
+            ran.index("zfs destroy rpool/preview/shop-pv1"),
+            next(i for i, line in enumerate(ran) if line.startswith("zfs clone")),
+        )
         self.assertEqual(json.loads((run / "credentials.json").read_text())["TunnelID"], "tun-feat-y")
 
         self.want()
@@ -341,7 +348,7 @@ class AgentTest(unittest.TestCase):
         self.until(lambda: (self.fake / "active-container@shop-pv1.service").exists())
         self.state("shop/feat-x", "live", SHA_A)
         ran = self.ran()
-        self.assertFalse([line for line in ran if line.startswith(("nix build", "zfs snapshot", "zfs destroy"))], ran)
+        self.assertFalse([line for line in ran if line.startswith(("nix build", "zfs clone", "zfs destroy"))], ran)
         self.assertIn("zfs mount rpool/preview/shop-pv1", ran)
         self.assertTrue((self.tmp / "run/shop-pv1/config.yml").exists())
 

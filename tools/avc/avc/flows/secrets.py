@@ -167,7 +167,7 @@ def _restarts(ctx: Ctx, generators: list[str]) -> list[ship.PostAction]:
     seen: dict[str, ship.PostAction] = {}
     for g in generators:
         for app in ctx.index.apps_using(g):
-            seen.setdefault(app.job, ship.restart(app.job, app.home_node or ctx.index.leader))
+            seen.setdefault(app.job, ship.restart(app.job, ctx.index.leader))
     return list(seen.values())
 
 

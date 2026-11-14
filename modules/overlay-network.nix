@@ -183,8 +183,8 @@ let
 
   # inet input: a declared app's own ports on this node's mesh address, by mark. On
   # the metrics node only, since that is where Loki and Prometheus are and the only
-  # node a container can reach a mesh address from (its own); app-container.nix
-  # asserts such an app is pinned to a metrics node.
+  # node a container can reach a mesh address from (its own); such an
+  # app's job is held to the metrics node (lib/mk-app-container.nix).
   markedHostAccepts = lib.optionalString isMetrics (
     lines (
       map (

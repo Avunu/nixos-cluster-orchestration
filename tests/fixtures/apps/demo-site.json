@@ -1,5 +1,4 @@
 {
-  "homeNode": "node1",
   "wordpress": {
     "publicUrl": "https://www.example.com",
     "adminHost": "admin.example.com",

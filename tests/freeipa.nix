@@ -106,7 +106,7 @@ let
         && c.systemd.services ? cluster-backup-demo-idm;
     }
     {
-      name = "health is reported on the home node";
+      name = "health is reported, by every node, since any may run the server";
       ok = c.systemd.timers ? cluster-freeipa-health;
     }
 

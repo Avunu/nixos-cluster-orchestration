@@ -5,7 +5,7 @@
 # in a VM against an S3 server with plain credential files). This file only adds the
 # secrets: where the repository password and the target's credentials come from.
 #
-# ── operator verbs (on the app's homeNode) ──────────────────────────────────
+# ── operator verbs (on the node running the app) ──────────────────────────────────
 #   cluster-backup [app…]        back up now (all apps here, or the named ones)
 #   cluster-backup-list [app…]   list each app's snapshots
 #   cluster-restore <app> …      restore; prints the plan, --yes to run it

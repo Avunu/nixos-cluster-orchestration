@@ -14,13 +14,15 @@
 #
 #   preview   `preview.slots` on an app declares that many more containers,
 #             `<app>-pv<k>` (modules/apps.nix), dormant like every container and with
-#             everything the host decides about one fixed at evaluation. For a pull
-#             request the agent on the app's homeNode builds this site's flake with the
-#             app's project input at the pull request's commit, for one slot's guest;
-#             gives the slot a ZFS clone of the state dataset and a JuiceFS clone of the
-#             app's files; and starts it, whose own units migrate the copy. The Worker
-#             made the preview's tunnel and hostname, and writes the result on the pull
-#             request.
+#             everything the host decides about one fixed at evaluation. Every node
+#             offers its slots, and the Worker gives a pull request to the node with the
+#             fewest previews. That node's agent builds this site's flake with the app's
+#             project input at the pull request's commit, for one slot's guest; gives
+#             the slot a ZFS clone of the node's copy of the app's state, the live one
+#             or a replica at most a minute behind it (modules/app-state.nix), and a
+#             JuiceFS clone of the app's files; and starts it, whose own units migrate
+#             the copy. The Worker made the preview's tunnel and hostname, and writes
+#             the result on the pull request.
 #
 # What a preview is trusted with: the app's own secrets and a copy of its data, like the
 # app. It runs a branch of the app's repository, which takes write access to push; the
@@ -28,9 +30,9 @@
 # (modules/kinds/). It is still production's data on a hostname of its own: keep the
 # preview zone behind Cloudflare Access if the app's own sign-in is not enough.
 #
-# Only on the homeNode: the clone is of that node's disks. Not a Nomad job: a slot is
-# started by the agent, as root, and the fence and the registrar read
-# `cluster.nomadApps`, which leaves slots out.
+# A preview stays on the node that seeded it: its copy is a clone on that node's disks,
+# and is not replicated. Not a Nomad job: a slot is started by the agent, as root, and
+# the fence and the registrar read `cluster.nomadApps`, which leaves slots out.
 {
   config,
   lib,
@@ -48,7 +50,6 @@ let
 
   previewed = lib.filterAttrs (_: a: a.preview.slots > 0) apps;
   slotsOf = name: lib.filterAttrs (_: a: a.preview.of == name) apps;
-  here = lib.filterAttrs (_: a: a.homeNode == nodeName) previewed;
 
   agentConfig = {
     node = nodeName;
@@ -66,7 +67,7 @@ let
         name = slot;
         inherit (s.preview) origin;
       }) (slotsOf name);
-    }) here;
+    }) previewed;
   };
 
   agent = pkgs.writeScript "cluster-ci-agent" (
@@ -98,8 +99,8 @@ in
             message = "clusterApps.${n}: this app's kind has no previews. The odoo and frappe kinds do.";
           }
           {
-            assertion = a.homeNode != null;
-            message = "clusterApps.${n}: preview.slots needs homeNode: a preview's database is a clone of that node's disks.";
+            assertion = config.cluster.state.enable or false;
+            message = "clusterApps.${n}: preview.slots needs cluster.state (modules/app-state.nix): a preview's database is a clone of the app's dataset.";
           }
         ]) previewed
       );

@@ -2,8 +2,9 @@
 #
 #   freeipa = { hostname; domain; realm; privateIp4; image; authelia; };
 #
-# With the generic homeNode, tunnel.id and resources beside it, as any app.
-# The app is a monolith pinned to its homeNode whose container runs the
+# With the generic tunnel.id and resources beside it, as any app. The app is one
+# container, on whichever node Nomad picks, with its state following it
+# (modules/app-state.nix). It runs the
 # upstream FreeIPA server image under podman -- NixOS has an IPA client module
 # but no server. The design follows an earlier standalone deployment, which
 # proved it works inside nspawn, minus what went wrong there:
@@ -80,7 +81,6 @@ let
     name: a:
     a.freeipa
     // {
-      inherit (a) homeNode;
       tunnelId = a.tunnel.id;
       authelia = a.freeipa.authelia // {
         oidcClients = a.freeipa.authelia.oidcClients // clientsFrom name;
@@ -736,7 +736,10 @@ let
     };
   };
 
-  local = lib.filterAttrs (_: i: i.homeNode == nodeName) instances;
+  # Every node has the health check and the upgrade, and each acts on the servers
+  # whose container runs there. A node that does not run one still reports it, as
+  # not up: lib/alert-rules.nix takes the best any node says of an app.
+  local = instances;
   autoUpgraded = lib.filterAttrs (_: i: i.image.autoUpgrade.enable) local;
 
   # Reports through metrics only (lib/alert-rules.nix FreeIPA*): a failing
@@ -776,7 +779,8 @@ let
         current=$(g readlink -f /etc/systemd/system/podman-freeipa.service 2>/dev/null | tr -d '\r')
         [ -n "$started" ] && [ "$started" != "$current" ] && pending=1
       fi
-      [ "$up" = 1 ] || echo "$APP: FreeIPA is not running" >&2
+      here=0; systemctl is-active --quiet "container@$APP" && here=1
+      [ "$up" = 1 ] || [ "$here" = 0 ] || echo "$APP: FreeIPA is not running" >&2
       mkdir -p ${metricsDir}
       f=${metricsDir}/cluster_freeipa_$APP.prom
       {
@@ -786,7 +790,7 @@ let
         echo "cluster_freeipa_restart_pending{app=\"$APP\"} $pending"
         echo "cluster_freeipa_health_last_run_timestamp_seconds{app=\"$APP\"} $(date +%s)"
       } > "$f.tmp" && mv "$f.tmp" "$f"
-      echo "$APP: up=$up errors=$errors warnings=$warnings restart_pending=$pending"
+      [ "$here" = 0 ] || echo "$APP: up=$up errors=$errors warnings=$warnings restart_pending=$pending"
     done
   '';
 
@@ -840,6 +844,11 @@ let
       )
     })
     ref=''${REF[$APP]}
+    if ! systemctl is-active --quiet "container@$APP"; then
+      [ "$ifneeded" = 1 ] && exit 0
+      echo "$APP is not running on this node ($(hostname)); \`cluster-state status\` says where it is" >&2
+      exit 1
+    fi
     # A unit of the guest's systemd: see in_guest_unit in backup-core.nix.
     g() {
       local c=$1; shift
@@ -903,7 +912,7 @@ let
     ds=$(findmnt -n -o SOURCE -T /state/clients/"$APP")
     snap="$ds@pre-upgrade-$APP-$(date +%Y%m%d-%H%M%S)"
     zfs snapshot "$snap"
-    echo "== safety snapshot $snap (copy out of it; never roll back rpool/state)"
+    echo "== safety snapshot $snap (copy out of it; rolling back would undo what the server wrote since)"
     if [ "''${TRACKED[$APP]}" = 1 ] && [ -n "$cur" ] && [ "$cur" != "$new" ]; then
       # What was running stays reachable: with the snapshot, the way back.
       g podman tag "$cur" "''${ref%:*}:previous"
@@ -1085,7 +1094,7 @@ in
       ) instances
     );
 
-    # Health and upgrades run where the server does.
+    # Health and upgrades run where the server does, which each finds out when it runs.
     systemd.services =
       lib.optionalAttrs (local != { }) {
         cluster-freeipa-health = {

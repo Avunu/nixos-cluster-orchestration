@@ -156,17 +156,26 @@ export class Pipeline {
     });
   }
 
-  // Every (node, app) whose agent offers previews of this repository.
+  // Every app that previews this repository, each on one node. Every node offers every
+  // app (each has a copy of its data), so the node is the one with the fewest previews
+  // now, counting the ones this call gives it; a tie goes to the name that sorts first.
+  // A preview that exists keeps its node, whatever this says (`want`).
   targets(repo) {
-    const seen = new Set();
-    const out = [];
-    for (const [node, agent] of Object.entries(this.state.agents)) {
-      for (const a of agent.apps ?? []) {
-        if (sameRepo(a.repo, repo) && a.slots > 0 && !seen.has(a.app)) {
-          seen.add(a.app);
-          out.push({ node, app: a.app });
-        }
+    const load = {};
+    for (const r of Object.values(this.state.previews)) load[r.node] = (load[r.node] ?? 0) + 1;
+    const offers = new Map();
+    for (const node of Object.keys(this.state.agents).sort()) {
+      for (const a of this.state.agents[node].apps ?? []) {
+        if (!sameRepo(a.repo, repo) || !(a.slots > 0)) continue;
+        if (!offers.has(a.app)) offers.set(a.app, []);
+        offers.get(a.app).push(node);
       }
+    }
+    const out = [];
+    for (const [app, nodes] of offers) {
+      const node = nodes.reduce((best, n) => ((load[n] ?? 0) < (load[best] ?? 0) ? n : best));
+      load[node] = (load[node] ?? 0) + 1;
+      out.push({ node, app });
     }
     return out;
   }

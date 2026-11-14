@@ -63,11 +63,12 @@ in
       rules = [
         (rule {
           alert = "BackupStale";
-          expr = "time() - cluster_backup_last_success_timestamp_seconds > ${hours 30}";
+          # Every node an app has run on has a timestamp of its own; the newest is the app's.
+          expr = "time() - max by (app) (cluster_backup_last_success_timestamp_seconds) > ${hours 30}";
           for = "10m";
           severity = "critical";
           summary = "{{ $labels.app }}: no successful backup for {{ $value | humanizeDuration }}";
-          description = "Check `journalctl -u cluster-backup-{{ $labels.app }}` on the app's homeNode; run `cluster-backup {{ $labels.app }}` once fixed.";
+          description = "Check `journalctl -u cluster-backup-{{ $labels.app }}` on the node running the app (`cluster-state status`); run `cluster-backup {{ $labels.app }}` once fixed.";
         })
         (rule {
           alert = "BackupPartial";
@@ -78,7 +79,7 @@ in
         })
         (rule {
           alert = "BackupVerifyStale";
-          expr = "time() - cluster_backup_verify_last_success_timestamp_seconds > ${days 8}";
+          expr = "time() - max by (app) (cluster_backup_verify_last_success_timestamp_seconds) > ${days 8}";
           for = "10m";
           severity = "warning";
           summary = "{{ $labels.app }}: backups not proven restorable for {{ $value | humanizeDuration }}";
@@ -86,7 +87,7 @@ in
         })
         (rule {
           alert = "BackupCheckStale";
-          expr = "time() - cluster_backup_check_last_success_timestamp_seconds > ${days 8}";
+          expr = "time() - max by (app) (cluster_backup_check_last_success_timestamp_seconds) > ${days 8}";
           for = "10m";
           severity = "warning";
           summary = "{{ $labels.app }}: repository not pruned/checked for {{ $value | humanizeDuration }}";
@@ -161,6 +162,45 @@ in
           severity = "critical";
           summary = "{{ $labels.app }}: the last deploy did not apply inside the container";
           description = "`nixos-container run {{ $labels.app }} -- systemctl --failed`; the reload's own report is in `journalctl -u container@{{ $labels.app }}`. A new secret or bind mount needs `nomad job restart app-{{ $labels.app }}`.";
+        })
+      ];
+    }
+    {
+      # From cluster-state replicate (modules/app-state.nix), every minute on every
+      # node that has an app with local state.
+      name = "state";
+      rules = [
+        (rule {
+          alert = "StateReplicaLagging";
+          expr = "cluster_state_replica_lag_seconds > 600";
+          for = "10m";
+          severity = "warning";
+          summary = "{{ $labels.app }}: {{ $labels.instance }}'s copy of its state is {{ $value | humanizeDuration }} behind";
+          description = "If the node running the app died now, this is what starting it on {{ $labels.instance }} would lose. `journalctl -u cluster-state-replicate` there; `cluster-state status` on any node.";
+        })
+        (rule {
+          alert = "StateReplicationStale";
+          expr = "time() - cluster_state_last_run_timestamp_seconds > 900";
+          for = "5m";
+          severity = "warning";
+          summary = "{{ $labels.instance }}: app state has not been snapshotted or pulled for {{ $value | humanizeDuration }}";
+          description = "`systemctl status cluster-state-replicate.timer cluster-state-replicate.service` on the node.";
+        })
+        (rule {
+          alert = "StateReplicationFailing";
+          expr = "cluster_state_failed_apps > 0";
+          for = "15m";
+          severity = "warning";
+          summary = "{{ $labels.instance }}: replicating {{ $value }} app(s)' state fails";
+          description = "`journalctl -u cluster-state-replicate` on the node names each app and why.";
+        })
+        (rule {
+          alert = "StateOrphaned";
+          expr = "cluster_state_orphans > 0";
+          for = "5m";
+          severity = "warning";
+          summary = "{{ $labels.instance }}: {{ $value }} copy(ies) of app state set aside";
+          description = "The node ran an app, died or was cut off, and the app was started elsewhere from an earlier snapshot. What it wrote after that snapshot is only in the orphan: `cluster-state orphans` on the node, mount it to recover anything, then `cluster-state drop-orphan`.";
         })
       ];
     }
@@ -562,7 +602,8 @@ in
       rules = [
         (rule {
           alert = "FreeIPADown";
-          expr = "cluster_freeipa_up == 0";
+          # Every node reports every server, and all but the one running it say 0.
+          expr = "max by (app) (cluster_freeipa_up) == 0";
           # A first install takes about five minutes, an upgrade longer.
           for = "20m";
           severity = "critical";
@@ -571,7 +612,7 @@ in
         })
         (rule {
           alert = "FreeIPAUnhealthy";
-          expr = "cluster_freeipa_healthcheck_errors > 0";
+          expr = "max by (app) (cluster_freeipa_healthcheck_errors) > 0";
           for = "30m";
           severity = "warning";
           summary = "{{ $labels.app }}: ipa-healthcheck reports {{ $value }} error(s)";
@@ -579,7 +620,7 @@ in
         })
         (rule {
           alert = "FreeIPARestartPending";
-          expr = "cluster_freeipa_restart_pending == 1";
+          expr = "max by (app) (cluster_freeipa_restart_pending) == 1";
           for = "24h";
           severity = "warning";
           summary = "{{ $labels.app }}: a deployed FreeIPA change has not been applied for a day";
@@ -587,7 +628,7 @@ in
         })
         (rule {
           alert = "FreeIPAHealthStale";
-          expr = "time() - cluster_freeipa_health_last_run_timestamp_seconds > ${hours 1}";
+          expr = "time() - max by (app) (cluster_freeipa_health_last_run_timestamp_seconds) > ${hours 1}";
           for = "15m";
           severity = "warning";
           summary = "{{ $labels.app }}: the FreeIPA health check has not run for {{ $value | humanizeDuration }}";
