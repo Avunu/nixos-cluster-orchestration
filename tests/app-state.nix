@@ -17,6 +17,10 @@
 #   - the dead node, back, has its copy set aside whole (the write only it had is in the
 #     orphan) and receives the app's new history; nothing deletes the orphan unasked;
 #   - a replica that a clone hangs off (a preview) keeps receiving;
+#   - a replica keeps its history when the node running the app destroys its own, and is
+#     set aside instead of emptied when asked to give all of it up;
+#   - the state backup is taken by one node, a replica, and a restore of it replaces the
+#     app's state on every node;
 #   - a directory from before datasets is adopted where it is, and refused elsewhere;
 #   - a new app is not started empty while a node that might hold it is silent;
 #   - the timer does all of it by itself.
@@ -28,6 +32,23 @@ let
 
   # The test network's own addresses stand in for the mesh: <subnet>.<index>.
   topology = {
+    # The frequent backup (modules/state-backup-core.nix), to a directory on the node
+    # that turns out to be the one to do it; its timers never fire by themselves.
+    backup = {
+      target = {
+        type = "local";
+        path = "/srv/nightly";
+      };
+      state = {
+        target = {
+          type = "local";
+          path = "/srv/state-backups";
+        };
+        schedule = "2099-01-01";
+      };
+      maintenance = "2099-01-01";
+      uploadLimitKiB = 0;
+    };
     mesh.subnet = "192.168.1.0/24";
     nodes = {
       a.index = 1;
@@ -73,7 +94,13 @@ let
     imports = [
       stubClusterApps
       ../modules/app-state.nix
+      ../modules/state-backup-core.nix
     ];
+    cluster.stateBackup.credentialFiles = {
+      password = "${pkgs.writeText "restic-password" "correct horse battery staple"}";
+      id = "${pkgs.writeText "unused-id" "none"}";
+      secret = "${pkgs.writeText "unused-secret" "none"}";
+    };
     _module.args = {
       inherit topology clusterLib;
       nodeName = name;
@@ -189,6 +216,37 @@ pkgs.testers.runNixOSTest {
         assert prop(a, "cluster:holder") == "-"
         assert a.succeed("cluster-state orphans").strip() == ""
 
+    with subtest("the state backup is one replica's job, and the node running the app is not asked to read"):
+        # b runs it; a and c are replicas, and a's name sorts first.
+        replicate(c)
+        assert b.succeed("cluster-state backup-source demo").strip() == ""
+        assert c.succeed("cluster-state backup-source demo").strip() == ""
+        assert a.succeed("cluster-state backup-source demo").strip().startswith(DS + "@repl-")
+        for m in (a, b, c):
+            m.succeed("cluster-state-backup demo")
+        a.succeed("test -d /srv/state-backups/state/demo/snapshots")
+        for m in (b, c):
+            m.fail("test -e /srv/state-backups")
+        assert "cluster_state_backup_last_success_timestamp_seconds" in a.succeed("cat /var/lib/prometheus-node-exporter-text/cluster_backup_demo_state.prom")
+        a.succeed("cluster-state-backup-list demo | grep -q state")
+        a.fail("zfs list tank/state-backup/demo")  # the clone it read from is gone
+        # And the replica it was read from still receives.
+        write(b, "after-state-backup")
+        replicate(b, a)
+        assert head(a) == head(b)
+
+    with subtest("a replica keeps its history when the node running the app destroys its own"):
+        before = int(a.succeed(f"zfs list -H -t snapshot -d 1 -o name {DS} | grep -c @repl-"))
+        assert before >= 3, before
+        # b, as a node taken over would: every snapshot but the newest, gone.
+        b.succeed(f"zfs list -H -t snapshot -d 1 -o name -s createtxg {DS} | head -n -1 | xargs -n1 zfs destroy")
+        write(b, "after-the-purge")
+        replicate(b, a)
+        assert head(a) == head(b)
+        after = int(a.succeed(f"zfs list -H -t snapshot -d 1 -o name {DS} | grep -c @repl-"))
+        assert after > before, f"a had {before} replication snapshots and has {after}"
+        assert a.succeed("cluster-state orphans").strip() == ""
+
     with subtest("the holder dies: a start elsewhere waits out the fence, then takes the newest copy any node has"):
         write(b, "c-has-it")
         replicate(b, c)  # c is ahead of a now
@@ -267,6 +325,27 @@ pkgs.testers.runNixOSTest {
                 f"test \"$(zfs list -Hp -t snapshot -d 1 -o creation -s createtxg {DS} | tail -1)\" -gt {since}", timeout=300
             )
         print(a.succeed("cluster-state status"))
+
+    with subtest("a restore of the state backup replaces the app's state, on every node"):
+        # b runs it. What the backup holds stays; what was written after it goes.
+        write(b, "in-the-backup")
+        since = int(b.succeed("date +%s"))
+        a.wait_until_succeeds(
+            f"test \"$(zfs list -Hp -t snapshot -d 1 -o creation -s createtxg {DS} | tail -1)\" -gt {since}", timeout=300
+        )
+        a.succeed("cluster-state-backup demo")
+        write(b, "after-the-backup")
+        out = a.fail("cluster-state-restore demo --yes 2>&1")
+        assert "running on b" in out, out
+        b.succeed("systemctl stop container@demo.service")
+        out = a.succeed("cluster-state-restore demo 2>&1")
+        assert "nothing done" in out, out
+        a.succeed("cluster-state-restore demo --yes")
+        c.succeed("systemctl start container@demo.service")
+        c.succeed("grep -qx in-the-backup /state/clients/demo/data/in-the-backup")
+        c.fail("test -e /state/clients/demo/data/after-the-backup")
+        # What was there before the restore is one snapshot back, on the node that restored.
+        a.succeed(f"zfs list -H -t snapshot -d 1 -o name {DS} | grep -q @pre-restore-state-")
         out = a.succeed("cluster-state status")
         assert "running" in out and "replica" in out, out
   '';

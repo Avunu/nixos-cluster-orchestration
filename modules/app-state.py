@@ -11,6 +11,7 @@ that runs the app (its holder) and kept as an unmounted, read-only replica on th
     serve             one request from a peer, on the mesh (socket-activated)
     status            what this node and its peers hold
     where <app>       the peers running the app; fails when one cannot be asked
+    backup-source <app>   the snapshot to back up off-site, if this node is the one to
     init <app>        an empty dataset for a new app, when a peer cannot be asked
     orphans           copies set aside because another node's history replaced them
     drop-orphan <name> [--yes]
@@ -251,8 +252,7 @@ def orphan(app: str, why: str) -> None:
     stamp = int(time.time())
     if prop(d, "mounted") == "yes":
         zfs("unmount", "-f", d)
-    if int(prop(d, "written")) > 0:
-        zfs("snapshot", f"{d}@orphaned-{stamp}")
+    zfs("snapshot", f"{d}@orphaned-{stamp}")
     name = f"{parent}/{app}-{stamp}"
     zfs("rename", d, name)
     zfs("set", "readonly=on", "canmount=noauto", "mountpoint=none", name)
@@ -283,15 +283,19 @@ def pull(app: str, peer: str, theirs: list[list]) -> bool:
         common = max((i for i, (_n, g, _c) in enumerate(mine) if g in known), default=None)
         holder = prop(d, HOLDER)
         own = common is None or common < len(mine) - 1 or int(prop(d, "written")) > 0
-        if holder == REPLICA and common is not None:
-            # A replica has nothing of its own: what it has past the common snapshot
-            # the sender had too, and has since destroyed.
-            if own:
-                zfs("rollback", "-r", f"{d}@{mine[common][0]}")
-            since = mine[common][0]
-        elif holder == REPLICA and zfs("destroy", "-r", d, check=False).returncode == 0:
-            # So far behind that the sender kept nothing it has: a whole copy again.
-            log(f"{app}: this node's replica shared no snapshot with {peer} any more; receiving it whole")
+        if holder == REPLICA:
+            # A replica has nothing of its own, but its history is its own to keep: the
+            # node running the app, taken over or mistaken, must not be able to erase it
+            # here. So past the common snapshot only the sender's one-off snapshots (a
+            # backup's, an upgrade's) are rolled back; a replication snapshot the sender
+            # no longer has, or no common snapshot at all, sets the whole copy aside.
+            past = [] if common is None else [n for n, _g, _c in mine[common + 1 :]]
+            if common is None or any(n.startswith("repl-") for n in past):
+                orphan(app, f"{peer} no longer has the history this replica holds")
+            else:
+                if past:
+                    zfs("rollback", "-r", f"{d}@{mine[common][0]}")
+                since = mine[common][0]
         elif own:
             orphan(app, f"{peer} has run the app since, from an earlier snapshot")
         else:
@@ -299,11 +303,14 @@ def pull(app: str, peer: str, theirs: list[list]) -> bool:
     group(f"{root()}/apps")
     receive(app, peer, since, head[0])
     zfs("set", f"{HOLDER}={REPLICA}", "readonly=on", f"cluster:source={peer}", d)
-    # What the sender no longer keeps, this node need not either.
+    # Replication snapshots are thinned here by this node's own clock, to the same rule
+    # as the sender's, and never because the sender dropped one. Its one-off snapshots
+    # go when it drops them.
     kept = {g for _n, g, _c in theirs}
     for name, guid, _c in snaps(d):
-        if guid not in kept:
-            zfs("destroy", f"{d}@{name}", check=False)  # a preview's clone keeps one alive
+        if guid not in kept and not name.startswith("repl-"):
+            zfs("destroy", f"{d}@{name}", check=False)
+    thin(d)
     return True
 
 
@@ -429,8 +436,7 @@ def acquire(app: str) -> None:
             # Said once, where the operator of the app will look for why it restarted.
             log(
                 f"{app}: starting from a replicated snapshot ({snaps(d)[-1][0]}), not from a clean stop: whatever the "
-                "node that ran it wrote after that is not here. An archived database has to start a new generation "
-                "(`db-archive next-generation`): the archive holds changes this copy never made."
+                "node that ran it wrote after that is not here, and is in an orphan on that node once it returns."
             )
         zfs("set", "readonly=off", f"{HOLDER}={ME}", d)
         if prop(d, "mounted") != "yes":
@@ -442,8 +448,9 @@ def release(app: str) -> None:
         d = ds(app)
         if not exists(d) or prop(d, HOLDER) != ME:
             return
-        if int(prop(d, "written")) > 0:
-            snapshot(d)
+        # Always: `written` counts what has reached the disk, and the last seconds of
+        # writes may not have. A snapshot waits for them.
+        snapshot(d)
         zfs("set", f"{HOLDER}={RELEASED}", d)
         zfs("unmount", d, check=False)
         zfs("set", "readonly=on", d)
@@ -504,6 +511,25 @@ def replicate() -> int:
                 log(f"{app}: {e}")
     write_metrics(st, lag, holding, failed)
     return 1 if failed else 0
+
+
+def backup_source(app: str) -> str | None:
+    """The snapshot this node should back up off-site now, if it is the node to do it.
+
+    One node per app: a replica, so that reading a whole database costs the app nothing,
+    and of the replicas the one whose name sorts first. With no replica (one node, or
+    none caught up yet) the node holding the app. Peers that do not answer are not
+    counted, so two nodes cut off from each other may both back up, which costs storage
+    nothing: the same blocks.
+    """
+    st = {ME: local_status(), **poll()}
+    have = {n: s["apps"][app] for n, s in st.items() if s and s["apps"].get(app, {}).get("snaps")}
+    replicas = sorted(n for n, a in have.items() if a["holder"] == REPLICA and not a["running"])
+    chosen = replicas[0] if replicas else min(have, default=None, key=lambda n: (not have[n]["running"], n))
+    if chosen != ME:
+        return None
+    mine = [n for n, _g, _c in have[ME]["snaps"] if n.startswith("repl-")]
+    return f"{ds(app)}@{mine[-1]}" if mine else None
 
 
 def orphans() -> list[list]:
@@ -600,6 +626,10 @@ def main() -> int:
             if silent:
                 raise Refused(f"{', '.join(silent)} not answering, so whether {args[1]} runs there is not known")
             print(" ".join(sorted(p for p, v in st.items() if v["apps"].get(args[1], {}).get("running"))))
+        elif verb == "dataset" and len(args) == 2 and args[1] in APPS:
+            print(ds(args[1]))
+        elif verb == "backup-source" and len(args) == 2 and args[1] in APPS:
+            print(backup_source(args[1]) or "")
         elif verb == "orphans":
             for name, used, _created in orphans():
                 print(f"{name}\t{int(used) >> 20} MiB")

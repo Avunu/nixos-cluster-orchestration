@@ -12,6 +12,7 @@ let
     inherit lib;
     backupApps = [ "demo-odoo" ];
     freeipaApps = [ "idm" ];
+    stateBackupApps = [ "demo-odoo" ];
     annotate = false;
   };
   rulesFile = pkgs.writeText "rules.yml" (builtins.toJSON rules);
@@ -302,6 +303,44 @@ let
         "0x40"
       ]
     ] "10m" none)
+    # The state backup is one node's job per app, and that node changes: the newest counts.
+    (case "StateBackupStale"
+      [
+        [
+          ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo",instance="n"}''
+          "0x400"
+        ]
+      ]
+      "5h"
+      [
+        {
+          app = "demo-odoo";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "StateBackupStale" [
+      [
+        ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo",instance="old"}''
+        "0x400"
+      ]
+      [
+        ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo",instance="new"}''
+        "0+60x400"
+      ]
+    ] "5h" none)
+    (case "StateBackupNeverRan" [ ] "5h" [
+      {
+        app = "demo-odoo";
+        severity = "warning";
+      }
+    ])
+    (case "StateBackupNeverRan" [
+      [
+        ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo"}''
+        "0+60x400"
+      ]
+    ] "5h" none)
     # An app that moved: the node it left has a timestamp that stands still, and a
     # FreeIPA it does not run. The node it is on now is the one that counts.
     (case "BackupStale" [
@@ -1209,6 +1248,7 @@ let
         inherit lib;
         backupApps = [ "demo-odoo" ];
         freeipaApps = [ "idm" ];
+        stateBackupApps = [ "demo-odoo" ];
       }
     )
   );

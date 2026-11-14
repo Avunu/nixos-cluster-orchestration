@@ -19,8 +19,9 @@
 # NOT the raw database directory. The off-site copy must survive a database
 # major-version bump and a new node, which only a dump does, and raw database
 # files dedup badly. The raw copy the old backup.nix shipped was also taken
-# live, file by file -- restorable only by luck. Fast local rollback is what
-# the 15-minute ZFS auto-snapshots of rpool/state are for.
+# live, file by file -- restorable only by luck. The raw directory's recent past
+# is the replicated snapshots of the app's dataset (modules/app-state.nix), and
+# off the nodes the state backup (modules/state-backup-core.nix), from one.
 #
 # The exception is state no dump covers -- a directory server with its CA
 # and Kerberos master keys. With backup.localSnapshot, the app's localState

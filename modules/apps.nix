@@ -81,8 +81,8 @@ let
   # (modules/ci-agent.nix). The same kind with the same parameters, so the same
   # mounts, limits and firewall, each named for the app whose data it gets a copy
   # of (`preview.of`). What a slot must not share with the app is left out: its
-  # tunnel and hostname (a preview's are made per branch), its database archive
-  # and backups (a copy of production is not worth keeping), and its sign-in as
+  # tunnel and hostname (a preview's are made per branch), its backups
+  # (a copy of production is not worth keeping), and its sign-in as
   # an OIDC client.
   previewSlots =
     name: e:
@@ -93,7 +93,6 @@ let
           removeAttrs e [
             "enable"
             "tunnel"
-            "archive"
             "oidc"
           ]
           // {

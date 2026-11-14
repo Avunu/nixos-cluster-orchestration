@@ -24,7 +24,13 @@ let
 
   rules = import ../lib/alert-rules.nix {
     inherit lib;
-    inherit (cfg) backupApps verifiedApps freeipaApps;
+    inherit (cfg)
+      backupApps
+      verifiedApps
+      freeipaApps
+      stateBackupApps
+      stateBackupStaleHours
+      ;
   };
   rulesFile = pkgs.writeText "cluster-alert-rules.yml" (builtins.toJSON rules);
 
@@ -290,6 +296,16 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Apps with a database, whose backups must pass the weekly restore rehearsal.";
+    };
+    stateBackupApps = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Apps whose local state must keep reaching topology.backup.state.";
+    };
+    stateBackupStaleHours = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = "How old the newest state backup may be before StateBackupStale: a few runs of its schedule.";
     };
     freeipaApps = lib.mkOption {
       type = lib.types.listOf lib.types.str;

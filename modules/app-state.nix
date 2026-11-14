@@ -22,6 +22,11 @@
 #     comes back, its copy has history the app's new one does not; it is renamed to
 #     <state>/orphans/<app>-<time>, whole, and a new replica is received. Nothing deletes
 #     an orphan (`cluster-state orphans`, `drop-orphan`); StateOrphaned says there is one.
+#   - Each node thins its own copy's snapshots, by its own clock: every one for
+#     `keep.recentMinutes`, then one an hour, then one a day. A replica never drops
+#     history because the node running the app did, so that node, taken over, cannot
+#     erase what the others hold. A replica asked to give up replication snapshots is
+#     set aside like an orphan instead.
 #
 # Two copies running at once is what must not happen. Nomad starts one allocation of a
 # stateful app (count 1, lib/mk-app-container.nix), acquire stops the other copy when it
@@ -112,8 +117,8 @@ in
     keep = {
       recentMinutes = mkOption {
         type = types.ints.positive;
-        default = 30;
-        description = "Every snapshot is kept this long.";
+        default = 240;
+        description = "Every snapshot is kept this long: how far back a rewind to the minute reaches.";
       };
       hourly = mkOption {
         type = types.ints.unsigned;

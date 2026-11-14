@@ -11,12 +11,15 @@
 #   cluster-restore <app> …      restore; prints the plan, --yes to run it
 #
 # Timers: nightly backup (topology.backup.schedule), weekly prune + check
-# (.maintenance), weekly restore rehearsal (.verify). Each writes node_exporter
+# (.maintenance), weekly restore rehearsal (.verify). And, where the topology has
+# `backup.state`, the frequent one to a second target (modules/state-backup-core.nix):
+# each app's local state from a replica, hourly, with verbs of its own. Each writes node_exporter
 # textfile metrics under /var/lib/prometheus-node-exporter-text.
 #
 # ── deliberately not backed up ──────────────────────────────────────────────
-#   - Raw database directories: dumps are what survive a version bump or a new
-#     node; fast local rollback is the ZFS auto-snapshots (modules/zfs-host.nix).
+#   - Raw database directories, by this backup: dumps are what survive a version
+#     bump. The copies for the last hours are the replicas (modules/app-state.nix)
+#     and the state backup above, which is the raw directory, from a snapshot.
 #   - The JuiceFS metadata engine: it dumps itself hourly into its own bucket
 #     (modules/storage-juicefs-meta.nix restores the newest one on a rebuilt
 #     node). Restoring a stale copy against a live bucket would orphan chunks.
@@ -44,9 +47,13 @@
 let
   vars = config.clan.core.vars.generators;
   salt = topology.backup.repoSalt or null;
+  state = topology.backup.state or null;
 in
 {
-  imports = [ ./backup-core.nix ];
+  imports = [
+    ./backup-core.nix
+    ./state-backup-core.nix
+  ];
 
   clan.core.vars.generators = {
     # The repository password. Generated, not prompted -- losing it means
@@ -83,6 +90,33 @@ in
           persist = true;
         };
       };
+    };
+  };
+
+  # Credentials for topology.backup.state.target, the frequent backup's own target
+  # (modules/state-backup-core.nix): a different place from the nightly one's, so a
+  # different pair. Declared only where the topology names that target.
+  clan.core.vars.generators.backup-state-target = lib.mkIf (state != null) {
+    share = true;
+    prompts = {
+      access-key = {
+        description = "State backup target access key id (topology.backup.state.target)";
+        persist = true;
+      };
+      secret-key = {
+        description = "State backup target secret";
+        type = "hidden";
+        persist = true;
+      };
+    };
+  };
+
+  cluster.stateBackup = lib.mkIf (state != null) {
+    repoPathFor = lib.mkIf (builtins.isString salt) (clusterLib.backupTarget.stateRepoPath salt);
+    credentialFiles = {
+      password = vars.restic.files.password.path;
+      id = vars.backup-state-target.files.access-key.path;
+      secret = vars.backup-state-target.files.secret-key.path;
     };
   };
 

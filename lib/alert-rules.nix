@@ -19,6 +19,10 @@
   verifiedApps ? backupApps,
   # FreeIPA servers (modules/kinds/freeipa.nix), whose health the node reports.
   freeipaApps ? [ ],
+  # Apps whose local state goes to topology.backup.state (modules/state-backup-core.nix),
+  # and how old the newest such backup may be: a few runs of its schedule.
+  stateBackupApps ? [ ],
+  stateBackupStaleHours ? 4,
   # Tests set this false: promtool compares annotations verbatim, and the
   # expressions and labels are what the tests are about.
   annotate ? true,
@@ -195,6 +199,15 @@ in
           description = "`journalctl -u cluster-state-replicate` on the node names each app and why.";
         })
         (rule {
+          alert = "StateBackupStale";
+          # One node backs an app's state up, and which one moves with the app.
+          expr = "time() - max by (app) (cluster_state_backup_last_success_timestamp_seconds) > ${hours stateBackupStaleHours}";
+          for = "10m";
+          severity = "warning";
+          summary = "{{ $labels.app }}: its state has not reached the state backup target for {{ $value | humanizeDuration }}";
+          description = "`cluster-state-backup {{ $labels.app }}` on a node holding a replica (`cluster-state status`), and `journalctl -u cluster-state-backup` there. The nodes' own copies are unaffected.";
+        })
+        (rule {
           alert = "StateOrphaned";
           expr = "cluster_state_orphans > 0";
           for = "5m";
@@ -202,7 +215,18 @@ in
           summary = "{{ $labels.instance }}: {{ $value }} copy(ies) of app state set aside";
           description = "The node ran an app, died or was cut off, and the app was started elsewhere from an earlier snapshot. What it wrote after that snapshot is only in the orphan: `cluster-state orphans` on the node, mount it to recover anything, then `cluster-state drop-orphan`.";
         })
-      ];
+      ]
+      ++ map (
+        app:
+        rule {
+          alert = "StateBackupNeverRan";
+          labels.app = app;
+          expr = ''absent(cluster_state_backup_last_success_timestamp_seconds{app="${app}"})'';
+          for = "${toString stateBackupStaleHours}h";
+          severity = "warning";
+          summary = "${app}: its state has never reached the state backup target";
+        }
+      ) stateBackupApps;
     }
     {
       name = "nomad";

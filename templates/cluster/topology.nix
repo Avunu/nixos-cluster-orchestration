@@ -76,9 +76,6 @@
     endpoint = "https://s3.example.net";
     region = "region-1";
     juicefsBucket = "my-cluster-juicefs";
-    # Only for apps with `archive.enable`: a bucket of its own, since each such
-    # app's container holds an S3 key to it.
-    # dbArchiveBucket = "my-cluster-db-archive";
   };
 
   logging.retention = "720h";
@@ -114,6 +111,20 @@
       monthly = 12;
     };
     uploadLimitKiB = 0;
+    # A second, frequent backup to a second place: each app's local state (its
+    # database directory), from a replica, with credentials of its own
+    # (`backup-state-target`). The nightly backup above is the long history and can
+    # be far away; this one wants to be near the nodes. Leave it out for none.
+    # state = {
+    #   target = {
+    #     type = "s3";
+    #     endpoint = "https://s3.example.net";
+    #     bucket = "my-cluster-state-backups";
+    #     region = "region-1";
+    #   };
+    #   schedule = "hourly";
+    #   retention = { hourly = 48; daily = 14; };
+    # };
   };
 
   # The key is the machine name everywhere, and must equal hostName. One node

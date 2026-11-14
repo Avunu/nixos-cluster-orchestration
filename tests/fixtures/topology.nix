@@ -75,7 +75,6 @@
     endpoint = "https://s3.example.net";
     region = "fixture-1";
     juicefsBucket = "fixture-juicefs";
-    dbArchiveBucket = "fixture-db-archive";
   };
 
   logging.retention = "720h";
@@ -107,6 +106,15 @@
       monthly = 12;
     };
     uploadLimitKiB = 0;
+    state = {
+      target = {
+        type = "s3";
+        endpoint = "https://s3.example.net";
+        bucket = "fixture-state-backups";
+        region = "region-1";
+      };
+      schedule = "hourly";
+    };
   };
 
   nodes = {

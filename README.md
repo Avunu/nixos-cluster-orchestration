@@ -42,10 +42,9 @@ Nomad decides, each time an app starts: the emptiest node that can run it (`sche
 An app with local state (a database directory, FreeIPA's data) runs as one allocation, and its state goes where it goes:
 
 - **A dataset per app.** `<pool>/state/apps/<app>`, mounted at `/state/clients/<app>` on the node running the app and kept unmounted and read-only on every other node.
-- **Replicated every minute.** The node running the app snapshots the dataset if anything was written (`cluster.state.intervalSeconds`, 60), and every other node pulls what it lacks, incrementally, over the mesh. Every snapshot is kept for 30 minutes, then one an hour for a day, then one a day for a week (`cluster.state.keep`).
+- **Replicated every minute.** The node running the app snapshots the dataset if anything was written (`cluster.state.intervalSeconds`, 60), and every other node pulls what it lacks, incrementally, over the mesh. Each node thins its own copy by its own clock: every snapshot for four hours, then one an hour for a day, then one a day for a week (`cluster.state.keep`). A replica never drops history because the running node did, so that node, taken over, cannot erase what the others hold; asked to, a replica sets its copy aside like an orphan.
 - **A move loses nothing.** When Nomad starts the app on another node while the first is reachable (a drain, a job restart that lands elsewhere), the new node stops it on the old one, takes a last snapshot of the stopped database, receives it, and starts.
 - **A node's death loses at most the interval.** Nomad marks the node down and starts the app on another, from the newest snapshot any surviving node holds. The new node first waits until the dead one, if it is only cut off, has stopped its own copy: a node that cannot reach a Nomad server stops its stateful apps 60 seconds after its last heartbeat (Nomad's `disconnect.stop_on_client_after`). An unplanned failover therefore takes about three minutes, and what the dead node wrote after its last replicated snapshot is not in the app any more.
-- **An archived database needs a new generation after one.** [The database archive](#the-database-archive) holds changes the dead node shipped and the app's new copy never made, and the archiver refuses to append a second history to them. After an unplanned failover of an app with `archive.enable`: `nixos-container run <app> -- db-archive next-generation --yes`. The app's journal says when a start was one (`not from a clean stop`). A move needs nothing.
 - **Those writes are kept, on the node that made them.** When it returns, its copy is renamed to `<pool>/state/orphans/<app>-<time>`, whole, and it receives the app's new history as a replica. `StateOrphaned` fires. Nothing deletes an orphan: mount it, take what is needed, and remove it yourself.
 
 ```sh
@@ -210,7 +209,7 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount and the metadata node refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
 | Logs | Loki keeps its store on the `metrics` node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
 | Backups | restic, with each app's repository at a salted hash of its name. |
-| The database archive | Encrypted inside the app's container before it leaves, with a key of the app's own, at a salted hash of its name. There is no unencrypted mode: no key, no upload. See [The database archive](#the-database-archive). |
+| The state backup | Restic, like the nightly backup and under the same password, at a salted hash of the app's name that is not the nightly repository's. See [Backups and restore](#backups-and-restore). |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
 
 Unattended unlock needs no person and no network, and never stands in a person's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
@@ -235,8 +234,7 @@ Kept outside any repository, off the cluster, and away from the laptop that hold
 - the offline age identity, whose public key is in `recipients`;
 - a dated `git bundle` of the private repository (`git bundle create site-<date>.bundle --all`);
 - direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB);
-- `<app>-db-archive/key` for each app that [archives its database](#the-database-archive): losing it loses that archive;
-- `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target` and `backup.repoSalt`.
+- `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}` and `backup-state-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target`, `backup.state.target` and `backup.repoSalt`.
 
 With the bundle and the offline identity, `clan vars get` gives back every other secret: `git clone site-<date>.bundle site`, then in it `AGE_KEYFILE=<offline identity> clan vars get <node> luks/passphrase`. To let a new operator in, add their public key to `recipients`, commit, and run `clan vars fix <machine>` for each machine with the offline identity; a key not yet in `recipients` reads nothing. With the JuiceFS key, the S3 pair and the bucket alone, the volume's metadata can be rebuilt anywhere (see [Restore without a node](#restore-without-a-node)).
 
@@ -460,13 +458,12 @@ What the node held, and what replaces it:
 | Client data: every app's local state, since each node holds a copy of each app's ([Where an app runs](#where-an-app-runs)), and through its mount every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
 | The machine's age key (`/etc/secret-vars/key.txt`), which decrypts that machine's vars at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
 | `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
-| `ovh-s3`, `backup-target` | New pairs from the provider, `avc secrets rotate ovh-s3` and `avc secrets rotate backup-target`, then delete the old pairs at the provider. |
+| `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
 | `nomad-gossip` on a server, `nomad-acl` on the leader, the alerting tokens on the `metrics` node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
 | `juicefs-pg` | By hand, in a window: every mount and the metadata role change together. |
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
 | `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
-| `<app>-db-archive` and `<app>-db-archive-s3`, for each app that archives its database | A new S3 pair per app from the provider, `avc secrets rotate <app>-db-archive-s3`, then delete the old pairs. The archive key is bound to data: a new key and a new generation, by "Keys" in [The database archive](#the-database-archive). What was archived under the old key counts as read. |
 | `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
 
 The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
@@ -606,11 +603,12 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
 | `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
-| `objectStorage` | `{ endpoint; region; juicefsBucket; dbArchiveBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. `dbArchiveBucket` is only for apps with `archive.enable`, and must be a bucket of its own ([The database archive](#the-database-archive)). Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
+| `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
 | `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it: a new salt moves every app to a new, empty repository, which is wanted only in [A node left your control](#a-node-left-your-control). |
-| `backup.target` | `{ type; ... }`, where `type` is `s3`, `rest`, `b2` or `local` (`lib/backup-target.nix`), with `endpoint`, `bucket` and `region` for S3. Keep it away from the object storage it protects. |
+| `backup.target` | `{ type; ... }`, where `type` is `s3`, `rest`, `b2` or `local` (`lib/backup-target.nix`), with `endpoint`, `bucket` and `region` for S3. The nightly backup's: the long history. Keep it away from the object storage it protects, and from the nodes. |
+| `backup.state` | Optional: `{ target; schedule; retention; staleHours; }`, a second, frequent backup of each app's local state to a second target, which must not be `backup.target` ([Backups and restore](#backups-and-restore)). `target` is `{ type; endpoint; bucket; region; }` as above, with credentials from `backup-state-target`; `schedule` is `hourly` unless set; `retention` is `{ hourly = 48; daily = 14; }`; `staleHours` (4) is when `StateBackupStale` fires. |
 | `backup.{schedule,maintenance,verify}` | systemd `OnCalendar`, in the node's clock (UTC). |
 | `backup.retention` | `{ daily; weekly; monthly; }`. |
 | `backup.uploadLimitKiB` | restic upload limit. `0` means unlimited. |
@@ -751,14 +749,13 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `ci/token` | Each machine's token for the cluster-ci Worker (per machine), listed in the Worker's `AGENT_TOKENS`. Only with `ci.url` | Generated |
 | `canary/value` | The string the [canary scan](#canary-scan) plants and looks for | Generated |
 | `github-token/{nix.conf,netrc}` | Pull loop access to private flakes | Prompt, a fine-grained PAT with read access to contents |
-| `restic/password` | Every app's backup repository. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
+| `restic/password` | Every app's backup repositories, nightly and state. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
 | `backup-target/{access-key,secret-key}` | The backup target | Prompt |
+| `backup-state-target/{access-key,secret-key}` | The state backup's target, only with `backup.state` | Prompt |
 | `alerting/cf-email-token` | Alert emails | Prompt, a Cloudflare token with Email Sending only |
 | `alerting-watchdog/token` | The dead-man heartbeat | Generated |
 | `cloudflare/provision-token` | The operator's own Cloudflare token for site provisioning; never deployed to a node | Prompt |
 | `<app>-cf/cloudflared` | Each app's tunnel | Prompt, from `cloudflared tunnel create` |
-| `<app>-db-archive/key` | The key an app's [database archive](#the-database-archive) is encrypted with, only for apps with `archive.enable`. Never regenerate it: a new one reads nothing archived so far | Generated |
-| `<app>-db-archive-s3/{access-key,secret-key}` | The same apps' access to the archive bucket, held inside the app's container | Prompt, a key of the app's own that reaches the archive bucket and nothing else |
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
 
@@ -852,7 +849,7 @@ One preview per app and branch, whatever the number of pull requests on the bran
 - **A copy does not act as production.** An `odoo` slot runs Odoo's `neutralize` on its copy before anything else, which turns off its mail servers, scheduled actions and payment providers, and does not start if that fails (Odoo 16 and later). A `frappe` slot sets `mute_emails` and `pause_scheduler`, and is not given the app's `cloud-storage` settings: the bucket is production's, so a preview's attachments are missing rather than writable.
 - **The preview's own sign-in is all that guards it.** It is production's data at a hostname anyone can ask for. Put the preview zone behind Cloudflare Access.
 - **Use a zone that serves nothing else** for `PREVIEW_DOMAIN`: unreviewed code at a subdomain of a production zone can set cookies for it.
-- **A slot is not backed up or archived**, is no Nomad job, and stays on the node that seeded it, where its clone is. Its logs are with every app's, under its slot's name. A build's last lines and the names of failed units go to the pull request; a guest's log never does, since it is a copy of production speaking.
+- **A slot is not backed up**, is no Nomad job, and stays on the node that seeded it, where its clone is. Its logs are with every app's, under its slot's name. A build's last lines and the names of failed units go to the pull request; a guest's log never does, since it is a copy of production speaking.
 
 Setting it up, once per site:
 
@@ -875,7 +872,22 @@ The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previ
 
 ### Backups and restore
 
-Each app is backed up, by whichever node is running it when the timer fires, into its own restic repository, `<target>/apps/<sha256 of repoSalt and the app's name>`. The two are joined with nothing between them, so from a machine that isn't a node, `printf %s "$salt$app" | sha256sum` gives the directory name. `cluster-backup-list <app>` prints it on a node, and is the only map from hash to app. A snapshot holds a logical database dump, taken inside the container with its own tools, and the app's JuiceFS paths, so a restore brings back a database and the files it refers to together. `backup.localSnapshot = true` adds an app's local state, read from a ZFS snapshot, for apps no dump covers.
+There are two backups, to two places, on two schedules.
+
+**The nightly one** is the long history, and goes to `backup.target`: somewhere that is neither the nodes nor their provider. Each app is backed up, by whichever node is running it when the timer fires, into its own restic repository, `<target>/apps/<sha256 of repoSalt and the app's name>`. The two are joined with nothing between them, so from a machine that isn't a node, `printf %s "$salt$app" | sha256sum` gives the directory name. `cluster-backup-list <app>` prints it on a node, and is the only map from hash to app. A snapshot holds a logical database dump, taken inside the container with its own tools, and the app's JuiceFS paths, so a restore brings back a database and the files it refers to together. `backup.localSnapshot = true` adds an app's local state, read from a ZFS snapshot, for apps no dump covers.
+
+**The state backup** is the recent past off the nodes, and exists once the topology has `backup.state`, with a target of its own: the nodes' own object storage is the natural one, since an hourly upload wants to be near and the nightly copy is the one that is far. Every hour (`backup.state.schedule`), each app's local state, as its newest replicated snapshot has it, goes into a second repository of the app's, `<state target>/state/<another hash>`: the database's directory itself, crash-consistent, which a database recovers from as from a power cut. One node does it per app, a replica, so reading a whole database costs the running app nothing. 48 hourly and 14 daily snapshots are kept (`backup.state.retention`). It is a physical copy: it restores to the same database version, and not the app's JuiceFS files, which are in object storage already.
+
+```sh
+cluster-state-backup [<app>]               # now; does nothing on a node that is not the one to
+cluster-state-backup-list <app>            # its snapshots, dated as the data is
+cluster-state-restore <app>                # print the plan
+cluster-state-restore <app> --snapshot <id> --yes   # the app stopped first: nomad job stop app-<name>
+```
+
+A state restore replaces the whole dataset on the node it runs on, after a ZFS snapshot of what was there, and every other node receives the result; then `nomad job start app-<name>`. Which to reach for: a node died, nothing, the app has moved already. A mistake in the last day, a replicated snapshot on any node (`zfs list -t snapshot <pool>/state/apps/<app>`, and `zfs clone` to read one). The nodes are gone, or the mistake is older: the state backup for the last two weeks to the hour, the nightly one beyond that or across a database version.
+
+The nightly backup's commands:
 
 ```sh
 cluster-backup [<app>]                     # back up now
@@ -912,50 +924,6 @@ juicefs mount -d sqlite3://meta.db /mnt/rescue --read-only
 ```
 
 Without the passphrase, with the wrong one, or with the wrong PEM, the load or the mount fails rather than reading garbage. For the backups: `restic -r <target>/apps/<hash> snapshots` with `restic/password` and the target's credentials.
-
-### The database archive
-
-A nightly backup can be a day old. `archive.enable = true` in an app's entry also archives its database continuously to object storage: a base backup and every change since, encrypted inside the app's container before it leaves. MariaDB is archived with WAL-G: a timer closes the binary log and ships it every `archive.flushSeconds` (60 by default), if anything was written. PostgreSQL is archived with pgBackRest: PostgreSQL hands over each WAL segment as it closes one, which it does at least every `flushSeconds` while there are changes. A clean stop of the database ships the last of them. A base backup is taken when the newest is older than `archive.baseIntervalHours` (24), and `archive.retainBaseBackups` (8) are kept per generation, with the changes since the oldest.
-
-**How far back it reaches.** To any moment since the oldest base backup kept: one interval less than the number kept, so seven days as set. Both are per app, in its `archive` entry. The archive is for the recent past, to the second; the restic backups above are the long history, to the night. Each base backup is a whole copy of the database, compressed, so eight of them cost about eight times that plus a week of changes, per app. A base backup past the count is removed by the archiver when its successor is in storage, with the changes from before the oldest kept. A shorter interval would shorten what a restore has to replay, at a base backup that often; nothing has timed a restore yet, so the interval is a day.
-
-**It is an archive, and nothing restores from it yet.** No command or timer in the library brings a database back from it, after a mistake or after a node is lost, so the restic backups above remain the copy that is rehearsed. `checks.db-archive` and `checks.db-archive-pg` prove that the archive is written, encrypted and complete through the failures they stage, and that a base backup comes back through the tool itself with the key and not with another.
-
-To turn it on for an app:
-
-1. Create a bucket for archives and nothing else, and name it in `objectStorage.dbArchiveBucket`. Evaluation refuses the JuiceFS volume's bucket and the backup target's, because every archived app's container holds an S3 key to this one.
-2. At the provider, make a key pair for the app that reaches this bucket and nothing else, and only the app's own path in it if the provider can scope a key that far. `clan vars generate <node>` asks for it (`<app>-db-archive-s3`) and makes the archive key (`<app>-db-archive`).
-3. Ship it, then restart the app once: `nomad job restart app-<name>`. The credentials are bind mounts, which a running container does not gain on a deploy, and PostgreSQL reads `archive_mode` only when it starts.
-4. Put `<app>-db-archive/key` in the [offline kit](#the-offline-kit).
-
-PostgreSQL needs an `https` endpoint, since pgBackRest speaks to S3 over TLS only.
-
-**Where it goes.** `<dbArchiveBucket>/db/<hash>/gen-<N>/`, where the hash is of `backup.repoSalt` and the app's name, so the provider does not read app names off the listing: `printf %s "db-archive:$salt$app" | sha256sum`.
-
-**Generations.** N is the generation of the data directory, kept in a marker file inside it (`db-archive.generation`), so the two are lost together. A data directory without a marker starts generation 1 only on an archive that was listed and found empty. On an archive that holds data, or one that could not be listed, the archiver refuses and uploads nothing (`cluster_db_archive_refused 1`): a second history appended to a generation would leave a restore that replays both. It refuses the same way when MariaDB's binary logs are numbered again from the start. The database keeps running; only its archive stops. If the data directory in front of you is the one to keep archiving, say so, in the container:
-
-```sh
-nixos-container run <app> -- db-archive status                     # generation, path, metrics, base backups
-nixos-container run <app> -- db-archive next-generation            # says which generation it would start
-nixos-container run <app> -- db-archive next-generation --yes      # starts it, with a base backup of its own
-nixos-container run <app> -- db-archive push                       # ship now
-nixos-container run <app> -- db-archive base --force               # a base backup now
-nixos-container run <app> -- db-archive generations                # each generation, its last write, and whether it can go
-nixos-container run <app> -- db-archive drop-generation <N>        # says what it would delete
-nixos-container run <app> -- db-archive drop-generation <N> --yes  # deletes it
-```
-
-`db-archive wal-g <arguments>` (MariaDB) and `db-archive pgbackrest <arguments>` (PostgreSQL) run the tool itself with the generation's settings.
-
-An earlier generation stays as it was, and is the only archive of its days, so it is kept for as long as a restore reaches back, counted from its last write. After that `drop-generation` deletes it, and nothing deletes one unasked: `cluster_db_archive_droppable_generations` counts the ones waiting, as of the last base backup. The command refuses the data directory's own generation, a later one (another node's, written since this one was current), one still inside that time, and one that storage did not list. No flag overrides it; deleting sooner is done at the provider. It needs no archive key, so it also removes a generation written under an earlier one.
-
-**What the archive does not hold.** Writes newer than the last shipment are only on the node's disks: up to `flushSeconds` of them, and everything written while storage is unreachable. MariaDB keeps its binary logs for three days, and an outage longer than that leaves a hole that the next base backup closes. PostgreSQL keeps WAL it could not ship up to `cluster.dbArchive.postgres.queueMaxMiB` (4096, set in the app's `module`). Beyond that it lets the oldest segment go rather than fill the disk and stop the database, records it in `db-archive.gap` in the data directory, and takes a base backup as soon as storage takes segments again. The changes in between are in no archive. A stop while storage is away is still a stop, with the last log left on the node: in the check, PostgreSQL takes 54 seconds over it, of the 90 a container is given.
-
-**Watching it.** Each archived app's node exports five metrics with an `app` label: `cluster_db_archive_last_ok_timestamp_seconds` (the last time everything written was found in storage, which stands still during an outage, a refusal or a gap), `cluster_db_archive_last_base_timestamp_seconds`, `cluster_db_archive_generation`, `cluster_db_archive_refused` and `cluster_db_archive_droppable_generations`. No alert rule reads them yet, so a stalled archive shows in a query and not in an email.
-
-**Keys.** The archive key is bound to data, like `restic/password`: `secrets/policy.toml` marks it never, and a new value reads nothing archived so far. If it has to change, as after [a node left your control](#a-node-left-your-control), change it by starting a generation under the new one: `clan vars generate <node> --generator <app>-db-archive --regenerate`, ship it, `nomad job restart app-<name>`, and at once `db-archive next-generation --yes` in its container. Do not leave out the last step, or one generation holds data under two keys. The earlier generations open with the old key only, so it stays in the kit until they are dropped. They are kept as long as any other: they are the only archive of those days, and deleting them takes nothing back from whoever read them. The one case for deleting sooner, at the provider, is a machine kept by whoever can also read the bucket without its S3 key. Each of those steps is what a check proves by itself; the sequence has not been rehearsed.
-
-The S3 key is inside the container, so a compromised app can delete or overwrite its own archive, and with a key that reaches the whole bucket, the other apps' archives too. It cannot read theirs. The key has to be allowed to delete objects, because the archiver removes old base backups with it. As for the backup target, a bucket with versioning and a key that cannot delete object versions leaves such an app able to hide objects but not to destroy history. With versioning, give the bucket a rule that expires noncurrent versions after the time above, or nothing deleted ever leaves it. Never a rule that expires current objects by age: both tools write files once that every later restore reads. Neither versioning nor such a rule is set or checked by the library, and no check runs against a versioned bucket.
 
 ### Monitoring and alerting
 
@@ -1035,6 +1003,8 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `FreeIPARestartPending` | warning | A deployed FreeIPA change has not been applied for a day. |
 | `FreeIPAHealthStale` | warning | The FreeIPA health check has not run. |
 | `FreeIPAHealthNeverRan` | warning | The FreeIPA health check has never reported. |
+| `StateBackupStale` | warning | An app's state has not reached the state backup target for 4 hours (`backup.state.staleHours`). |
+| `StateBackupNeverRan` | warning | An app's state has never reached the state backup target. |
 | `StateReplicaLagging` | warning | A node's copy of an app's local state is over 10 minutes behind the running one. |
 | `StateReplicationStale` | warning | A node has not snapshotted or pulled app state for 15 minutes. |
 | `StateReplicationFailing` | warning | Replicating some app's state fails on a node. |
@@ -1090,6 +1060,7 @@ This version is written for fresh installs. A cluster running an earlier version
 - **`homeNode` is gone, and local state moves into datasets.** Remove `homeNode` from every app (evaluation refuses it). An app's database is then a plain directory on the node it was pinned to, and the app has to start there once more: that start copies the directory into `<pool>/state/apps/<app>` (as long as the copy takes, inside `startTimeout`) and keeps the original as `/state/clients/.<app>.before-datasets`, to remove by hand. Started on any other node first, it refuses and Nomad tries again elsewhere, so an app may take a few attempts to land. To choose instead of waiting: `nomad node eligibility -disable` the other nodes, `nomad job restart app-<name>`, and enable them again. Each other node then receives a whole copy, which needs the disk. `/state` must be ZFS, as the installer makes it. Not rehearsed on a site with data.
 - **The scheduler algorithm.** New clusters spread apps over nodes. One bootstrapped before keeps Nomad's packing until told, once, on a server: `nomad operator scheduler set-config -scheduler-algorithm=spread`.
 - **The `backup` tag does nothing now.** Each app is backed up by the node running it. Leave the tag or remove it.
+- **The database archive is gone.** `archive.*` on an app, `objectStorage.dbArchiveBucket` and the `<app>-db-archive*` vars no longer exist: remove them, and the archive bucket and its keys at the provider when its last week is no longer wanted. What replaces it is replication between the nodes and, off them, `backup.state`.
 
 ## Testing
 
@@ -1147,10 +1118,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `cluster-watchdog` | The dead-man's logic, and the audit Worker's schemas, tokens and emails. |
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |
 | `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM. |
-| `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. |
-| `db-archive` | The database archiver for MariaDB against an S3 server, in a VM: generation 1 by the timer alone; what reaches storage is encrypted, and comes back with its key and not with another; a push is recorded only once its log is listed in storage; no key, no upload; renumbered logs, an archive that already holds data and one that could not be listed are refused; base backups and retention, with the binary logs from before the oldest base backup kept; an earlier generation kept for as long as a restore reaches back and then deleted when asked, and never a later one or the data directory's own; an outage, and a stop with and without storage. |
-| `db-archive-pg` | The same for PostgreSQL, where PostgreSQL hands over each WAL segment itself: every stored object is ciphertext; nothing is uploaded while the archiver refuses; WAL that cannot be shipped is kept up to its limit and dropped beyond it, and the gap holds the freshness metric still until a base backup closes it; a restored base backup carries no marker; earlier generations kept and dropped by the same rule. |
-| `db-archive-wiring` | What `archive.enable` gives an app's container and what it refuses to evaluate: the bucket and salted path, the per-app generators, read-only credential mounts, each engine's settings, eight daily base backups unless the app says otherwise, and no bucket shared with JuiceFS or the backups. Evaluation only. |
+| `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
 | `cluster-single` | `node1`'s real machine module boots and walks the whole cold start, twice: secrets, networking, the mesh, etcd, encrypted JuiceFS on S3, Nomad with TLS and scoped tokens, every app's job, monitoring, the audit producers. Jobs register but aren't placed. About 5 GB of RAM. |
 | `cluster` | Three voters form quorums, share one JuiceFS volume, and run probe containers with cross-node reachability, an app held to one node by a constraint, and fencing. About 9 GB of RAM. |
@@ -1200,7 +1168,7 @@ These are accepted deliberately.
 3. **Request body cap.** Cloudflare's limit (100 MB on Free and Pro) applies to everything proxied, tunnel included.
 4. **Config changes bounce the connector.** A container restart drops its tunnel briefly.
 5. **`br-wan` puts containers on the public L2 segment.** Their inbound filtering is the container's own firewall, with the host pinning each port's MAC and addresses.
-6. **Restores are from nightly backups, not point-in-time.** The replicated snapshots of an app's state ([Where an app runs](#where-an-app-runs)) narrow that to a minute for the last half hour and an hour for the last day, on every node, for a loss that is not the pool's own. [The database archive](#the-database-archive) holds every change of an app that turns it on, and nothing here restores from it yet.
+6. **No restore is to the second.** An app's state can be had back to the minute for the last four hours and to the hour for the last day, from any node's snapshots ([Where an app runs](#where-an-app-runs)); from off the nodes, to the hour with `backup.state` and to the night without. The continuous database archive an earlier version had is gone: it was the only thing here that reached a second, nothing restored from it, and replication took over what it was for.
 7. **The JuiceFS metadata engine is a single point of failure.** If the `juicefs-meta` node dies, every node's `/mnt/jfs` is stranded until it returns.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
 9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation.

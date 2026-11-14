@@ -63,6 +63,8 @@ in
     backupApps = lib.attrNames backedUp;
     verifiedApps = lib.attrNames (lib.filterAttrs isVerified backedUp);
     freeipaApps = lib.attrNames (lib.filterAttrs (_: a: a.freeipa != null) apps);
+    stateBackupApps = config.cluster.stateBackup.apps or [ ];
+    stateBackupStaleHours = topology.backup.state.staleHours or 4;
     # Every public hostname of every app, probed the way a user reaches it --
     # except those behind Cloudflare Access, where the edge answers with its
     # login redirect and the probe would never reach the tunnel or the app.
