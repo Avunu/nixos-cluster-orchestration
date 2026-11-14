@@ -281,7 +281,7 @@ in
     };
 
     # One JWT per role this machine logs in as (lib/nomad-pki.nix loginRoles), and
-    # only those: a worker holds no `registrar` and no `autoscaler`. Per machine, so
+    # only those: a worker holds no `registrar`. Per machine, so
     # each names its node, and a stolen one is that node's roles only.
     nomad-login = {
       dependencies = [ "nomad-jwt" ];

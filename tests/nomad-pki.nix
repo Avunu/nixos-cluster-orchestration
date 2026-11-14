@@ -14,8 +14,8 @@
 #   - a JWT from mint_jwt verifies with the public key, carries the claims the auth
 #     method binds, and a tampered one does not verify
 #   - the real `nomad-jwt` and `nomad-login` generators: the signing key stays off
-#     nodes, each machine gets a JWT for its own roles only (no registrar, no
-#     autoscaler on a worker), each verifies and names its node and role; and the
+#     nodes, each machine gets a JWT for its own roles only (no registrar
+#     on a worker), each verifies and names its node and role; and the
 #     management token (`nomad-acl`) is declared on the nomad-leader node only
 #
 # Run: nix build .#checks.x86_64-linux.nomad-pki
@@ -87,8 +87,8 @@ pkgs.runCommand "nomad-pki-check"
     [ "$(jq .jwtShared $f)" = true ] || fail "nomad-jwt is not shared"
     [ "$(jq .loginShared $f)" = false ] || fail "nomad-login is shared: every node would hold every role"
     [ "$(jq -c .loginDependencies $f)" = '["nomad-jwt"]' ] || fail "nomad-login does not depend on nomad-jwt alone"
-    [ "$(jq -c .serverLogins $f)" = '["jwt-autoscaler","jwt-avc","jwt-fence","jwt-node-meta","jwt-registrar"]' ] \
-      || fail "node1 (leader, metrics) logins: $(jq -c .serverLogins $f)"
+    [ "$(jq -c .serverLogins $f)" = '["jwt-avc","jwt-fence","jwt-node-meta","jwt-registrar"]' ] \
+      || fail "node1 (leader) logins: $(jq -c .serverLogins $f)"
     [ "$(jq -c .workerLogins $f)" = '["jwt-avc","jwt-fence","jwt-node-meta"]' ] \
       || fail "a worker's logins: $(jq -c .workerLogins $f)"
     pass "declarations: nomad-acl on the leader only, the JWT key stays off nodes, logins per machine and per role"
@@ -205,7 +205,7 @@ pkgs.runCommand "nomad-pki-check"
     gen nomad-login ${server.nomad-login.finalScript} "$PWD/in" login-server
     gen nomad-login ${worker.nomad-login.finalScript} "$PWD/in" login-worker
     cp jwtkey/signing.pub signing.pub
-    for x in login-server/jwt-{fence,node-meta,avc,registrar,autoscaler} login-worker/jwt-{fence,node-meta,avc}; do
+    for x in login-server/jwt-{fence,node-meta,avc,registrar} login-worker/jwt-{fence,node-meta,avc}; do
       [ -s "$x" ] || fail "nomad-login did not write $x"
       IFS=. read -r h p s < "$x" || true  # no trailing newline: read returns 1 at EOF
       verify "$h" "$p" "$s" || fail "$x does not verify with nomad-jwt's signing.pub"
@@ -218,8 +218,8 @@ pkgs.runCommand "nomad-pki-check"
       [ "$(jq -r .aud <<<"$claims")" = ${pki.jwtAudience} ] || fail "$x: aud: $claims"
       [ "$(jq -r '.exp - .iat' <<<"$claims")" = $((${toString pki.jwtDays} * 86400)) ] || fail "$x: lifetime: $claims"
     done
-    [ ! -e login-worker/jwt-registrar ] && [ ! -e login-worker/jwt-autoscaler ] \
-      || fail "the worker's generator wrote a registrar or autoscaler JWT"
+    [ ! -e login-worker/jwt-registrar ] \
+      || fail "the worker's generator wrote a registrar JWT"
     pass "nomad-login: one verified JWT per role, naming its node; the worker gets fence, node-meta, avc only"
 
     # ── the fixtures the VM tests use ───────────────────────────────────────

@@ -338,7 +338,7 @@ pkgs.testers.runNixOSTest {
             print(f"management-absent-from-workers: {detail}")
             control("management-absent-from-workers",
                     not present and readers == [] and no_raft
-                    and held and not set(held) & {"registrar", "autoscaler"}
+                    and held and "registrar" not in held
                     and "client" in kinds.values() and "management" not in kinds.values(),
                     detail)
 

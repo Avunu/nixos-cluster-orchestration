@@ -10,8 +10,7 @@
 #
 # Nomad chooses the node. An app with `localState` runs as one allocation, and its
 # state follows it there (modules/app-state.nix); one without spreads as `nomad` says.
-# The two constraints an app can carry are derived, not named: a ready JuiceFS mount,
-# and for `network.hostAccess` the metrics node, the only one that routes to itself.
+# The one constraint an app carries by itself is derived, not named: a ready JuiceFS mount.
 { lib }:
 let
   inherit (lib)
@@ -47,9 +46,6 @@ let
   usesJfs = app.juicefsPaths != { };
   # One writer: a database's directory, wherever Nomad puts the app.
   stateful = app.localState != { };
-  # Loki and Prometheus answer on the metrics node's mesh address, which only that
-  # node's own containers can route to (modules/app-container.nix, hostAccess).
-  metricsOnly = app.network.hostAccess != [ ];
 
   # A preview slot (modules/apps.nix, modules/ci-agent.nix): declared like any app, so
   # everything the host decides about a container is decided here, at evaluation, and
@@ -286,11 +282,6 @@ let
 
   constraints =
     app.nomad.constraints
-    ++ optional metricsOnly {
-      LTarget = "\${node.unique.name}";
-      Operand = "=";
-      RTarget = (net.soleTaggedNode topology "metrics").hostName;
-    }
     ++ optional usesJfs {
       LTarget = "\${meta.jfs_ready}";
       Operand = "=";

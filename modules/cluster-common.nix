@@ -143,7 +143,7 @@ in
     "flakes"
   ];
 
-  # Nomad + nomad-autoscaler are BSL-licensed (unfree).
+  # Nomad is BSL-licensed (unfree).
   nixpkgs.config.allowUnfree = true;
 
   # REQUIRED, not convenience: nix shells out to `git` to fetch `git+https://`
@@ -343,7 +343,7 @@ in
         denied_host_uids = rawExecDeniedUids;
       };
 
-      # /v1/metrics in Prometheus form, on EVERY node: the metrics node's Prometheus
+      # /v1/metrics in Prometheus form, on EVERY node: every node's Prometheus
       # scrapes them all (modules/monitoring-server.nix). This used to be set only
       # there, so every other node answered the scrape with an error and its
       # `up{job="nomad"}` was 0, unnoticed until tests/cluster.nix asked.

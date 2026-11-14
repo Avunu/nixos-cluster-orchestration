@@ -70,7 +70,6 @@ let
   meshIp = net.meshIp topology node;
   meshSubnet = topology.mesh.subnet;
   meshPorts = lib.concatMapStringsSep ", " toString (net.meshPortsFor node);
-  isMetrics = net.hasTag "metrics" node;
 
   # ── Container default-deny (design WS9, Appendix E) ─────────────────────────
   # What each app declares it may reach (clusterApps.<n>.network, set by
@@ -182,18 +181,16 @@ let
   );
 
   # inet input: a declared app's own ports on this node's mesh address, by mark. On
-  # the metrics node only, since that is where Loki and Prometheus are and the only
-  # node a container can reach a mesh address from (its own); such an
-  # app's job is held to the metrics node (lib/mk-app-container.nix).
-  markedHostAccepts = lib.optionalString isMetrics (
-    lines (
-      map (
-        n:
-        ''iifname "br-app" meta mark ${markOf n} ip daddr ${meshIp} tcp dport { ${
-          setOf (map toString (lib.unique apps.${n}.hostAccess))
-        } } accept''
-      ) hostAccessApps
-    )
+  # every node: each runs Loki and Prometheus, and a container reaches the mesh
+  # address of the node it is on and no other, so the app finds them wherever Nomad
+  # put it.
+  markedHostAccepts = lines (
+    map (
+      n:
+      ''iifname "br-app" meta mark ${markOf n} ip daddr ${meshIp} tcp dport { ${
+        setOf (map toString (lib.unique apps.${n}.hostAccess))
+      } } accept''
+    ) hostAccessApps
   );
   # inet forward: cross-node peer flows. Out: by the source's mark, to the other
   # nodes' container subnets (never a transit or host address), on its declared
@@ -275,7 +272,7 @@ let
         ct state { established, related } accept
 
         # Declared container flows to this node's mesh address, by bridge port (the
-        # mark). Before the weak-host drop: Grafana is local to the metrics node.
+        # mark). Before the weak-host drop: Grafana is local to the node it asks.
     ${markedHostAccepts}
 
         # Weak host model: the kernel answers for an address on ANY interface, so an
@@ -292,6 +289,8 @@ let
 
         # The mesh: what this node's roles serve (lib/net.nix meshPortsFor).
         iifname "${meshIf}" ip saddr ${meshSubnet} tcp dport { ${meshPorts} } accept
+        # Alertmanager's gossip probes its peers over UDP as well.
+        iifname "${meshIf}" ip saddr ${meshSubnet} udp dport ${toString net.alertmanagerClusterPort} accept
         iifname "${meshIf}" icmp type echo-request accept
 
         # Control VLAN: Nomad under mTLS, and the mesh's own transport. Nothing else:

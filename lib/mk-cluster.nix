@@ -119,7 +119,6 @@ libraryInputs.clan-core.lib.clan {
     };
     roles.juicefs-meta.tags = [ "juicefs-meta" ];
     roles.nomad-leader.tags = [ "nomad-leader" ];
-    roles.metrics.tags = [ "metrics" ];
   };
 
   machines = lib.mapAttrs (

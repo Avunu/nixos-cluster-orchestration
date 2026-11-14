@@ -83,8 +83,7 @@ rec {
 
   # The roles a node logs in as, from its tags. What a node holds is what a thief
   # gets from it, so a role is minted only where its consumer runs: `registrar`
-  # where jobs are registered (nomad-leader), `autoscaler` where the autoscaler runs
-  # (metrics). Every node fences, sets its own node meta, and serves avc.
+  # where jobs are registered (nomad-leader). Every node fences, sets its own node meta, and serves avc.
   loginRoles =
     node:
     let
@@ -95,8 +94,7 @@ rec {
       "node-meta"
       "avc"
     ]
-    ++ lib.optional (has "nomad-leader") "registrar"
-    ++ lib.optional (has "metrics") "autoscaler";
+    ++ lib.optional (has "nomad-leader") "registrar";
 
   # Bash. Needs openssl and coreutils on PATH. Each function works in a directory of
   # its own, so it can run in a generator's sandbox, a build, or a VM.

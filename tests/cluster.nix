@@ -441,7 +441,7 @@ pkgs.testers.runNixOSTest {
                 # Not deployed, read by nothing.
                 present = n.execute("test -e /run/secrets/shared/nomad-acl")[0] == 0
                 readers = units_reading(n, "nomad-acl/token")
-                # Its own roles only: no registrar, no autoscaler.
+                # Its own roles only: no registrar.
                 held = sorted(n.succeed(f"ls {TOKENS}").split())
                 # Every token-shaped value deployed to the node, tried against the API.
                 found = n.succeed(

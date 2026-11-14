@@ -5,9 +5,8 @@
 # CPU/memory surfaces without any in-container agent (see README's
 # "Operational loop", step 1).
 #
-# The scraping/scaling half (Prometheus + Nomad Autoscaler) is a singleton and
-# lives in modules/monitoring-server.nix, assigned by the `metrics` tag through
-# inventory.instances. This file carries no leader conditional.
+# The scraping half (Prometheus, and with it Alertmanager and Loki) is
+# modules/monitoring-server.nix, on every node as well.
 #
 # Both exporters listen on the node's mesh address (modules/mesh-control-core.nix)
 # only: before the mesh, an attacker on the control VLAN read all of node_exporter.

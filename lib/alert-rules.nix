@@ -532,7 +532,7 @@ in
           for = "5m";
           severity = "critical";
           summary = "{{ $labels.app }} is unreachable at {{ $labels.instance }}";
-          description = "Probed from the metrics node through Cloudflare: tunnel, nginx and app all have to work.";
+          description = "Probed from every node through Cloudflare: tunnel, nginx and app all have to work.";
         })
         (rule {
           alert = "BackupTargetDown";
@@ -682,8 +682,8 @@ in
           expr = ''up{job="loki"} == 0'';
           for = "5m";
           severity = "warning";
-          summary = "Loki on {{ $labels.instance }} is down: logs are queueing on every node";
-          description = "Nodes keep their journals and resume from their cursors, so nothing is lost until a guest journal rotates past SystemMaxUse. `journalctl -u loki` on the metrics node.";
+          summary = "Loki on {{ $labels.instance }} is down: its copy of the logs is falling behind";
+          description = "The other nodes' Lokis have every line. This one's own node resumes from its journal cursor; the others hold 512 MiB for it each, and what is past that is a gap in this copy. `journalctl -u loki` on the node.";
         })
         (rule {
           alert = "LogShipperDown";
@@ -695,11 +695,11 @@ in
         })
         (rule {
           alert = "LogShippingFailing";
-          expr = ''sum by (instance) (rate(vector_component_errors_total{component_id="loki"}[10m])) > 0'';
+          expr = ''sum by (instance) (rate(vector_component_errors_total{component_id=~"loki-.*"}[10m])) > 0'';
           for = "15m";
           severity = "warning";
-          summary = "{{ $labels.instance }} has been failing to push logs to Loki for 15m";
-          description = "`journalctl -u vector` on the node; usually Loki rejecting (limits, clock skew) or unreachable.";
+          summary = "{{ $labels.instance }} has been failing to push logs to a Loki for 15m";
+          description = "`journalctl -u vector` on the node says which; usually a Loki rejecting (limits, clock skew) or a node that is down, which NodeDown says too.";
         })
       ];
     }

@@ -1,8 +1,8 @@
-# modules/logging-server.nix — Loki: the cluster's log store (singleton).
+# modules/logging-server.nix — Loki: the cluster's log store, a whole one on every node.
 #
-# Imported by modules/monitoring-server.nix, so it follows the `metrics` role:
-# Loki sits beside Prometheus and Alertmanager, and every node's Vector
-# (modules/logging.nix) pushes to it over the WireGuard control mesh. It has no
+# Imported by modules/monitoring-server.nix, so every node runs one, beside its
+# Prometheus and Alertmanager, and every node's Vector (modules/logging.nix) pushes
+# to every one of them over the WireGuard control mesh. It has no
 # authentication of its own: before the mesh, anything on the control VLAN could
 # read it and push forged lines into it (`loki-forged-push-refused`).
 #
@@ -13,13 +13,11 @@
 # the disk encryption is what protects them at rest; a bucket would have put them
 # in front of the storage provider instead.
 #
-# What that costs, accepted: moving the `metrics` tag gives the new node an EMPTY
-# Loki, and the history goes with the node if the node is lost. Every node's Vector
+# What that costs, accepted: the logs are on the nodes and nowhere else. Each node
+# has all of them, so they survive any node and not the loss of all. Every node's Vector
 # resumes from its own journal cursor, so nothing still in a journal is lost, and
 # retention (topology.logging.retention) is what bounds the store anyway. A backup
-# would keep client-bearing lines past that retention, so there is none. The node the
-# tag moved AWAY from keeps its old store, which its own Loki no longer compacts:
-# modules/logging.nix applies the same retention to it (loki-retired-store).
+# would keep client-bearing lines past that retention, so there is none.
 #
 # The limits started from an earlier filesystem-backed deployment's, with the
 # reasons for them kept beside each.
@@ -164,8 +162,15 @@ in
   # shippers', scraped by the Prometheus beside it.
   services.prometheus.scrapeConfigs = [
     {
+      # Every node's, like every other job: a Loki that is down is seen by the others.
       job_name = "loki";
-      static_configs = [ { targets = [ "${meshIp}:${toString net.lokiPort}" ]; } ];
+      static_configs = [
+        {
+          targets = lib.mapAttrsToList (_: nd: "${net.meshIp topology nd}:${toString net.lokiPort}") (
+            lib.filterAttrs (_: nd: nd.provisioned or true) topology.nodes
+          );
+        }
+      ];
     }
     {
       job_name = "vector";

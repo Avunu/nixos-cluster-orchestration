@@ -1,7 +1,7 @@
 # modules/nomad-acl.nix — Nomad's namespaces, policies and scoped tokens.
 #
 # Before this, every consumer of the API (the fence on every node, jfs-nomad-meta,
-# job registration, the autoscaler, avc) read the ACL bootstrap token, so every node
+# job registration, avc) read the ACL bootstrap token, so every node
 # held a management token: root on any worker was root on the cluster. Now:
 #
 #   nomad-acl-init     the `nomad-leader` node only, and the only reader of the
@@ -90,15 +90,6 @@ let
     registrar = ''
       namespace "${ns}" { capabilities = ["submit-job", "read-job", "list-jobs"] }
     '';
-    autoscaler = ''
-      namespace "${ns}" {
-        policy       = "scale"
-        capabilities = ["list-jobs"]
-      }
-      node { policy = "read" }
-      operator { policy = "read" }
-      agent { policy = "read" }
-    '';
     # avc: status, logs, and `nomad job restart` (alloc-lifecycle). Never submit.
     operator-read = ''
       namespace "${ns}" { capabilities = ["list-jobs", "read-job", "read-logs", "alloc-lifecycle"] }
@@ -113,7 +104,6 @@ let
     fence = "fence";
     node-meta = "node-meta";
     registrar = "registrar";
-    autoscaler = "autoscaler";
     avc = "operator-read";
   };
   bindingRules = lib.mapAttrsToList (role: policy: {
@@ -306,8 +296,7 @@ let
   # reinstalled, raft reset in a recovery): every consumer of it would get 403 until
   # the next timer. So every few minutes a refused token gets a fresh login. Only a
   # refusal does: Nomad not answering is not this unit's problem, and logging in then
-  # would fail too. The autoscaler picks the new token up through its login's
-  # ExecStartPost; the fence and the scripts read the file on every run.
+  # would fail too. The fence and the scripts read the file on every run.
   tokenCheckScript = pkgs.writeShellScript "nomad-token-check" ''
     set -uo pipefail
     export PATH=${
@@ -392,11 +381,6 @@ in
             LoadCredential = [ "jwt:${vars.nomad-login.files."jwt-${role}".path}" ];
             Restart = "on-failure";
             RestartSec = 10;
-          }
-          # The autoscaler loads its token once, at start (a DynamicUser reads it as a
-          # credential). --no-block: at boot it is queued behind this very unit.
-          // lib.optionalAttrs (role == "autoscaler") {
-            ExecStartPost = "-${pkgs.systemd}/bin/systemctl --no-block try-restart nomad-autoscaler.service";
           };
         }
       ) roles

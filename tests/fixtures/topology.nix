@@ -133,7 +133,6 @@
         "etcd"
         "nomad-leader"
         "juicefs-meta"
-        "metrics"
       ];
       hostId = "f0000001";
 

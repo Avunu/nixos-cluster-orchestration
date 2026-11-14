@@ -64,7 +64,6 @@ let
       index = 1;
       hostName = "machine";
       controlIp = "192.168.1.1";
-      tags = [ "metrics" ];
     };
   };
   node = topology.nodes.machine;
@@ -104,6 +103,7 @@ pkgs.testers.runNixOSTest {
 
   node.specialArgs = {
     inherit topology clusterLib node;
+    nodeName = "machine";
   };
 
   nodes.machine =

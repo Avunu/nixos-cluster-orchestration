@@ -520,9 +520,8 @@ in
             + " starts there (README, \"Upgrading a running cluster\").";
         }) config.clusterApps
         # hostAccess (design 1.12): the identity is nspawn's vb-<name>, exact only up
-        # to 12 characters. Only the metrics node's own containers have a path to its
-        # mesh address, so the app's job is constrained to that node
-        # (lib/mk-app-container.nix).
+        # to 12 characters. A container reaches the mesh address of the node it is on,
+        # where every node has the same services, so the app runs on any.
         ++ lib.mapAttrsToList (n: _: {
           assertion = lib.stringLength n <= 12;
           message =

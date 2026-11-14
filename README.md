@@ -37,7 +37,7 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 
 ### Where an app runs
 
-Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and three things only narrow the choice. An app with files on JuiceFS needs a node whose mount is ready. An app with `network.hostAccess` (Grafana) runs on the `metrics` node, the only one that routes to Loki and Prometheus. And `wpdb` runs on the node whose app subnet its `address` is in, because an address does not move between subnets. `nomad.constraints` takes anything else in Nomad's own terms.
+Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and two things only narrow the choice. An app with files on JuiceFS needs a node whose mount is ready. And `wpdb` runs on the node whose app subnet its `address` is in, because an address does not move between subnets. `nomad.constraints` takes anything else in Nomad's own terms.
 
 An app with local state (a database directory, FreeIPA's data) runs as one allocation, and its state goes where it goes:
 
@@ -95,11 +95,11 @@ Bridged frames do not traverse the host's IP hooks, so each container firewalls 
 
 ```nix
 # apps/<name>.nix
-network.hostAccess = [ 3100 ];                             # TCP ports on the metrics node's mesh address
+network.hostAccess = [ 3100 ];                             # TCP ports on the mesh address of the node it runs on
 network.peerAccess = [ { app = "wpdb"; port = 3306; } ];   # another app, one TCP port
 ```
 
-- `hostAccess` is for Loki and Prometheus on the `metrics` node. The app's job is constrained to that node, and its name must be at most 12 characters, because its identity is nspawn's veth `vb-<name>` (asserted).
+- `hostAccess` is for Loki and Prometheus, which every node runs: the app reaches them on the node Nomad put it on. Its name must be at most 12 characters, because its identity is nspawn's veth `vb-<name>` (asserted).
 - `peerAccess` reaches another app on the same node over the bridge, or on any other node over the app VLAN, on one TCP port, and nothing comes back but replies. Both ends get an extra `br-app` veth named `vp-<iid>`, so any name length works (D23 under [Defaults awaiting a decision](#defaults-awaiting-a-decision)).
 - Identity is the bridge port a frame arrives on, never the address: a container holds `CAP_NET_ADMIN` and can take any address and MAC it likes.
 - A container's IPv4 egress excludes RFC 1918, CGNAT, link-local and every node's public address. An S3 endpoint on a private address would need a rule of its own.
@@ -111,7 +111,7 @@ Refused traffic is logged, rate-limited, with the prefixes `container-to-host-dr
 ### The control plane
 
 - **Nomad** listens on the control VLAN with mutual TLS (`nomad-ca`, `nomad-tls`) and a gossip key (`nomad-gossip`, servers only), and verifies server names. ACLs are on. Apps run in the `apps` namespace; `default` can run nothing.
-- **Every machine logs in with scoped tokens.** Each node holds pre-signed JWTs (`nomad-login`, signed offline by `nomad-jwt`) for its roles: `fence`, `node-meta` and `avc` everywhere, `registrar` on the `nomad-leader` node, `autoscaler` on the `metrics` node. `nomad-login@<role>` exchanges them for tokens in `/run/nomad-tokens/<role>`. The management token (`nomad-acl`) is only on the `nomad-leader` node, read only by `nomad-acl-init`. **Every voter still holds every ACL token, management included, in its raft state**, and root on a server can always mint one.
+- **Every machine logs in with scoped tokens.** Each node holds pre-signed JWTs (`nomad-login`, signed offline by `nomad-jwt`) for its roles: `fence`, `node-meta` and `avc` everywhere, `registrar` on the `nomad-leader` node. `nomad-login@<role>` exchanges them for tokens in `/run/nomad-tokens/<role>`. The management token (`nomad-acl`) is only on the `nomad-leader` node, read only by `nomad-acl-init`. **Every voter still holds every ACL token, management included, in its raft state**, and root on a server can always mint one.
 - **Everything else is on the WireGuard mesh**, `wg-ctrl`, one key per machine (`wg-ctrl`), each node at `<mesh.subnet base>.<index>`. A machine on the VLAN without a key reaches only Nomad's port and the mesh's UDP port. The mesh authenticates the machine, not the process: any process on a node can use it (D1, accepted). SSH no longer answers on the VLANs.
 - **etcd** is created once, from the tags, with three or more members (see the tag table).
 - **Jumbo frames.** The VLANs take `vlans.<v>.mtu` (9000 in the template) and the mesh 80 bytes less. A private network that doesn't really carry 9000 is a silent blackhole, so every node probes every peer at full size (`VrackJumboBroken`), and the [real hardware checklist](#real-hardware-checklist) tests it before any data. With the trunk at 1500 and a VLAN asking for 9000, networkd does not create the VLAN at all.
@@ -207,7 +207,7 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | A swapped volume | A per-node secret on the encrypted root whose hash is compiled into the signed initrd. The initrd checks it before it mounts anything from the pool, and halts on a mismatch, so a forged disk with copied identifiers gets nothing. |
 | The emergency shell | Protected by a hashed password, and entering it first extends PCR 7 with a burn, so the TPM refuses the disk key for the rest of that boot. |
 | The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount and the metadata node refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
-| Logs | Loki keeps its store on the `metrics` node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
+| Logs | Each node's Loki keeps its store on that node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
 | Backups | restic, with each app's repository at a salted hash of its name. |
 | The state backup | Restic, like the nightly backup and under the same password, at a salted hash of the app's name that is not the nightly repository's. See [Backups and restore](#backups-and-restore). |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
@@ -460,7 +460,7 @@ What the node held, and what replaces it:
 | `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
 | `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
-| `nomad-gossip` on a server, `nomad-acl` on the leader, the alerting tokens on the `metrics` node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
+| `nomad-gossip` on a server, `nomad-acl` on the leader, the alerting tokens on every node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
 | `juicefs-pg` | By hand, in a window: every mount and the metadata role change together. |
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
 | `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
@@ -578,7 +578,7 @@ Accepted, and written here so they are accepted knowingly.
 - **The app VLAN is not authenticated.** An attacker on it who spoofs a container's source address can reach a port an app declared on another node: for traffic arriving from the VLAN, the rule checks the source subnet and port, not identity.
 - **Metadata leaks:** the bucket shows object sizes and timing; restic's key files show host names and times; metrics and alert emails carry app and host names to Cloudflare; PostgreSQL's WAL, the JuiceFS cache and backup staging hold plaintext on the encrypted disk until the next run.
 - **`juicefs config --secret-key` puts the S3 secret on a command line** on the metadata node for the seconds of its storage test, after a restore, a rotation or a lost state file. JuiceFS 1.4.1 has no other way.
-- **Loki's history is lost with the `metrics` node.** Backing it up would keep client-bearing logs past their retention.
+- **Logs are kept on the nodes only.** Every node's Loki holds the whole cluster's lines, so they survive any node but not all of them. Backing them up would keep client-bearing logs past their retention.
 - **`freeipa` keeps every capability** (`additionalCapabilities = [ "all" ]`), so a compromise of that container is host root whatever the firewall does.
 - **Cloudflare sees traffic at the tunnel edge,** and the alert emails' text.
 - **Lanzaboote is pinned to a commit,** not a release.
@@ -603,7 +603,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
 | `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
-| `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
+| `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: each node's store is its own encrypted disk (`/var/lib/loki`). |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
 | `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it: a new salt moves every app to a new, empty repository, which is wanted only in [A node left your control](#a-node-left-your-control). |
@@ -648,7 +648,6 @@ What an unlock depends on (the node's `initrdNicModules`, `wanInterface`, `publi
 | `etcd` | Votes in the etcd raft. |
 | `nomad-leader` | Registers rendered jobspecs, and holds the management token. Singleton. |
 | `juicefs-meta` | Hosts the JuiceFS metadata PostgreSQL. Singleton: two would mean two metadata engines over one bucket. |
-| `metrics` | Hosts Prometheus, Loki, Alertmanager and the Nomad autoscaler. Singleton. Moving the tag starts an empty Loki. |
 
 Quorum size is derived from the tags, so a placeholder listed as a voter makes Nomad and etcd wait for a machine that does not exist. Add `nomad-server` and `etcd` in the same commit that fills in a node's real addressing. A cluster with fewer than three voters has no HA.
 
@@ -683,7 +682,7 @@ An app is one file in `appsDir`, named after the app. It is a function of `{ inp
 | `odoo` | `package`, `hostname`, `workers`, `maxCronThreads`, `serverWideModules` | Odoo and nginx on a socket, local PostgreSQL, the filestore on JuiceFS, an admin password var. |
 | `frappe` | `package`, `site`, `webThreads`, `settings` | A bench, local MariaDB and Redis, the site directory on JuiceFS, its secrets. |
 | `freeipa` | `hostname`, `domain`, `realm`, `privateIp4`, `image`, `authelia` | The upstream FreeIPA image under podman, a private address reachable only over WARP, optional Authelia as an OIDC provider, nightly upgrades. |
-| `grafana` | `hostname`, `loginName`, `adminGroup`, `editorGroup`, with `oidc.idp` | Grafana on the metrics node, signed in through an identity provider's Authelia, reaching Loki and Prometheus through `network.hostAccess`. |
+| `grafana` | `hostname`, `loginName`, `adminGroup`, `editorGroup`, with `oidc.idp` | Grafana on whichever node Nomad picks, signed in through an identity provider's Authelia, reaching Loki and Prometheus through `network.hostAccess`. |
 | `wpdb` | `address`, `port`, `clientHosts`, `bufferPoolSize` | The one MariaDB every WordPress site shares, with databases and grants per site. Runs on the node whose app subnet holds `address`. |
 | `wordpress` | The `wordpress` section, usually written by a tool as JSON | One file, two containers: `<name>` (read-only public face) and `<name>-admin` (writable admin face), each reaching `wpdb` through `network.peerAccess`. |
 
@@ -740,7 +739,7 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `juicefs-pg/password` | The JuiceFS metadata engine. Manual: every mount and the metadata role change together | Generated |
 | `nomad-acl/token` | Nomad's management token: the ACL bootstrap and `nomad-acl-init`, on the `nomad-leader` node only | Generated |
 | `nomad-jwt/{signing.key,signing.pub}` | Signs each machine's login JWTs; the key never leaves the operator's machine | Generated |
-| `nomad-login/jwt-<role>` | Each machine's scoped Nomad logins (`fence`, `node-meta`, `avc`, plus `registrar` and `autoscaler` where those run), per machine | Generated, signed by `nomad-jwt` |
+| `nomad-login/jwt-<role>` | Each machine's scoped Nomad logins (`fence`, `node-meta`, `avc`, plus `registrar` where jobs are registered), per machine | Generated, signed by `nomad-jwt` |
 | `nomad-gossip/gossip.hcl` | Nomad's serf encryption key, servers only | Generated |
 | `nomad-ca/{ca.key,ca.crt}` | Nomad's CA; the key never leaves the operator's machine | Generated |
 | `nomad-tls/{agent,cli}.{key,crt}` | Each machine's Nomad certificates (per machine) | Generated, signed by `nomad-ca` |
@@ -927,7 +926,15 @@ Without the passphrase, with the wrong one, or with the wrong PEM, the load or t
 
 ### Monitoring and alerting
 
-Every node runs node_exporter, `smartctl_exporter`, a JuiceFS write probe, the boot report and audit, the canary scan and a jumbo-frame probe of every peer, and ships its journal and every container's journal to Loki through Vector over the mesh. The node tagged `metrics` adds Prometheus, Loki, Alertmanager and blackbox probes of every app's public hostname.
+Every node runs node_exporter, `smartctl_exporter`, a JuiceFS write probe, the boot report and audit, the canary scan and a jumbo-frame probe of every peer, and ships its journal and every container's journal through Vector over the mesh. Every node also runs the whole of monitoring: a Prometheus that scrapes every node, a Loki that every node ships to, an Alertmanager, and blackbox probes of every app's public hostname.
+
+No node is the monitoring node, and nothing about monitoring is placed or elected: it does not depend on the scheduler it watches.
+
+- **One alert is one email.** Each Prometheus evaluates the same rules and tells its own Alertmanager; the Alertmanagers gossip on the mesh (port 9094) about what has been sent.
+- **Every node has every log line.** Each node's Vector feeds its own Loki from the journal, and every other node's through a 512 MiB buffer on disk. A node down for longer than its peers' buffers hold has a gap in its own copy when it returns; the other copies are whole.
+- **Grafana asks the node it is on,** wherever Nomad puts it, so a graph may show a gap for the time that node was down which another node's history does not have.
+- **The weekly report is sent once,** by the node whose address sorts first among those its Prometheus sees up.
+- **What it costs:** the stack once per node, in memory and in disk (each Loki has its 50 GB dataset).
 
 ```
 Prometheus (lib/alert-rules.nix) -> Alertmanager -> alert-email-bridge
@@ -938,7 +945,7 @@ Setup, once:
 
 1. Onboard the sender's domain (`alerting.from`) to Cloudflare Email Sending, including SPF and DKIM.
 2. Create an API token with the Email Sending permission only, and run `clan vars set <node> alerting/cf-email-token`.
-3. After the deploy, run `cluster-alert-test` on the metrics node. It fires a real alert through the whole path, which resolves by itself after 5 minutes.
+3. After the deploy, run `cluster-alert-test` on any node. It fires a real alert through the whole path, which resolves by itself after 5 minutes.
 
 A weekly report emails each app's last backup, rehearsal and repository check. It is a positive signal: if it stops arriving, that tells you something.
 
@@ -1022,7 +1029,7 @@ Alerting runs on the cluster, so it can't report the cluster's own death. `worke
 cd workers/cluster-watchdog
 wrangler kv namespace create WATCHDOG          # put the printed id in wrangler.toml
 wrangler r2 bucket create <bucket_name in wrangler.toml>   # the audit trail; add a bucket lock rule
-clan vars get <metrics node> alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
+clan vars get <node> alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
 wrangler secret put CF_EMAIL_TOKEN             # the Email-Sending-only token
 avc audit tokens | wrangler secret put AUDIT_TOKENS
 wrangler deploy
@@ -1042,7 +1049,7 @@ A weekly scan plants the `canary` value in a file on the JuiceFS volume (`/mnt/j
 
 ### Logs
 
-Grafana queries Loki with labels `node`, `app`, `site`, `service` and `level`. The payload flakes supply the application fields. A label contract is pinned at build time: `modules/logging.nix` runs its VRL program over sample entries with `vector vrl`, and a program that stops emitting a label fails the system's build. Loki's store is on the `metrics` node's own encrypted disk, in its own dataset (`rpool/loki`, 50 GB quota): moving the `metrics` tag starts an empty Loki.
+Grafana queries Loki with labels `node`, `app`, `site`, `service` and `level`. The payload flakes supply the application fields. A label contract is pinned at build time: `modules/logging.nix` runs its VRL program over sample entries with `vector vrl`, and a program that stops emitting a label fails the system's build. Each node's Loki has its store on that node's own encrypted disk, in its own dataset (`rpool/loki`, 50 GB quota).
 
 ## Upgrading a running cluster
 
@@ -1054,13 +1061,14 @@ This version is written for fresh installs. A cluster running an earlier version
 - **Scoped tokens.** The leader's `nomad-acl-init` has to run before any other node's logins succeed; until then those retry every 10 seconds, and a non-leader's deploy may report an activation failure once and then recover.
 - **The mesh.** etcd's peer addresses move from the control VLAN to the mesh, and etcd reads its member list only on a new data directory, so an existing member keeps advertising its old addresses: an in-place move needs `etcdctl member update` per member, or a fresh etcd. Not tested. SSH over the VLANs stops.
 - **JuiceFS encryption.** A volume formatted before is plaintext, and every mount and the metadata node now refuse it (exit 3). Moving to an encrypted volume is a migration (a new volume, copy, cut over), not a switch.
-- **Loki's dataset.** A node installed before has no `rpool/loki`, and disko creates datasets only at install. Create it first on the `metrics` node: `zfs create -o mountpoint=legacy -o quota=50G -o com.sun:auto-snapshot=false rpool/loki`. Required mounts are in the boot contract, so the closure waits for approval anyway; create the dataset before approving. The old Loki bucket is no longer used.
+- **Loki's dataset.** A node installed before has no `rpool/loki`, and disko creates datasets only at install. Create it first, on every node: `zfs create -o mountpoint=legacy -o quota=50G -o com.sun:auto-snapshot=false rpool/loki`. Required mounts are in the boot contract, so the closure waits for approval anyway; create the dataset before approving. The old Loki bucket is no longer used.
 - **Hashed backup paths.** Apps with repositories at `apps/<app>` get new, empty ones at the hashed path; the old ones stay untouched. Deploy before the first backup, or `restic copy` each app across.
 - **Every container restarts once.** Each job now runs as `nomad-apps` with a new wrapper, so each allocation is replaced. Containers with `peerAccess` get a new veth, which a reload cannot apply: `nomad job restart app-<name>`. Containers' WAN MACs become fixed (`02:76:77:<node index>:<iid>`); if your provider pins MACs per port or address, check before rollout.
 - **`homeNode` is gone, and local state moves into datasets.** Remove `homeNode` from every app (evaluation refuses it). An app's database is then a plain directory on the node it was pinned to, and the app has to start there once more: that start copies the directory into `<pool>/state/apps/<app>` (as long as the copy takes, inside `startTimeout`) and keeps the original as `/state/clients/.<app>.before-datasets`, to remove by hand. Started on any other node first, it refuses and Nomad tries again elsewhere, so an app may take a few attempts to land. To choose instead of waiting: `nomad node eligibility -disable` the other nodes, `nomad job restart app-<name>`, and enable them again. Each other node then receives a whole copy, which needs the disk. `/state` must be ZFS, as the installer makes it. Not rehearsed on a site with data.
 - **The scheduler algorithm.** New clusters spread apps over nodes. One bootstrapped before keeps Nomad's packing until told, once, on a server: `nomad operator scheduler set-config -scheduler-algorithm=spread`.
 - **The `backup` tag does nothing now.** Each app is backed up by the node running it. Leave the tag or remove it.
 - **The database archive is gone.** `archive.*` on an app, `objectStorage.dbArchiveBucket` and the `<app>-db-archive*` vars no longer exist: remove them, and the archive bucket and its keys at the provider when its last week is no longer wanted. What replaces it is replication between the nodes and, off them, `backup.state`.
+- **The `metrics` tag does nothing now, and the autoscaler is gone.** Every node runs Prometheus, Loki and Alertmanager. The node that had the tag keeps its history; the others start empty and fill from then on, and each needs `rpool/loki` (above). Remove the tag or leave it. The Nomad autoscaler ran on that node and never acted, since no job carries a scaling policy; its `autoscaler` login role went with it, so `clan vars generate` reissues each node's `nomad-login`.
 
 ## Testing
 
@@ -1147,7 +1155,6 @@ Each of these is built with a default and is easy to reverse. They are choices f
 | --- | --- | --- |
 | The initrd emergency shell (D3) | Kept, behind a hashed random password, with a PCR 7 burn before it starts. The only way in if the initrd's network fails. | No shell at all: `emergencyAccess = false` in `modules/boot-security-core.nix` and its assertion in `modules/boot-security.nix`. SSH recovery still works. |
 | The Nomad management token (D6) | Kept on the `nomad-leader` node, read only by `nomad-acl-init`. Deleting it adds little: root on a server can mint one. | Delete it after `nomad-acl-init` and make policy changes through `acl-bootstrap-reset`. |
-| The Nomad autoscaler (D11) | Runs on the `metrics` node with a scoped token, and does nothing until a job has a scaling policy. | Remove the service and the `autoscaler` login role. |
 | Deploy judgement calls (D15) | Three activation attempts per closure; no automatic live rollback; contract changes approved per closure on the node; boot counting off; `RebootPendingTooLong` after 14 days; attended reboots, one node at a time. | `MAX=3` in `lib/cluster-upgrade.nix`; an approved digest in the private repository instead of per-node approval; Lanzaboote's boot counting. |
 | Hashed restic paths (D17) | `apps/<sha256(salt + app)>`, so app names don't reach the backup provider. | Delete the `cluster.backup.repoPathFor` line and the salt assertion in `modules/backup.nix`. |
 | CI merge gate and canary (D22) | Public CI on a self-hosted KVM runner; the site's merges gated on `boot-install` and `boot-fallback` at its own lock; one canary node required on any site of more than one node. Every new boot stack holds the other nodes' deploys until the canary reboots. | `deploy.withoutCanary = "<reason>"`; per closure, `/run/cluster-upgrade.skip-canary`. |

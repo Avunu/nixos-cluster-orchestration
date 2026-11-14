@@ -7,7 +7,7 @@
 #     filesystem at /var/lib/nixos-containers/<app>/var/log/journal;
 #   - any extra journal an app declares (clusterApps.<n>.logging.journalDirs),
 #     e.g. FreeIPA's, which lives in the image's own systemd under podman;
-# and pushes to Loki on the `metrics` node (modules/logging-server.nix) over
+# and pushes to the Loki on every node (modules/logging-server.nix) over
 # the control VLAN.
 #
 # Why read the directories rather than the host journal: nspawn's
@@ -35,12 +35,16 @@
   topology,
   clusterLib,
   node,
+  nodeName,
   ...
 }:
 let
   net = clusterLib.net;
   apps = config.clusterApps;
-  metricsNode = net.soleTaggedNode topology "metrics";
+  # Placeholders (`provisioned = false`) have no Loki to send to.
+  lokiNodes = lib.filterAttrs (_: nd: nd.provisioned or true) topology.nodes;
+  # What is kept for a peer's Loki while it does not answer. Vector's minimum is 256 MiB.
+  remoteBufferBytes = 536870912;
 
   checkVrl = import ../lib/vrl-check.nix { inherit pkgs lib; };
 
@@ -305,36 +309,52 @@ in
         }) appJournals
       );
 
-      sinks = {
-        loki = {
-          type = "loki";
-          inputs = [ "normalize" ];
-          # Over the control mesh: Loki listens on nothing else.
-          endpoint = "http://${net.meshIp topology metricsNode}:${toString net.lokiPort}";
-          labels = {
-            node = "{{ node }}";
-            app = "{{ app }}";
-            site = "{{ site }}";
-            service = "{{ service }}";
-            level = "{{ level }}";
-          };
-          structured_metadata = {
-            unit = "{{ unit }}";
-            syslog_identifier = "{{ syslog_identifier }}";
-            pid = "{{ pid }}";
-            container_host = "{{ container_host }}";
-          };
-          # The line is the message alone: a traceback reads as a traceback.
-          # Everything a developer filters by is a label or metadata above,
-          # and a JSON message (Caddy, nginx) still works with `| json`.
-          encoding.codec = "text";
-          out_of_order_action = "accept";
-          # The journal is the buffer: a journald source only advances its
-          # checkpointed cursor once Loki has accepted the batch, so a Loki or
-          # metrics-node outage delays logs rather than dropping them.
-          acknowledgements.enabled = true;
-        };
-
+      # Every node runs Loki (modules/logging-server.nix), and every node's lines go to
+      # every one of them: whichever node is asked has the whole cluster's logs, and
+      # none of them is the one that must not be lost. This node's own Loki is fed
+      # straight from the journal, which is its buffer: the source only advances its
+      # cursor once the batch is accepted. The others are fed through a buffer on disk,
+      # which accepts at once, so a node that is down delays nothing here; one down
+      # for longer than the buffer holds has a gap in ITS copy, and the others' are whole.
+      sinks =
+        lib.mapAttrs' (
+          name: nd:
+          lib.nameValuePair "loki-${name}" (
+            {
+              type = "loki";
+              inputs = [ "normalize" ];
+              labels = {
+                node = "{{ node }}";
+                app = "{{ app }}";
+                site = "{{ site }}";
+                service = "{{ service }}";
+                level = "{{ level }}";
+              };
+              structured_metadata = {
+                unit = "{{ unit }}";
+                syslog_identifier = "{{ syslog_identifier }}";
+                pid = "{{ pid }}";
+                container_host = "{{ container_host }}";
+              };
+              # The line is the message alone: a traceback reads as a traceback.
+              # Everything a developer filters by is a label or metadata above,
+              # and a JSON message (Caddy, nginx) still works with `| json`.
+              encoding.codec = "text";
+              out_of_order_action = "accept";
+              # Over the control mesh: Loki listens on nothing else.
+              endpoint = "http://${net.meshIp topology nd}:${toString net.lokiPort}";
+              acknowledgements.enabled = true;
+            }
+            // lib.optionalAttrs (name != nodeName) {
+              buffer = {
+                type = "disk";
+                max_size = remoteBufferBytes;
+                when_full = "drop_newest";
+              };
+            }
+          )
+        ) lokiNodes
+        // {
         # Scraped by Prometheus (job `vector`): LogShippingStalled alerts on it.
         metrics = {
           type = "prometheus_exporter";
@@ -366,10 +386,10 @@ in
     map (g: lib.nameValuePair (gidGroup g) { gid = lib.toInt g; }) (lib.filter isGid extraJournalGroups)
   );
 
-  # A node that does not run Loki keeps whatever Loki left in its store: rpool/loki is on
-  # every node (lib/mk-disk-layout.nix), so that the `metrics` tag can move, and Loki's
-  # compactor, which applies the retention, runs only where Loki does. After a move the
-  # old node would keep client-bearing lines past retention for good. So the same
+  # A node that does not run Loki keeps whatever Loki left in its store, and Loki's
+  # compactor, which applies the retention, runs only where Loki does. Every node runs
+  # Loki now, so this acts only where that has been turned off: there the store would
+  # keep client-bearing lines past retention for good. So the same
   # retention is applied here: a file older than it goes. Nothing younger is touched, so a
   # tag that comes back, or is dropped for a moment, loses nothing Loki would have kept.
   assertions = [

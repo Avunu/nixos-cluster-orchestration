@@ -71,7 +71,7 @@
   # ci.url = "https://cluster-ci.example.workers.dev";
 
   # S3-compatible storage for JuiceFS. Credentials: `clan vars`. Loki keeps its logs
-  # on the metrics node's own encrypted disk, not here.
+  # on each node's own encrypted disk, not here.
   objectStorage = {
     endpoint = "https://s3.example.net";
     region = "region-1";
@@ -152,7 +152,6 @@
         "nomad-server"
         "nomad-leader"
         "juicefs-meta"
-        "metrics"
       ];
       hostId = "00000000"; # ZFS: head -c4 /dev/urandom | od -A none -t x4
 

@@ -3,7 +3,7 @@
 # machine modules, as tests/cluster.nix boots them, with the fixture catalogue and
 # four probe apps besides:
 #
-#   gprobe        network.hostAccess = [ Loki, Prometheus ], pinned to node1 (a
+#   gprobe        network.hostAccess = [ Loki, Prometheus ], held to node1 by the test (a
 #                 metrics node). Its identity is nspawn's veth vb-gprobe.
 #   a-long-named-wordpress-site
 #                 27 characters, network.peerAccess to dbprobe on 3306: the shape of a
@@ -226,6 +226,8 @@ let
   ciApps = {
     clusterApps = {
       gprobe = probe "gprobe" [ 8080 ] {
+        # Any node would do, each having Loki and Prometheus; the script looks on node1.
+        nomad.constraints = onNode "node1";
         network.hostAccess = [
           net.lokiPort
           net.prometheusPort
@@ -313,7 +315,7 @@ let
       refused = lib.any (m: lib.hasInfix "network.hostAccess" m) twelve;
       messages = twelve;
     };
-    # Nobody names a node for a hostAccess app: its job is held to the metrics node.
+    # A hostAccess app is held to no node: every node has what it reaches.
     onMetrics = heldTo (evalNode (hostAccessApp "twelve-chars")) "twelve-chars";
     kinds = {
       grafanaHostAccess = c1.clusterApps.demo-grafana.network.hostAccess;
@@ -514,11 +516,11 @@ pkgs.testers.runNixOSTest {
                   f" 12 characters: {EVAL['twelve']['messages']}")
             control("name-too-long-assertion", ev["refused"] and EVAL["twelve"]["messages"] == [],
                     f"16 characters: {ev['messages']}; 12 characters: {EVAL['twelve']['messages']}")
-            control("hostaccess-held-to-metrics", EVAL["onMetrics"] == ["node1"], f"{EVAL['onMetrics']}")
+            control("hostaccess-held-to-no-node", EVAL["onMetrics"] == [], f"{EVAL['onMetrics']}")
             k = EVAL["kinds"]
             print(f"real kinds: {k}")
             control("real-kinds-declare-their-flows",
-                    k["grafanaHostAccess"] == [LOKI, PROM] and k["grafanaHome"] == ["node1"]
+                    k["grafanaHostAccess"] == [LOKI, PROM] and k["grafanaHome"] == []
                     and sorted(k["grafanaUrls"]) == sorted(k["meshUrls"])
                     and k["sitePeers"] == [[{"app": "demo-wpdb", "port": k["wpdbPort"]}]] * 2
                     and k["siteBridge"] is None and k["wantVeth"] in k["siteVeth"],

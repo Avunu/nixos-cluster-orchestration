@@ -90,7 +90,8 @@ rec {
     concatStringsSep "." (octets ++ [ (toString node.index) ]);
 
   # The TCP ports a node serves on the mesh, by role. Appendix E of the design:
-  # every node its exporters, its log shipper and its app state; `metrics` Loki and Prometheus;
+  # every node its exporters, its log shipper, its app state, and its Loki, Prometheus
+  # and Alertmanager gossip (each node runs the whole of monitoring);
   # `etcd` etcd; `juicefs-meta` the metadata engine. The host firewall accepts
   # exactly these on the mesh interface, and nothing of them anywhere else.
   meshPortsFor =
@@ -100,10 +101,9 @@ rec {
       smartctlExporterPort
       vectorMetricsPort
       statePort
-    ]
-    ++ lib.optionals (hasTag "metrics" node) [
       lokiPort
       prometheusPort
+      alertmanagerClusterPort
     ]
     ++ lib.optionals (hasTag "etcd" node) [
       etcdClientPort
@@ -198,10 +198,13 @@ rec {
   nodeExporterPort = 9100;
   smartctlExporterPort = 9633;
   prometheusPort = 9090;
-  # Loki on the metrics node (modules/logging-server.nix), pushed to by every
+  # Loki on every node (modules/logging-server.nix), pushed to by every
   # node's Vector (modules/logging.nix), which exposes its own health here.
   lokiPort = 3100;
   vectorMetricsPort = 9598;
+  # Alertmanager's gossip between the nodes' instances (modules/alerting.nix), TCP and
+  # UDP: what makes N of them send one email.
+  alertmanagerClusterPort = 9094;
 
   # ── Galera (per-client MariaDB) ─────────────────────────────────────────────
   # gcomm connection string from a list of member IPs.

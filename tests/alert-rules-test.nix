@@ -673,7 +673,7 @@ let
     (case "LogShippingFailing"
       [
         [
-          ''vector_component_errors_total{component_id="loki",instance="n"}''
+          ''vector_component_errors_total{component_id="loki-m",instance="n"}''
           "0+5x40"
         ]
       ]
@@ -687,7 +687,7 @@ let
     )
     (case "LogShippingFailing" [
       [
-        ''vector_component_errors_total{component_id="loki",instance="n"}''
+        ''vector_component_errors_total{component_id="loki-m",instance="n"}''
         "0+5x5 25x40"
       ]
     ] "35m" none)

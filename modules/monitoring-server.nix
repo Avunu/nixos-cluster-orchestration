@@ -1,18 +1,17 @@
-# modules/monitoring-server.nix — Prometheus + Nomad Autoscaler (singleton).
+# modules/monitoring-server.nix — Prometheus, on every node.
 #
-# Assigned to the ONE node tagged `metrics` via inventory.instances in flake.nix.
-#   - Prometheus scrapes every node-exporter + Nomad's own /v1/metrics, with the
-#     relabel container@(.*)\.service -> nspawn_container (README step 2).
-#   - Nomad Autoscaler (no NixOS module upstream) as a systemd unit, plugins via
-#     withPlugins; APM = Prometheus, target = Nomad (step 3).
+# No node is the monitoring node. Each runs a Prometheus that scrapes every node's
+# exporters and Nomad's own /v1/metrics (with the relabel container@(.*)\.service ->
+# nspawn_container), evaluates the same rules, and holds its own history; and with
+# it, imported below, an Alertmanager (modules/alerting.nix) and a Loki
+# (modules/logging-server.nix) that every node's log shipper feeds. So monitoring
+# survives any node, and does not depend on the scheduler it watches: nothing here is
+# placed, elected or moved.
 #
-# Alerting (Alertmanager, rules, probes, email) is modules/alerting.nix, and
-# the log store (Loki) is modules/logging-server.nix, both imported below:
-# they need Prometheus/Alertmanager beside them, so they follow this role.
-#
-# Autoscaler note: this is a singleton today because two agents would both act
-# on the same scaling policies. Running it on a second node needs leader
-# election, which is why the tag is deliberately not on node2/node3 yet.
+# What that costs: the stack N times over, in memory and in disk, and N histories that
+# are the same except where a node was down and has a gap of its own. An alert is one
+# email all the same (the Alertmanagers gossip), and Grafana, wherever Nomad puts it,
+# asks the node it is on (modules/kinds/grafana.nix).
 {
   config,
   lib,
@@ -48,49 +47,6 @@ let
   ];
   credPath = unit: id: "/run/credentials/${unit}.service/${id}";
 
-  autoscalerEnv = pkgs.nomad-autoscaler.withPlugins (ps: [
-    ps.prometheus
-    ps.nomad_apm
-    ps.nomad_target
-    ps.target_value
-    ps.threshold
-  ]);
-
-  autoscalerConfig = pkgs.writeText "nomad-autoscaler.hcl" ''
-    plugin_dir = "${autoscalerEnv}/share"
-
-    nomad {
-      address     = "${net.nomadAddr node}"
-      ca_cert     = "${credPath "nomad-autoscaler" "nomad-ca.crt"}"
-      client_cert = "${credPath "nomad-autoscaler" "nomad-cli.crt"}"
-      client_key  = "${credPath "nomad-autoscaler" "nomad-cli.key"}"
-      # Its token is scoped to this namespace (modules/nomad-acl.nix).
-      namespace   = "${clusterLib.nomad.appsNamespace}"
-    }
-
-    apm "prometheus" {
-      driver = "prometheus"
-      config = {
-        address = "http://${meshIp}:${toString net.prometheusPort}"
-      }
-    }
-
-    apm "nomad-apm" {
-      driver = "nomad-apm"
-    }
-
-    target "nomad-target" {
-      driver = "nomad-target"
-    }
-
-    strategy "target-value" {
-      driver = "target-value"
-    }
-
-    strategy "threshold" {
-      driver = "threshold"
-    }
-  '';
 in
 {
   imports = [
@@ -162,40 +118,4 @@ in
 
   # Nomad's telemetry (what the `nomad` job above scrapes) is on every node:
   # modules/cluster-common.nix.
-
-  systemd.services.nomad-autoscaler = {
-    description = "Nomad Autoscaler (Prometheus APM -> Nomad target)";
-    after = [
-      "nomad.service"
-      "prometheus.service"
-      "nomad-login@autoscaler.service"
-    ];
-    wants = [ "nomad-login@autoscaler.service" ];
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      # The token goes in via the environment, NOT into autoscalerConfig: that
-      # HCL is a Nix store path, and the store is world-readable.
-      #
-      # Without it the agent starts happily and then 403s on every scaling
-      # decision once ACLs are bootstrapped — it looks alive and does nothing.
-      #
-      # It is the `autoscaler` role's token (scale and list in `apps`, read on
-      # node, operator and agent), read once at start: nomad-login@autoscaler
-      # restarts this unit each time it refreshes the token (modules/nomad-acl.nix).
-      # Until that login has succeeded the credential is missing and the start
-      # fails; Restart= tries again.
-      LoadCredential = [
-        "nomad-token:${clusterLib.nomadPki.tokenDir}/autoscaler"
-      ]
-      ++ nomadCreds;
-      ExecStart = pkgs.writeShellScript "nomad-autoscaler-start" ''
-        set -euo pipefail
-        NOMAD_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/nomad-token"); export NOMAD_TOKEN
-        exec ${autoscalerEnv}/bin/nomad-autoscaler agent -config ${autoscalerConfig}
-      '';
-      Restart = "on-failure";
-      RestartSec = 10;
-      DynamicUser = true;
-    };
-  };
 }

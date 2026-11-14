@@ -78,6 +78,8 @@
         storageEtcd = ./modules/storage-etcd.nix;
         storageJuicefs = ./modules/storage-juicefs.nix;
         monitoring = ./modules/monitoring.nix;
+        # Prometheus, Alertmanager and Loki, on every node (it imports the other two).
+        monitoringServer = ./modules/monitoring-server.nix;
         logging = ./modules/logging.nix;
         vars = ./modules/vars.nix;
         pullDeploy = ./modules/pull-deploy.nix;
@@ -167,7 +169,7 @@
               }
               // args
             );
-          # Nomad + nomad-autoscaler are BSL-licensed (unfree); allow them.
+          # Nomad is BSL-licensed (unfree); allow it.
           pkgs = import nixpkgs {
             inherit system;
             config.allowUnfree = true;
@@ -332,7 +334,6 @@
               # Replaces colmena (deploy) and the old per-file secret scripts.
               clan-cli
               pkgs.nomad
-              pkgs.nomad-autoscaler
               pkgs.juicefs
               pkgs.jq
               pkgs.hcl2json

@@ -246,7 +246,7 @@ in
         };
         # Loki's chunks, index and WAL (modules/logging-server.nix): plaintext log
         # lines, client data among them, so on the encrypted pool and nowhere else.
-        # On every node, so the `metrics` tag can move without a disk change. The
+        # On every node: each runs a Loki (modules/logging-server.nix). The
         # quota keeps a flood of logs from filling the pool under everything else;
         # Loki's retention, not the quota, is what bounds it normally. No automatic
         # snapshots: one would keep lines past retention.

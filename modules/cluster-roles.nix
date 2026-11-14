@@ -29,7 +29,7 @@
 
   manifest = {
     name = "cluster-roles";
-    description = "Singleton cluster roles (metadata engine, job registrar, metrics).";
+    description = "Singleton cluster roles (metadata engine, job registrar).";
     categories = [ "System" ];
     readme = builtins.readFile ./cluster-roles.README.md;
 
@@ -38,12 +38,9 @@
     #                  filesystem, i.e. silent data loss.
     #   nomad-leader — job submission is idempotent, so N registrars are merely
     #                  pointless churn against the raft leader on every deploy.
-    #   metrics      — two autoscaler agents would both act on the same scaling
-    #                  policies; a second needs leader election first.
     constraints.roles = {
       juicefs-meta.maxMachines = 1;
       nomad-leader.maxMachines = 1;
-      metrics.maxMachines = 1;
     };
   };
 
@@ -55,10 +52,5 @@
   roles.nomad-leader = {
     description = "Registers rendered Nomad jobspecs after raft leadership.";
     perInstance = { ... }: { nixosModule = ./nomad-bootstrap-leader.nix; };
-  };
-
-  roles.metrics = {
-    description = "Runs Prometheus and the Nomad autoscaler.";
-    perInstance = { ... }: { nixosModule = ./monitoring-server.nix; };
   };
 }

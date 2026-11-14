@@ -4,14 +4,14 @@ Assigns this cluster's **singleton** roles to machines by tag.
 
 Every node in this cluster runs the same base modules — the Nomad agent (a client
 on `worker` nodes, a server on `nomad-server` ones), the JuiceFS client, the node
-exporter, the container fencer. A handful of services
+exporter, the container fencer, and the whole of monitoring (Prometheus, Loki,
+Alertmanager). A handful of services
 must run on exactly one node, and this service is how that is expressed.
 
 | Role | What it adds | Why exactly one |
 |---|---|---|
 | `juicefs-meta` | PostgreSQL metadata engine + volume format | Two engines over one S3 bucket is a split-brain filesystem — silent data loss |
 | `nomad-leader` | Registers rendered jobspecs after raft leadership | Job submission is idempotent, so N registrars are just churn against the leader on every deploy |
-| `metrics` | Prometheus, Loki, Alertmanager + Nomad autoscaler | Two autoscaler agents would both act on the same scaling policies; a second needs leader election first |
 
 ## Usage
 
@@ -23,7 +23,6 @@ inventory.instances.cluster-roles = {
   module = { name = "cluster-roles"; input = "self"; };
   roles.juicefs-meta.tags = [ "juicefs-meta" ];
   roles.nomad-leader.tags = [ "nomad-leader" ];
-  roles.metrics.tags = [ "metrics" ];
 };
 ```
 
