@@ -80,9 +80,50 @@ in
       files.provision-token.deploy = false;
     };
 
+    # ── what `avc cloud` holds (lib/cloud.nix) ───────────────────────────────
+    # The OVH API's three values, for an application of the operator's own
+    # (https://<endpoint>/createToken): what makes buckets, users and their S3 keys in
+    # the Public Cloud project. Operator secrets like the token above: on no node.
+    # Cloudflare's side of `avc cloud` uses that token, `cloudflare/provision-token`.
+    cloud-ovh = lib.mkIf ((topology.cloud.ovh or null) != null) {
+      share = true;
+      prompts.application-key = {
+        description = "OVH API application key (avc cloud)";
+        persist = true;
+      };
+      prompts.application-secret = {
+        description = "OVH API application secret";
+        type = "hidden";
+        persist = true;
+      };
+      prompts.consumer-key = {
+        description = "OVH API consumer key, with GET, POST, PUT and DELETE on /cloud/project/<project>/*";
+        type = "hidden";
+        persist = true;
+      };
+      files.application-key.deploy = false;
+      files.application-secret.deploy = false;
+      files.consumer-key.deploy = false;
+    };
+    # What OpenTofu's state (cloud/terraform.tfstate in the site's repository) is
+    # encrypted with: it holds every key pair and tunnel secret the providers issued.
+    # Bound to that file: a new passphrase reads none of it.
+    cloud-state = lib.mkIf ((topology.cloud or { }) != { }) {
+      share = true;
+      files.passphrase.deploy = false;
+      runtimeInputs = [
+        pkgs.coreutils
+        pkgs.openssl
+      ];
+      script = ''
+        openssl rand -hex 32 | tr -d '\n' > "$out/passphrase"
+      '';
+    };
+
     # ── S3 object storage ─────────────────────────────────────────────────
     # Issued by the provider, so it cannot be generated — prompted once and stored.
-    # Consumed by JuiceFS (both halves) and by the backup provider.
+    # Consumed by JuiceFS (both halves). `avc cloud apply` writes it where the
+    # topology has `cloud.ovh`.
     ovh-s3 = {
       share = true;
       prompts."access-key" = {

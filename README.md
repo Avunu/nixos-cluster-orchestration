@@ -234,6 +234,7 @@ Kept outside any repository, off the cluster, and away from the laptop that hold
 - the offline age identity, whose public key is in `recipients`;
 - a dated `git bundle` of the private repository (`git bundle create site-<date>.bundle --all`);
 - direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB);
+- `cloud-state/passphrase`, with `cloud`: without it OpenTofu's state is unreadable, and what it made has to be imported again by hand;
 - `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}` and `backup-state-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target`, `backup.state.target` and `backup.repoSalt`.
 
 With the bundle and the offline identity, `clan vars get` gives back every other secret: `git clone site-<date>.bundle site`, then in it `AGE_KEYFILE=<offline identity> clan vars get <node> luks/passphrase`. To let a new operator in, add their public key to `recipients`, commit, and run `clan vars fix <machine>` for each machine with the offline identity; a key not yet in `recipients` reads nothing. With the JuiceFS key, the S3 pair and the bucket alone, the volume's metadata can be rebuilt anywhere (see [Restore without a node](#restore-without-a-node)).
@@ -603,6 +604,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
 | `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
+| `cloud` | Optional: what `avc cloud` makes at the providers ([Providers](#providers)). `cloud.ovh` is `{ endpoint; project; region; noncurrentDays; }`: the API endpoint (`ovh-us`, `ovh-eu`, `ovh-ca`), the Public Cloud project's id, the region its buckets are made in, and how long a hidden object version is kept (30). `cloud.cloudflare` is `{ accountId; zones; auditBucket; auditLockDays; }`: `zones` maps a zone's name to its id (`zones."example.com" = "<zone id>"`), and only hostnames in one of them get a DNS record; `auditBucket` is the audit trail's R2 bucket, locked for `auditLockDays` (365). Leave a provider out and nothing of its is touched. |
 | `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: each node's store is its own encrypted disk (`/var/lib/loki`). |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
@@ -753,7 +755,9 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `backup-state-target/{access-key,secret-key}` | The state backup's target, only with `backup.state` | Prompt |
 | `alerting/cf-email-token` | Alert emails | Prompt, a Cloudflare token with Email Sending only |
 | `alerting-watchdog/token` | The dead-man heartbeat | Generated |
-| `cloudflare/provision-token` | The operator's own Cloudflare token for site provisioning; never deployed to a node | Prompt |
+| `cloudflare/provision-token` | The operator's own Cloudflare token, for site provisioning and for `avc cloud`; never deployed to a node | Prompt |
+| `cloud-ovh/{application-key,application-secret,consumer-key}` | The operator's OVH API application, for `avc cloud`, only with `cloud.ovh`; never deployed to a node | Prompt |
+| `cloud-state/passphrase` | What `cloud/terraform.tfstate` is encrypted with, only with `cloud`; never deployed to a node. Never regenerate it: a new one reads none of the state | Generated |
 | `<app>-cf/cloudflared` | Each app's tunnel | Prompt, from `cloudflared tunnel create` |
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
@@ -868,6 +872,40 @@ Setting it up, once per site:
 The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previews` by `state`. No alert rule reads them yet.
 
 **What is proven.** `checks.cluster-ci` runs the Worker's decisions (which webhook makes, moves, resets or removes a preview, what a node's report does to the pull request, which push deploys and which updates a lock) with GitHub and Cloudflare stood in for. `checks.ci-agent` runs the agent as a process against a stand-in Worker and stand-in `nix`, `zfs`, `juicefs` and `systemd`, and holds it to what it asks of them and in which order. A slot's container and its host evaluate on the fixture cluster. Nothing here has met GitHub, Cloudflare or a node: no slot has been started, no clone taken, no copy migrated. The first preview on a real site is that test.
+
+### Providers
+
+What the site needs from OVH and Cloudflare is made by [OpenTofu](https://opentofu.org), from a configuration nobody writes: `lib/cloud.nix` derives it from the topology and the apps, as the flake's `cloud` output. `avc cloud` runs it on your machine. No node holds a provider's API credentials or runs OpenTofu.
+
+```sh
+avc cloud plan                 # what would change; nothing done
+avc cloud apply                # done, written back, and shipped as a pull request
+avc cloud apply --destroy <address>[,<address>]
+avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and credentials
+```
+
+| Provider | What is made | From |
+| --- | --- | --- |
+| OVH | A bucket, a user of its own, that user's S3 key pair, and a policy that reaches that bucket and no other | `objectStorage.juicefsBucket`; `backup.state.target.bucket` when it is on the same endpoint |
+| OVH | Versioning on the state backup's bucket, and hidden versions expired after `noncurrentDays` | the same |
+| Cloudflare | A tunnel per app, locally configured | every app with a hostname |
+| Cloudflare | A proxied CNAME per hostname, to the app's tunnel | hostnames in a zone of `cloud.cloudflare.zones` |
+| Cloudflare | The private route to a FreeIPA server's address | `freeipa.privateIp4` |
+| Cloudflare | The audit trail's R2 bucket, with a lock rule | `cloud.cloudflare.auditBucket` |
+
+No user may delete an object version, so on the versioned bucket a node that is taken over can hide backups and not destroy them.
+
+**What comes back goes where the site reads it.** An S3 key pair into its var (`ovh-s3`, `backup-state-target`), written only when it differs. A new tunnel's id into `apps/<app>.json`, which merges with the app's `.nix`, and its credentials file into the app's `<app>-cf/cloudflared`. So a new app with a hostname needs no `cloudflared tunnel create` and no `tunnel.id`: `avc cloud apply` makes the tunnel and writes both. The apply ends in the same pull request every change does.
+
+**A tunnel made by hand is adopted.** An app that already has a `tunnel.id` gets an import of it, and its secret and its name stay as they are. A DNS record made by hand is not known to the topology by any id: delete it first, or `avc cloud tofu "import cloudflare_dns_record.<name> <zone id>/<record id>"`. A bucket made by hand likewise (`import ovh_cloud_project_storage.juicefs <project>/<region>/<name>`); its old user and key are then yours to remove once the new pair is deployed.
+
+**Nothing is destroyed by accident.** Buckets and tunnels carry `prevent_destroy`, so a plan that would delete one fails in OpenTofu. Anything else a plan would delete or replace, `avc cloud apply` refuses until each address is named with `--destroy`. A replaced key pair is one a node is using: name it, apply, and let the ship reach the nodes.
+
+**The state** is `cloud/terraform.tfstate` in your repository, committed with each apply. It holds every key the providers issued, so OpenTofu encrypts it (and every saved plan) with `cloud-state/passphrase`, enforced: without the passphrase it refuses to read the state, and it never writes one in the clear. Put the passphrase in the [offline kit](#the-offline-kit). Two operators applying at once would each commit a state; the pull request of the second conflicts, which is the lock.
+
+To turn it on: `cloud` in the topology; `clan vars generate` for `cloud-state`, and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
+
+Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket (the site provisioner's), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
 
 ### Backups and restore
 
@@ -1125,6 +1163,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `alerting` | An alert travels Prometheus, Alertmanager and the bridge to a stub of the Cloudflare API, in a VM. |
 | `cluster-watchdog` | The dead-man's logic, and the audit Worker's schemas, tokens and emails. |
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |
+| `cloud` | The fixture's OpenTofu configuration validated against the OVH and Cloudflare providers' own schemas, with the OpenTofu `avc` runs: a bucket, user, key pair and one-bucket policy per bucket, none able to delete a version; a tunnel per app, adopted where the app names one; proxied CNAMEs, FreeIPA's private route, the locked audit bucket; and where each output is written back. No provider is contacted. |
 | `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM. |
 | `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
@@ -1181,6 +1220,7 @@ These are accepted deliberately.
 9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation.
 10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
 11. **State replication has run in VMs only.** `checks.app-state` proves the moves, the failover and the orphan with real ZFS on three VMs, with a stand-in for the container; no check yet has Nomad itself move a stateful app, and nothing has timed a large database's first replica or a failover on real disks. `wpdb` cannot move at all, and FreeIPA's move is the generic one, untried with a real FreeIPA.
+12. **`avc cloud` has met no provider.** Its configuration is validated against the providers' published schemas and its state encryption against OpenTofu itself, but no plan has been made against a real OVH or Cloudflare account. Unverified there: that OVH's policy language keeps `s3:DeleteObjectVersion` from a user that has `s3:DeleteObject`, the import ids, and the `ovh-us` endpoint's coverage of each resource. Read the first plan before applying it.
 
 ## License
 

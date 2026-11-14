@@ -137,6 +137,15 @@
           inherit (clan.config) nixosConfigurations;
         };
 
+      # What the site needs from its providers, as an OpenTofu configuration
+      # (lib/cloud.nix), and where each thing they hand back goes. `avc cloud` runs it.
+      mkCloud =
+        { clan, topology }:
+        import ./lib/cloud.nix {
+          inherit lib topology clusterLib;
+          inherit (clan.config) nixosConfigurations;
+        };
+
       # The fixture cluster (tests/fixtures): what this flake's checks and its
       # nixosConfigurations are built from. A function of the topology so
       # tests/cluster.nix can build the SAME clan over a test topology. Nothing
@@ -473,6 +482,58 @@
               inherit pkgs;
               lib = nixpkgs.lib;
             }
+          );
+
+          # The fixture's OpenTofu configuration (lib/cloud.nix) against the providers' own
+          # schemas, with the OpenTofu and the providers avc runs: every resource type and
+          # argument exists, and it says what the fixture's topology and apps call for.
+          checks.cloud = detach (
+            _:
+            let
+              cloud = mkCloud {
+                clan = fixtureCluster;
+                topology = fixtureTopology;
+              };
+              tofu = pkgs.opentofu.withPlugins (ps: [
+                ps.ovh_ovh
+                ps.cloudflare_cloudflare
+                ps.hashicorp_random
+              ]);
+            in
+            pkgs.runCommand "cloud-config-check"
+              {
+                nativeBuildInputs = [
+                  tofu
+                  pkgs.jq
+                ];
+                config = builtins.toJSON cloud.config;
+                writeback = builtins.toJSON cloud.writeback;
+                passAsFile = [
+                  "config"
+                  "writeback"
+                ];
+              }
+              ''
+                mkdir work && cd work
+                cp "$configPath" main.tf.json
+                export HOME=$PWD TF_IN_AUTOMATION=1
+                tofu init -input=false -backend=false >/dev/null
+                tofu validate -no-color
+                want() { jq -e "$1" main.tf.json >/dev/null || { echo "missing: $2" >&2; exit 1; }; }
+                want '.resource.ovh_cloud_project_storage.juicefs.name == "${fixtureTopology.objectStorage.juicefsBucket}"' "the JuiceFS bucket"
+                want '.resource.ovh_cloud_project_storage.juicefs.lifecycle.prevent_destroy' "a bucket that cannot be destroyed by a plan"
+                want '.resource.ovh_cloud_project_storage.state_backup.versioning.status == "enabled"' "a versioned state backup bucket"
+                want '.resource.ovh_cloud_project_user_s3_policy.state_backup.policy | fromjson | .Statement[0].Action | index("s3:DeleteObjectVersion") | not' "a user that cannot delete a version"
+                want '.resource.ovh_cloud_project_user_s3_policy.juicefs.policy | fromjson | .Statement[0].Resource | all(test("fixture-juicefs|${fixtureTopology.objectStorage.juicefsBucket}"))' "a policy for its own bucket only"
+                want '.resource.cloudflare_zero_trust_tunnel_cloudflared."demo_odoo".config_src == "local"' "a locally configured tunnel per app"
+                want '[.import[].to] | index("cloudflare_zero_trust_tunnel_cloudflared.demo_odoo")' "an import of the tunnel the app already names"
+                want '.resource.cloudflare_dns_record | to_entries | all(.value.type == "CNAME" and .value.proxied)' "proxied CNAMEs"
+                want '.resource.cloudflare_zero_trust_tunnel_cloudflared_route."demo_idm".network | endswith("/32")' "FreeIPA's private route"
+                want '.resource.cloudflare_r2_bucket_lock.audit.rules[0].condition.max_age_seconds == 31536000' "the audit bucket's lock"
+                jq -e '.vars."s3_juicefs_secret_key" == "ovh-s3/secret-key" and .vars."s3_state_backup_access_key" == "backup-state-target/access-key" and (.tunnels."demo-odoo".known)' "$writebackPath" >/dev/null \
+                  || { echo "the write-back map is wrong: $(cat "$writebackPath")" >&2; exit 1; }
+                touch $out
+              ''
           );
 
           # An app's local state following it between three nodes with real ZFS: a
@@ -1841,7 +1902,7 @@
       flake = {
         # The consumer interface (mkCluster, mkOpsIndex) and the pure helpers.
         lib = clusterLib // {
-          inherit mkCluster mkOpsIndex;
+          inherit mkCluster mkOpsIndex mkCloud;
         };
         inherit nixosModules;
 
@@ -1860,6 +1921,10 @@
         inherit (fixtureCluster.config) nixosConfigurations clanInternals;
 
         opsIndex = mkOpsIndex {
+          clan = fixtureCluster;
+          topology = fixtureTopology;
+        };
+        cloud = mkCloud {
           clan = fixtureCluster;
           topology = fixtureTopology;
         };

@@ -117,6 +117,29 @@
     };
   };
 
+  # What `avc cloud` provisions at the providers, from the rest of this file and the
+  # apps (the library's lib/cloud.nix). Leave a provider out and nothing of its is
+  # touched. The credentials are vars no node holds: `cloud-ovh`, `cloud-cloudflare`.
+  cloud = {
+    ovh = {
+      # The API's name for where the account is: ovh-us, ovh-eu or ovh-ca.
+      endpoint = "ovh-us";
+      # The Public Cloud project's id, and the region its buckets are made in.
+      project = "00000000000000000000000000000000";
+      region = "US-EAST-VA";
+      # How long a deleted or overwritten object stays recoverable in a versioned bucket.
+      noncurrentDays = 30;
+    };
+    cloudflare = {
+      accountId = "00000000000000000000000000000000";
+      # Zones whose records are made here, by zone id. A hostname in none of them is left alone.
+      zones."example.com" = "00000000000000000000000000000000";
+      # The audit trail's R2 bucket (workers/cluster-watchdog), locked for this long.
+      auditBucket = "fixture-audit";
+      auditLockDays = 365;
+    };
+  };
+
   nodes = {
     node1 = {
       index = 1;

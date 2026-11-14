@@ -53,6 +53,9 @@
 
       # What `avc` reads.
       opsIndex = cluster.lib.mkOpsIndex { inherit clan topology; };
+      # What `avc cloud` hands to OpenTofu: the buckets, tunnels and DNS records the
+      # topology and the apps call for (topology.nix, `cloud`).
+      cloud = cluster.lib.mkCloud { inherit clan topology; };
 
       # avc, clan, nomad and friends: `nix develop`, `nix run .#avc`.
       inherit (cluster) packages devShells;
