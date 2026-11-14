@@ -363,6 +363,86 @@ let
           default = { };
           description = "How modules/backup.nix backs this app up. Detected; override when detection is wrong.";
         };
+        preview = {
+          slots = mkOption {
+            type = types.ints.unsigned;
+            default = 0;
+            example = 2;
+            description = ''
+              How many branches of this app's project can have a preview at once
+              (modules/ci-agent.nix). Each slot is a container of its own,
+              `<name>-pv<k>`, declared like any other and dormant until a pull
+              request takes it: the same kind, mounts, limits and firewall, on a copy
+              of this app's database and files. 0 = no previews.
+            '';
+          };
+          input = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "my-odoo-project";
+            description = "The site flake's input this app's package comes from: what a preview builds at the pull request's commit.";
+          };
+          repo = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "OWNER/my-odoo-project";
+            description = "That input's GitHub repository, whose pull requests get previews.";
+          };
+          inputUrl = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "git+https://github.com/OWNER/my-odoo-project.git?ref={ref}&rev={rev}&submodules=1";
+            description = ''
+              The flake reference a preview overrides `input` with, where `{rev}` is the
+              commit and `{ref}` the branch. null = `github:<repo>/{rev}`. Set it when
+              the input is not a plain `github:` one (submodules, say), in the same
+              form as in flake.nix.
+            '';
+          };
+          healthPath = mkOption {
+            type = types.str;
+            default = "/";
+            description = "What is asked of a preview through its hostname before it is called live. Anything but a 5xx passes.";
+          };
+          of = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            internal = true;
+            description = "On a slot: the app it previews. Set by modules/apps.nix, never by hand.";
+          };
+          origin = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            internal = true;
+            description = "Where the app answers inside its container, as a cloudflared service. Set by the kind; a kind that sets none cannot be previewed.";
+          };
+          socketGroups = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            internal = true;
+            description = "Groups a slot's connector needs to reach `origin`. Set by the kind.";
+          };
+          # What a kind names its data by. A slot's is the app's own name, because the
+          # copy holds the app's database, under its own directory on its own volume.
+          base = mkOption {
+            type = types.str;
+            readOnly = true;
+            internal = true;
+            default = if config.preview.of != null then config.preview.of else name;
+          };
+          stateRoot = mkOption {
+            type = types.str;
+            readOnly = true;
+            internal = true;
+            default = if config.preview.of != null then "/state-preview/${name}" else "/state";
+          };
+          jfsRoot = mkOption {
+            type = types.str;
+            readOnly = true;
+            internal = true;
+            default = if config.preview.of != null then "previews/${name}" else "clients/${name}";
+          };
+        };
         network = mkOption {
           type = import ../lib/app-network-type.nix { inherit lib; };
           default = { };
@@ -389,6 +469,17 @@ in
     type = types.attrsOf appType;
     default = { };
     description = "Per-client application stacks; each generates a dormant container + Nomad job.";
+  };
+
+  # The apps Nomad runs: every one but the preview slots, which the pipeline's agent
+  # starts and stops (modules/ci-agent.nix). A slot is a job nowhere, so whatever
+  # registers jobs, fences containers without an allocation, backs up or probes reads
+  # this and not clusterApps.
+  options.cluster.nomadApps = mkOption {
+    type = types.attrsOf types.raw;
+    readOnly = true;
+    internal = true;
+    default = lib.filterAttrs (_: a: a.preview.of == null) config.clusterApps;
   };
 
   # Keep `config`'s TOP-LEVEL keys static (containers / systemd / system) so the
@@ -472,7 +563,7 @@ in
             if (action.id == "org.freedesktop.systemd1.manage-units"
                 && subject.user == ${builtins.toJSON clusterLib.nomad.appsUser}) {
               var units = ${
-                builtins.toJSON (map (n: "container@${n}.service") (lib.attrNames config.clusterApps))
+                builtins.toJSON (map (n: "container@${n}.service") (lib.attrNames config.cluster.nomadApps))
               };
               var unit = action.lookup("unit");
               var verb = action.lookup("verb");

@@ -47,7 +47,7 @@ let
   tls = pki.cliTlsFor config.clan.core.vars.generators;
 
   # Managed container names (the only units the fencer may touch).
-  managedApps = builtins.attrNames config.clusterApps;
+  managedApps = builtins.attrNames config.cluster.nomadApps;
 
   textDir = "/var/lib/prometheus-node-exporter-text";
   metric = "${textDir}/nomad_fence.prom";

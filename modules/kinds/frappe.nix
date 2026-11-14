@@ -81,7 +81,8 @@ let
     };
   };
 
-  apps = lib.filterAttrs (_: a: a.frappe != null) config.clusterApps;
+  # Not the preview slots: a slot reads the secrets of the app it copies.
+  apps = lib.filterAttrs (_: a: a.frappe != null && a.preview.of == null) config.clusterApps;
 
   # cloud-storage is prompted, not generated: the S3 credentials are issued by
   # the provider. Its value is a JSON object deep-merged into site_config.json,
@@ -109,6 +110,9 @@ in
         let
           f = config.frappe;
           nginxSocket = "/run/frappe-${name}/nginx.sock";
+          # On a preview slot these name the app it copies (modules/app-container.nix).
+          pv = config.preview;
+          isPreview = pv.of != null;
         in
         {
           options.frappe = mkOption {
@@ -140,8 +144,21 @@ in
                   encryptionKeyFile = "/run/secrets/encryption-key";
                   # Merged into site_config.json at activation: the
                   # cloud_storage_settings block (see frappeCloudStorage below).
-                  settingsFiles = [ "/run/secrets/cloud-storage" ];
-                  inherit (f) settings renamedApps replacedApps;
+                  # Not on a preview slot: the bucket is production's, and a
+                  # preview that could write to it could change what production
+                  # serves. Its attachments are then missing, and its uploads local.
+                  settingsFiles = lib.optional (!isPreview) "/run/secrets/cloud-storage";
+                  inherit (f) renamedApps replacedApps;
+                  # A slot's database is production's, a moment ago, with its mail
+                  # queue and its scheduled jobs. Both stay off, and the site answers
+                  # under whatever hostname the preview was given.
+                  settings =
+                    f.settings
+                    // lib.optionalAttrs isPreview {
+                      mute_emails = 1;
+                      pause_scheduler = 1;
+                      host_name = null;
+                    };
                   # nginx serves the public side over a unix socket and reaches
                   # gunicorn over a second one: no TCP in the request path. Its
                   # loopback :80 listener stays for SocketIO's session callback.
@@ -156,24 +173,30 @@ in
             };
 
             # The whole site directory -- shared, follows the app.
-            juicefsPaths."/var/lib/frappe/${f.site}" = "clients/${name}/frappe";
+            juicefsPaths."/var/lib/frappe/${f.site}" = "${pv.jfsRoot}/frappe";
             # MariaDB data -- local disk on the home node, never JuiceFS.
-            localState."/var/lib/mysql" = "/state/clients/${name}/mysql";
+            localState."/var/lib/mysql" = "${pv.stateRoot}/clients/${pv.base}/mysql";
 
             secrets = {
               db-password = {
-                generator = name;
+                generator = pv.base;
                 file = "db-password";
               };
               encryption-key = {
-                generator = name;
+                generator = pv.base;
                 file = "encryption-key";
               };
+            }
+            // lib.optionalAttrs (!isPreview) {
               cloud-storage = {
                 generator = "${name}-cloud-storage";
                 file = "cloud-storage";
               };
             };
+
+            preview.origin = "unix:${nginxSocket}";
+            preview.socketGroups = [ "frappe" ];
+            preview.healthPath = lib.mkDefault "/api/method/ping";
 
             # Conditions on the leaves, not on `tunnel` (see kinds/odoo.nix).
             tunnel = {

@@ -58,7 +58,8 @@ let
     };
   };
 
-  apps = lib.filterAttrs (_: a: a.odoo != null) config.clusterApps;
+  # Not the preview slots: a slot reads the secrets of the app it copies.
+  apps = lib.filterAttrs (_: a: a.odoo != null && a.preview.of == null) config.clusterApps;
 in
 {
   options.clusterApps = mkOption {
@@ -68,6 +69,10 @@ in
         let
           o = config.odoo;
           socket = "/run/odoo-${name}/nginx.sock";
+          # On a preview slot these name the app it copies (modules/app-container.nix).
+          pv = config.preview;
+          isPreview = pv.of != null;
+          dbName = if o.dbName != null then o.dbName else pv.base;
         in
         {
           options.odoo = mkOption {
@@ -79,42 +84,69 @@ in
           config = lib.mkIf (config.odoo != null) {
             tier = lib.mkDefault "monolith";
 
-            module = {
-              imports = [ inputs.odoo-nix.nixosModules.default ];
-              services.odoo-nix = {
-                enable = true;
-                inherit (o) package workers maxCronThreads;
-                dbName = if o.dbName != null then o.dbName else name;
-                # Pinned database, no manager listing; the master password
-                # still guards backup/restore/drop through the manager.
-                listDb = false;
-                withoutDemo = true;
-                database.createLocally = true;
-                adminPasswordFile = "/run/secrets/admin-passwd";
-                settings.options.server_wide_modules = lib.concatStringsSep "," o.serverWideModules;
-                # To the journal, not a file: modules/logging.nix ships it to
-                # Loki from there, labelled with the app's name.
-                logging.level = "info";
-                # nginx serves the public side over a unix socket -- the
-                # tunnel's origin; Odoo itself stays on loopback TCP behind it.
-                nginx = {
+            # A slot's database is production's, a moment ago: its mail servers, its
+            # scheduled actions, its payment providers and webhooks. Odoo's own
+            # `neutralize` switches those off, each module for what it added. Before
+            # the migration, which is before the app: a failure here leaves the
+            # preview stopped, never running with them on. Once per copy: the marker
+            # is in the copy's files, and a new copy has none. Odoo 16 and later;
+            # earlier has no such command, and so no preview.
+            module = lib.mkMerge [
+              (lib.mkIf isPreview (
+                { pkgs, ... }:
+                {
+                  systemd.services.odoo-migrate.serviceConfig.ExecStartPre = [
+                    (pkgs.writeShellScript "preview-neutralize" ''
+                      set -eu
+                      marker=/var/lib/odoo/.preview-neutralized
+                      [ -e "$marker" ] && exit 0
+                      ${o.package}/bin/odoo neutralize -d ${lib.escapeShellArg dbName}
+                      ${pkgs.coreutils}/bin/touch "$marker"
+                    '')
+                  ];
+                }
+              ))
+              {
+                imports = [ inputs.odoo-nix.nixosModules.default ];
+                services.odoo-nix = {
                   enable = true;
-                  socketPath = socket;
-                  inherit (o) clientMaxBodySize;
+                  inherit (o) package workers maxCronThreads;
+                  inherit dbName;
+                  # Pinned database, no manager listing; the master password
+                  # still guards backup/restore/drop through the manager.
+                  listDb = false;
+                  withoutDemo = true;
+                  database.createLocally = true;
+                  adminPasswordFile = "/run/secrets/admin-passwd";
+                  settings.options.server_wide_modules = lib.concatStringsSep "," o.serverWideModules;
+                  # To the journal, not a file: modules/logging.nix ships it to
+                  # Loki from there, labelled with the app's name.
+                  logging.level = "info";
+                  # nginx serves the public side over a unix socket -- the
+                  # tunnel's origin; Odoo itself stays on loopback TCP behind it.
+                  nginx = {
+                    enable = true;
+                    socketPath = socket;
+                    inherit (o) clientMaxBodySize;
+                  };
                 };
-              };
-              # DB-on-ZFS: 8k records match PostgreSQL pages; full-page writes
-              # are then redundant (ZFS record writes are atomic).
-              services.postgresql.settings.full_page_writes = false;
-            };
+                # DB-on-ZFS: 8k records match PostgreSQL pages; full-page writes
+                # are then redundant (ZFS record writes are atomic).
+                services.postgresql.settings.full_page_writes = false;
+              }
+            ];
+
+            preview.origin = "unix:${socket}";
+            preview.socketGroups = [ "odoo" ];
+            preview.healthPath = lib.mkDefault "/web/health";
 
             # Runtime odoo.conf + the filestore -- shared, follows the app.
-            juicefsPaths."/var/lib/odoo" = "clients/${name}/odoo";
+            juicefsPaths."/var/lib/odoo" = "${pv.jfsRoot}/odoo";
             # PostgreSQL data -- local disk on the home node, never JuiceFS.
-            localState."/var/lib/postgresql" = "/state/clients/${name}/postgresql";
+            localState."/var/lib/postgresql" = "${pv.stateRoot}/clients/${pv.base}/postgresql";
 
             secrets.admin-passwd = {
-              generator = name;
+              generator = pv.base;
               file = "admin-passwd";
             };
 

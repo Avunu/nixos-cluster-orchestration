@@ -5,6 +5,12 @@
 # The `cluster` input is pinned by revision in flake.nix, so this moves only what
 # follows a branch (your project flakes). Bump the library by hand, alone.
 #
+# Run weekly for everything, and by the cluster-ci Worker for one input the moment the
+# branch it follows moves (the library's README, "Previews and continuous deployment"):
+# the Worker starts this workflow with that input's name, the merge gate passes on the
+# result, and the nodes are told of the merge. Updating a lock takes Nix, which is why
+# the Worker asks this workflow and does not write the lock itself.
+#
 # Needs a secret FLAKE_UPDATE_TOKEN: a fine-grained token (or a GitHub App's) with
 # contents and pull-requests write on this repository. Not GITHUB_TOKEN: a pull request
 # it opens starts no workflows, so merge-gate would never report, and nothing would
@@ -15,9 +21,19 @@ on:
   schedule:
     - cron: "17 5 * * 1"
   workflow_dispatch:
+    inputs:
+      inputs:
+        description: "Flake inputs to update, separated by spaces. Empty: all that follow a branch."
+        required: false
+        default: ""
 
 permissions:
   contents: read
+
+# One at a time: two runs would each force-push the one branch.
+concurrency:
+  group: flake-update
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -31,11 +47,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FLAKE_UPDATE_TOKEN }}
           NIX_CONFIG: ${{ secrets.NIX_ACCESS_TOKENS }}
+          # Through the environment, never into the script's text.
+          INPUTS: ${{ inputs.inputs }}
         run: |
+          case "$INPUTS" in
+            *[!A-Za-z0-9_\ -]*) echo "not flake input names: $INPUTS" >&2; exit 1 ;;
+          esac
           git config user.name "flake-update"
           git config user.email "flake-update@example.invalid"   # not a mailbox
           git switch -C flake-auto-update
-          nix flake update
+          # Unquoted on purpose: one argument per name, and none at all when empty.
+          # shellcheck disable=SC2086
+          nix flake update $INPUTS
           if git diff --quiet -- flake.lock; then
             echo "flake.lock is current"
             exit 0

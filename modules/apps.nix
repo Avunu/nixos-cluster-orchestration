@@ -76,11 +76,45 @@ let
       (plane "admin" "-admin")
     ];
 
+  # `preview.slots = N` makes N more entries from the same file, `<name>-pv1` to
+  # `<name>-pvN`: the containers a pull request's preview runs in
+  # (modules/ci-agent.nix). The same kind with the same parameters, so the same
+  # mounts, limits and firewall, each named for the app whose data it gets a copy
+  # of (`preview.of`). What a slot must not share with the app is left out: its
+  # tunnel and hostname (a preview's are made per branch), its database archive
+  # and backups (a copy of production is not worth keeping), and its sign-in as
+  # an OIDC client.
+  previewSlots =
+    name: e:
+    lib.listToAttrs (
+      lib.genList (
+        i:
+        lib.nameValuePair "${name}-pv${toString (i + 1)}" (
+          removeAttrs e [
+            "enable"
+            "tunnel"
+            "archive"
+            "oidc"
+          ]
+          // {
+            preview = (e.preview or { }) // {
+              slots = 0;
+              of = name;
+            };
+            backup.enable = false;
+          }
+        )
+      ) (e.preview.slots or 0)
+    );
+
   # An app switched off with `enable = false` is not defined at all.
   entry =
     name: e:
     lib.optionalAttrs (e.enable or true) (
-      if e ? wordpress then wordpressPlanes name e else { ${name} = removeAttrs e [ "enable" ]; }
+      if e ? wordpress then
+        wordpressPlanes name e
+      else
+        { ${name} = removeAttrs e [ "enable" ]; } // previewSlots name e
     );
 
   fromNix = lib.mapAttrsToList (

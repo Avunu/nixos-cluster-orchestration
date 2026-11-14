@@ -343,6 +343,21 @@ in
       script = ''openssl rand -hex 32 | tr -d '\n' > "$out/token"'';
     };
 
+    # ── The pipeline's agent (modules/ci-agent.nix) ─────────────────────────
+    # Per machine, like the audit trail's: the cluster-ci Worker answers a token with
+    # that node's previews and their tunnel secrets, so a stolen one speaks for one
+    # node. Declared only when the topology names a Worker. Regenerating it needs the
+    # Worker's AGENT_TOKENS updated too (`avc ci tokens`), or the node's agent is
+    # refused with 401 until it is.
+    ci = lib.mkIf ((topology.ci.url or null) != null) {
+      files.token = { };
+      runtimeInputs = [
+        pkgs.openssl
+        pkgs.coreutils
+      ];
+      script = ''openssl rand -hex 32 | tr -d '\n' > "$out/token"'';
+    };
+
     # ── the canary (modules/canary-scan.nix) ──────────────────────────────────
     # A string that must never turn up in plaintext where client data must not be:
     # temp dirs, the journal, core dumps, swap, the ESPs, the raw disks, the object

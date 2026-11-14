@@ -18,7 +18,8 @@ let
   leader = lib.findFirst (
     n: lib.elem "nomad-leader" topology.nodes.${n}.tags
   ) (throw "ops-index: no node tagged nomad-leader") (lib.attrNames topology.nodes);
-  apps = nixosConfigurations.${leader}.config.clusterApps;
+  # Without the preview slots: they are no Nomad job, and nothing here is theirs to do.
+  apps = nixosConfigurations.${leader}.config.cluster.nomadApps;
 
   # The kinds an app can be (modules/kinds/); each is a nullable namespace.
   kinds = [
@@ -80,6 +81,9 @@ in
         enabled = cfg.cluster.audit.enable;
         nomadAcl = cfg.cluster.audit.enable && cfg.cluster.audit.nomadAcl.enable;
       };
+      # Whether this node's agent talks to the cluster-ci Worker (modules/ci-agent.nix),
+      # which then needs its `ci/token` in AGENT_TOKENS (`avc ci tokens`).
+      ci.enabled = cfg.cluster.ci.enable;
     }
   ) topology.nodes;
 

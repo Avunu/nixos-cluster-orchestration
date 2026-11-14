@@ -42,6 +42,39 @@ let
   pinned = app.homeNode != null;
   home = if pinned then topology.nodes.${app.homeNode} else null;
 
+  # A preview slot (modules/apps.nix, modules/ci-agent.nix): declared like any app, so
+  # everything the host decides about a container is decided here, at evaluation, and
+  # reviewed with the site. Three things differ. What runs in it is not this
+  # evaluation's closure but the one the agent built from a pull request, behind a
+  # profile. Its tunnel is made per branch, so its credentials and its one hostname
+  # arrive at run time. And Nomad knows nothing of it.
+  isPreview = app.preview.of != null;
+  previewRunDir = "/run/cluster-preview/${n}";
+  previewModule =
+    { pkgs, ... }:
+    {
+      systemd.services.preview-tunnel = {
+        description = "This preview's Cloudflare tunnel";
+        wantedBy = [ "multi-user.target" ];
+        wants = [ "network-online.target" ];
+        after = [ "network-online.target" ];
+        serviceConfig = {
+          # Both files are root's, on the host's /run; the unit is handed copies and
+          # runs as nobody in particular, like every app's connector.
+          LoadCredential = [
+            "config.yml:/run/preview/config.yml"
+            "credentials.json:/run/preview/credentials.json"
+          ];
+          ExecStart = "${pkgs.cloudflared}/bin/cloudflared tunnel --no-autoupdate --config %d/config.yml run";
+          DynamicUser = true;
+          SupplementaryGroups = app.preview.socketGroups;
+          Restart = "always";
+          RestartSec = 5;
+          LogExtraFields = [ "APP_SERVICE=tunnel" ];
+        };
+      };
+    };
+
   # Per-site tunnel, run inside the container against a unix socket. Because the
   # route is a socket PATH rather than an address, it stays correct wherever the
   # container is scheduled — which is what lets static container IPs go away.
@@ -205,13 +238,24 @@ let
     }
   ) app.localState;
 
-  bindMounts = secretMounts // jfsMounts // localMounts // app.extraBindMounts;
+  previewMounts = optionalAttrs isPreview {
+    "/run/preview" = {
+      hostPath = previewRunDir;
+      isReadOnly = true;
+    };
+  };
+
+  bindMounts = secretMounts // jfsMounts // localMounts // previewMounts // app.extraBindMounts;
 
   # Bind-mount sources must exist before nspawn starts. tmpfiles can't order
   # after the JuiceFS service mount, so create them in ExecStartPre instead.
   bindSources =
     (map (sub: "/mnt/jfs/${sub}") (builtins.attrValues app.juicefsPaths))
-    ++ builtins.attrValues app.localState;
+    ++ optionals (!isPreview) (builtins.attrValues app.localState)
+    # A slot's local state is a ZFS clone the agent mounts. Made here instead, it
+    # would be an empty directory on the root dataset that the database then
+    # initialises, and the clone would mount over a running database.
+    ++ optional isPreview previewRunDir;
 
   # The raw_exec wrapper: task-alive == container running; SIGTERM stops it
   # cleanly within kill_timeout. The node-local fencing reconciler (Phase 7)
@@ -492,6 +536,10 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
     extraVeths.${wanIf}.hostBridge = "br-wan";
     additionalCapabilities = app.additionalCapabilities;
     inherit bindMounts;
+    # As the guest sees it: its own profile, /nix/var/nix/profiles/per-container/<name>
+    # on the host, which the agent points at the closure it built. So a deploy of the
+    # host neither builds a slot's guest nor reloads it.
+    path = lib.mkIf isPreview (lib.mkForce "/nix/var/nix/profiles/system");
     extraFlags = [
       "--resolv-conf=off"
     ]
@@ -510,7 +558,8 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
           # a pin made on the host would be ignored here.
           ../modules/nixpkgs-overlays.nix
         ]
-        ++ optional hasTunnel tunnelModule;
+        ++ optional hasTunnel tunnelModule
+        ++ optional isPreview previewModule;
         system.stateVersion = topology.stateVersion;
       };
   };
@@ -598,5 +647,8 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
   };
 
   # (b) rendered Nomad job for the bootstrap oneshot to register.
-  system.build.nomadJobs.${n} = pkgs.writeText "nomad-${n}.json" (builtins.toJSON job);
+  # Not for a slot: the agent starts and stops it, on the one node that has its data.
+  system.build.nomadJobs = optionalAttrs (!isPreview) {
+    ${n} = pkgs.writeText "nomad-${n}.json" (builtins.toJSON job);
+  };
 }

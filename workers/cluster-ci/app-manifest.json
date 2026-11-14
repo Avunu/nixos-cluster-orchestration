@@ -1,0 +1,14 @@
+{
+  "name": "my-cluster-ci",
+  "url": "https://github.com/Avunu/nixos-cluster-orchestration",
+  "hook_attributes": { "url": "https://cluster-ci.example.workers.dev/webhook/github" },
+  "public": false,
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "read",
+    "pull_requests": "write",
+    "statuses": "write",
+    "actions": "write"
+  },
+  "default_events": ["pull_request", "push", "delete", "issue_comment"]
+}

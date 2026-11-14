@@ -580,6 +580,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.flakeUrl` | What nodes rebuild from, as `github:owner/repo`. Also how `avc` finds the deploy remote. |
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
+| `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
 | `objectStorage` | `{ endpoint; region; juicefsBucket; dbArchiveBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. `dbArchiveBucket` is only for apps with `archive.enable`, and must be a bucket of its own ([The database archive](#the-database-archive)). Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
@@ -724,6 +725,7 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `nomad-tls/{agent,cli}.{key,crt}` | Each machine's Nomad certificates (per machine) | Generated, signed by `nomad-ca` |
 | `wg-ctrl/{private,public}` | Each machine's mesh key (per machine); every peer reads the public half | Generated |
 | `audit/token` | Each machine's token for the audit trail (per machine), listed in the Worker's `AUDIT_TOKENS` | Generated |
+| `ci/token` | Each machine's token for the cluster-ci Worker (per machine), listed in the Worker's `AGENT_TOKENS`. Only with `ci.url` | Generated |
 | `canary/value` | The string the [canary scan](#canary-scan) plants and looks for | Generated |
 | `github-token/{nix.conf,netrc}` | Pull loop access to private flakes | Prompt, a fine-grained PAT with read access to contents |
 | `restic/password` | Every app's backup repository. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
@@ -753,6 +755,7 @@ Rotation notes:
 - **`nomad-jwt`:** regenerating reissues every node's logins, and the leader's `nomad-acl-init` updates the auth method on its next switch. Manual in the policy.
 - **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots, and its mesh services retry.
 - **`audit`:** a new token must reach the Worker (`avc audit tokens | wrangler secret put AUDIT_TOKENS`), or that node's events are refused (`AuditEventRejected`).
+- **`ci`:** a new token must reach the Worker (`avc ci tokens | wrangler secret put AGENT_TOKENS`), or that node's agent is refused: it then deploys on the timer alone, and its previews stand still.
 - **`canary`:** harmless to regenerate; the next scan plants the new value.
 
 ### Deploying
@@ -788,6 +791,64 @@ The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (
 **New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, clan-core, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
 
 Bump `clan-core` alone, as one reviewable commit. It tracks clan's unstable channel, and `checks.clan-coexist` is what catches an upstream change to host configuration. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
+
+### Previews and continuous deployment
+
+A GitHub App closes the two gaps the pull loop leaves: the wait between a merge and the nodes' next tick, and having nowhere to look at a pull request before it merges. Its endpoint is a Cloudflare Worker, [`workers/cluster-ci`](workers/cluster-ci), because a node accepts nothing inbound. Every node runs an agent (`modules/ci-agent.nix`, on once `ci.url` is set) that asks the Worker what to do, with a token of its own, and the Worker holds each request until it has an answer.
+
+**A merge deploys at once.** Three pushes matter, and GitHub tells the Worker of each:
+
+1. A push to a branch one of your flake inputs follows (a project's `main`). The Worker reads your site's `flake.lock`, finds the inputs that follow that branch, and starts the site's `flake-update.yml` for those inputs alone. Updating a lock takes Nix, so the workflow does it, on a branch, as a pull request with auto-merge: the [merge gate](templates/cluster/README.md) still decides.
+2. The merge of that pull request, or of any other, into the branch `deploy.flakeUrl` names. The Worker answers every node's held request, and each starts `cluster-upgrade.service`: the same tick as the timer's, with every gate above.
+3. Nothing else. The timer stays, so a push the Worker never heard of deploys within `deploy.pullInterval` as before.
+
+**A pull request gets a container.** `preview.slots` on an app declares that many more containers, `<app>-pv1` to `<app>-pvN`, of the same kind with the same parameters:
+
+```nix
+# apps/shop.nix
+preview = {
+  slots = 2;                       # branches previewed at once
+  input = "my-odoo-project";       # the flake input its package comes from
+  repo = "OWNER/my-odoo-project";  # whose pull requests get previews
+};
+```
+
+A slot is dormant like every container, and everything the host decides about one (mounts, memory limit, addresses, firewall) is fixed at evaluation and merged like the rest of the site. What a pull request supplies is what runs inside. When one opens on a branch of `repo`, and at each push to it:
+
+1. The Worker makes the branch a tunnel and a hostname of its own, `<branch>-<app>.<PREVIEW_DOMAIN>`, and tells the agent on the app's `homeNode`.
+2. The agent builds your site's flake with `input` at the pull request's commit, for one free slot's container.
+3. The first time, it gives the slot a copy of production: a ZFS clone of the node's state dataset, so the database comes up as after a power cut, and a `juicefs clone` of the app's files. Neither copies a block until one side writes, so the size of the database does not matter.
+4. It starts the container on that closure. The kind's own units migrate the copy before the app starts, exactly as a deploy migrates production. A later push keeps the copy and migrates it again.
+5. It asks the hostname for the kind's health path, and the Worker writes the result as one comment on the pull request, edited in place, and as the commit status `preview/<app>`, which a branch ruleset can require.
+
+One preview per app and branch, whatever the number of pull requests on the branch. It goes when the last of them closes or the branch is deleted: container stopped, clone destroyed, files removed, then tunnel and DNS record deleted. `/preview reset` in a comment on the pull request, from someone with write access, starts again from a fresh copy. With every slot taken, a new branch waits and says so.
+
+**What a preview is trusted with.** A copy of the app's data and the app's own secrets, running code that has not been reviewed. So:
+
+- **Forks get nothing.** Only a pull request from a branch of the repository itself is previewed, which takes write access to push. That is in the Worker's code, not its configuration.
+- **A copy does not act as production.** An `odoo` slot runs Odoo's `neutralize` on its copy before anything else, which turns off its mail servers, scheduled actions and payment providers, and does not start if that fails (Odoo 16 and later). A `frappe` slot sets `mute_emails` and `pause_scheduler`, and is not given the app's `cloud-storage` settings: the bucket is production's, so a preview's attachments are missing rather than writable.
+- **The preview's own sign-in is all that guards it.** It is production's data at a hostname anyone can ask for. Put the preview zone behind Cloudflare Access.
+- **Use a zone that serves nothing else** for `PREVIEW_DOMAIN`: unreviewed code at a subdomain of a production zone can set cookies for it.
+- **A slot is not backed up or archived**, is no Nomad job, and runs only on the app's `homeNode`, where the clone is. Its logs are with every app's, under its slot's name. A build's last lines and the names of failed units go to the pull request; a guest's log never does, since it is a copy of production speaking.
+
+Setting it up, once per site:
+
+1. Create a GitHub App from [`workers/cluster-ci/app-manifest.json`](workers/cluster-ci/app-manifest.json) (repository permissions: contents read, pull requests write, commit statuses write, actions write; events: pull request, push, delete, issue comment). Install it on the site's repository and on each project's.
+2. Fill in `wrangler.toml` (`PREVIEW_DOMAIN`, `CF_ACCOUNT_ID`, `CF_ZONE_ID`, `GITHUB_APP_ID`), then:
+   ```sh
+   cd workers/cluster-ci
+   wrangler deploy
+   wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem
+   wrangler secret put GITHUB_WEBHOOK_SECRET
+   wrangler secret put CF_API_TOKEN          # Cloudflare Tunnel: Edit, and DNS: Edit on the preview zone
+   ```
+   Point the App's webhook at the Worker's `/webhook/github`.
+3. Set `ci.url` in `topology.nix`, run `clan vars generate` for each node's `ci/token`, ship it, and give the Worker the tokens: `avc ci tokens | wrangler secret put AGENT_TOKENS`.
+4. Add `preview` to an app and ship it. The slots exist once the nodes have deployed.
+
+The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previews` by `state`. No alert rule reads them yet.
+
+**What is proven.** `checks.cluster-ci` runs the Worker's decisions (which webhook makes, moves, resets or removes a preview, what a node's report does to the pull request, which push deploys and which updates a lock) with GitHub and Cloudflare stood in for. `checks.ci-agent` runs the agent as a process against a stand-in Worker and stand-in `nix`, `zfs`, `juicefs` and `systemd`, and holds it to what it asks of them and in which order. A slot's container and its host evaluate on the fixture cluster. Nothing here has met GitHub, Cloudflare or a node: no slot has been started, no clone taken, no copy migrated. The first preview on a real site is that test.
 
 ### Backups and restore
 
@@ -1025,7 +1086,9 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 
 | Check | What it proves |
 | --- | --- |
-| `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets and audit flows. |
+| `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets, audit and pipeline flows. |
+| `cluster-ci` | The pipeline's Worker: a pull request becomes one preview per app and branch with its own tunnel and hostname, a fork gets nothing, a node's report reaches the pull request only for the commit it is about, a preview's tunnel is deleted only after its node let go of it, and which push deploys and which updates the site's lock. |
+| `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
 | `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
 | `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
 | `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that `clan vars generate` can read every generator of a new site. Evaluation only. |
@@ -1109,7 +1172,8 @@ These are accepted deliberately.
 6. **Restores are from nightly backups, not point-in-time.** Local ZFS snapshots narrow that to 15 minutes, but only for losses on the node itself. [The database archive](#the-database-archive) holds every change of an app that turns it on, and nothing here restores from it yet.
 7. **The JuiceFS metadata engine is a single point of failure.** If the `juicefs-meta` node dies, every node's `/mnt/jfs` is stranded until it returns.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
-9. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
+9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation. A preview's copy also includes every other app's database directory on that node, in the clone on the host; only the app's own is mounted into the slot.
+10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
 
 ## License
 

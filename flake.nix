@@ -109,6 +109,9 @@
         # The weekly look for the canary where client data must not be in plaintext.
         canaryScan = ./modules/canary-scan.nix;
         backup = ./modules/backup.nix;
+        # Deploys the moment the site's branch moves, and a preview per pull request:
+        # the node's half of workers/cluster-ci.
+        ciAgent = ./modules/ci-agent.nix;
         nixpkgsOverlays = ./modules/nixpkgs-overlays.nix;
       };
       nixosModules = clusterModuleSet;
@@ -406,6 +409,35 @@
               ''
                 cp -r ${./workers/cluster-watchdog} w && cd w
                 node --test test/*.test.js
+                touch $out
+              ''
+          );
+
+          # The pipeline's Worker: what a webhook and a node's report make of each other
+          # (node --test, no dependencies).
+          checks.cluster-ci = detach (
+            _:
+            pkgs.runCommand "cluster-ci-tests"
+              {
+                nativeBuildInputs = [ pkgs.nodejs_22 ];
+              }
+              ''
+                cp -r ${./workers/cluster-ci} w && cd w
+                node --test test/*.test.js
+                touch $out
+              ''
+          );
+
+          # The pipeline's agent, as a process, against a stand-in Worker and stand-in
+          # nix, zfs, juicefs and systemd: what it asks of them, in which order.
+          checks.ci-agent = detach (
+            _:
+            pkgs.runCommand "ci-agent-tests"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+              }
+              ''
+                python3 ${./tests/ci-agent.py} ${./modules/ci-agent.py}
                 touch $out
               ''
           );
@@ -1840,7 +1872,9 @@
                 lib = nixpkgs.lib;
                 mutant = "walg-cache-is-not-trusted";
                 extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings [ ''write_walg_cache "$have" ||'' ] [ "true ||" ];
+                  builtins.replaceStrings
+                    [ ''write_walg_cache "$have" ||'' ]
+                    [ "true ||" ];
               }
             );
             # The same, and WAL-G's exit status is taken as proof of an upload.
@@ -1915,7 +1949,9 @@
                 lib = nixpkgs.lib;
                 mutant = "later-generation-is-not-dropped";
                 extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
+                  builtins.replaceStrings
+                    [ ''if [ "$n" -ge "$cur" ]; then'' ]
+                    [ "if false; then" ];
               }
             );
             # The PostgreSQL archiver (tests/db-archive-pg.nix), edited the same way.
@@ -2012,7 +2048,9 @@
                 lib = nixpkgs.lib;
                 mutant = "pg-later-generation-is-not-dropped";
                 extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
+                  builtins.replaceStrings
+                    [ ''if [ "$n" -ge "$cur" ]; then'' ]
+                    [ "if false; then" ];
               }
             );
           };

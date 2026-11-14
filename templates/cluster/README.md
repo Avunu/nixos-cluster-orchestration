@@ -59,6 +59,10 @@ The first deploy of a library version with boot security waits on every such nod
 
 Write `apps/<name>.nix`, run `clan vars generate <node>`, and ship it (`avc deploy ship`). To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
 
+## Deploying on merge, and previews
+
+Without anything more, a merge reaches the nodes at their next timer, and a project's new commits reach this repository's lock once a week. A GitHub App and its Worker (`workers/cluster-ci` in the library) remove both waits, and give each pull request of a project a container of its own on a copy of production. Set `ci.url` in `topology.nix` and `preview` on an app; the library's README, "Previews and continuous deployment", has the setup and what a preview is trusted with. `.github/workflows/flake-update.yml` is what the Worker starts when a project's branch moves, so keep its file name, or set the Worker's `FLAKE_UPDATE_WORKFLOW`.
+
 ## Updating the library
 
 Change the `cluster` input's revision and bump nothing else in the same commit. It goes by pull request like every other change (`avc deploy ship` opens one), because nodes apply `main` within minutes: the merge gate below has to pass on it first.

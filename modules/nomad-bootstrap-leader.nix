@@ -42,7 +42,7 @@ let
     }) config.system.build.nomadJobs
   );
 
-  managedApps = builtins.attrNames config.clusterApps;
+  managedApps = builtins.attrNames config.cluster.nomadApps;
 
   registerScript = pkgs.writeShellScript "nomad-register-jobs" ''
     set -euo pipefail

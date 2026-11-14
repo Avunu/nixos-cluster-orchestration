@@ -64,6 +64,12 @@
     # withoutCanary = "<reason>";
   };
 
+  # The cluster-ci Worker, a GitHub App's endpoint (README.md in the library, "Previews
+  # and continuous deployment"). With it set, every node deploys the moment this
+  # repository's branch moves, and an app with `preview.slots` gets a container per
+  # pull request of its project.
+  # ci.url = "https://cluster-ci.example.workers.dev";
+
   # S3-compatible storage for JuiceFS. Credentials: `clan vars`. Loki keeps its logs
   # on the metrics node's own encrypted disk, not here.
   objectStorage = {
