@@ -67,9 +67,7 @@
       inherit (nixpkgs) lib;
       clusterLib = import ./lib { inherit lib; };
 
-      # Everything mkCluster imports on every machine. `nixosModules` is the wider
-      # set a consumer can reach, and a module for a host that is not a cluster node
-      # (none yet) belongs only in the wider one.
+      # Everything mkCluster imports on every machine, and what `nixosModules` exports.
       clusterModuleSet = {
         zfsHost = ./modules/zfs-host.nix;
         bootSecurity = ./modules/boot-security.nix;
@@ -111,11 +109,7 @@
         backup = ./modules/backup.nix;
         nixpkgsOverlays = ./modules/nixpkgs-overlays.nix;
       };
-      nixosModules = clusterModuleSet // {
-        # A Tang-only host, for a separate private repo: not a cluster node, so not in
-        # the module set (design 1.22).
-        tangServer = ./modules/tang-server.nix;
-      };
+      nixosModules = clusterModuleSet;
 
       # `lib.mkCluster` (lib/mk-cluster.nix): a consumer's clan, from these modules.
       # clanCore already imports sops-nix and disko into every machine, so
@@ -269,18 +263,6 @@
                     inherit pkgs lib topology;
                   };
                 clanCoreModule = clan-core.nixosModules.clanCore;
-              }
-              // args
-            );
-
-          # The Tang host module: its surface, key guard, key tool, probe and /rec events,
-          # against a stock Tang that shows each hazard (tests/tang-server.nix).
-          tangServer =
-            args:
-            import ./tests/tang-server.nix (
-              {
-                inherit pkgs;
-                lib = nixpkgs.lib;
               }
               // args
             );
@@ -567,12 +549,6 @@
           # real zstd core that a grep cannot see into.
           checks.canary-scan = detach (_: canaryScan { });
 
-          # The Tang host: Tang only on the private NIC and to its clients, SSH only on the
-          # public one; the key guard refuses where stock tangd would mint keys; rotation
-          # with a t=2 Clevis client; the verified probe and /rec events reach the real
-          # Worker, and a receiver outage delays them without losing one (design WS15).
-          checks.tang-server = detach (_: tangServer { });
-
           # The boot security posture and its one opt-out: what evaluates, what is
           # refused, and that each refusal is for the reason it claims. Eval only.
           checks.security-policy = detach (
@@ -732,6 +708,7 @@
                     withoutTries = lib.mkForce [
                       "nofail"
                       "x-systemd.device-timeout=30s"
+                      "tpm2-device=auto"
                     ];
                   in
                   {
@@ -809,6 +786,7 @@
                     withoutNofail = lib.mkForce [
                       "tries=0"
                       "x-systemd.device-timeout=30s"
+                      "tpm2-device=auto"
                     ];
                   in
                   {
@@ -902,50 +880,24 @@
                   };
               }
             );
-            # ── Clevis (WS4) ───────────────────────────────────────────────────────
-            # nixpkgs' clevis without the reply fix, the fleet's other fixes kept: its
-            # askpass hands every recovered key to pkgs.systemd's reply binary, which the
-            # initrd doesn't have. The build gate refuses this closure before any boot
-            # (boot-closure proves that); it is taken out here so that the boot itself can
-            # be shown to fail.
-            clevis-stock-package = detach (
+            # ── TPM unlock ─────────────────────────────────────────────────────────
+            # The initrd without TPM support: the binding is on the disk and nothing in the
+            # initrd can open it, so every boot waits at the prompt. The build gate that
+            # refuses such an initrd is out too, or there would be no closure to boot.
+            initrd-no-tpm = detach (
               _:
               bootTest ./tests/boot-install.nix {
                 mutant = "unattended-both-devices";
                 extraModule =
-                  { config, lib, ... }:
+                  { lib, ... }:
                   {
-                    cluster.boot.clevisPackage = lib.mkForce (config.system.build.clevisFor { replyFix = false; });
-                    system.checks = lib.mkForce [ (config.system.build.espBudgetFor 1024) ];
+                    assertions = lib.mkForce [ ];
+                    system.checks = lib.mkForce [ ];
+                    boot.initrd.systemd.tpm2.enable = lib.mkForce false;
                   };
               }
             );
-            # Clevis that can unlock, without --max-time: stuck forever on a silent Tang.
-            clevis-no-maxtime = detach (
-              _:
-              bootTest ./tests/boot-fallback.nix {
-                mutant = "tarpit-max-time-recovers";
-                extraModule =
-                  { config, lib, ... }:
-                  {
-                    cluster.boot.clevisPackage = lib.mkForce (config.system.build.clevisFor { maxTime = false; });
-                  };
-              }
-            );
-            # Clevis that recovers a device's key again for every question it asks: a reply
-            # that was lost costs another /rec at Tang.
-            clevis-askpass-no-memory = detach (
-              _:
-              bootTest ./tests/boot-install.nix {
-                mutant = "askpass-one-recovery-per-device";
-                extraModule =
-                  { config, lib, ... }:
-                  {
-                    cluster.boot.clevisPackage = lib.mkForce (config.system.build.clevisFor { recoverOnce = false; });
-                  };
-              }
-            );
-            # Emergency mode with PCR 7 intact: the shell asks Clevis for the key.
+            # Emergency mode with PCR 7 intact: the shell asks the TPM for the key.
             no-pcr-burn = detach (
               _:
               bootTest ./tests/boot-attack.nix {
@@ -954,18 +906,6 @@
                   { lib, ... }:
                   {
                     boot.initrd.systemd.services.emergency-pcr-burn.enable = lib.mkForce false;
-                  };
-              }
-            );
-            # The Tang VLAN left up into stage 2.
-            no-vlan-teardown = detach (
-              _:
-              bootTest ./tests/boot-install.nix {
-                mutant = "tang-vlan-gone-in-stage2";
-                extraModule =
-                  { lib, ... }:
-                  {
-                    boot.initrd.systemd.services.vlan-teardown.enable = lib.mkForce false;
                   };
               }
             );
@@ -982,7 +922,7 @@
             no-initrd-ssh-network = detach (
               _:
               bootTest ./tests/boot-fallback.nix {
-                mutant = "drop-ssh";
+                mutant = "refused-ssh";
                 extraModule =
                   { lib, ... }:
                   {
@@ -995,10 +935,7 @@
               _:
               bootTest ./tests/boot-attack.nix {
                 mutant = "sb-toggled-off";
-                sealEdit =
-                  builtins.replaceStrings
-                    [ '',tpm2:[{pcr_bank:"sha256",pcr_ids:"7"}]'' ]
-                    [ '',tpm2:[{pcr_bank:"sha256"}]'' ];
+                sealEdit = builtins.replaceStrings [ "--tpm2-pcrs=7 " ] [ "--tpm2-pcrs= " ];
               }
             );
 
@@ -1011,17 +948,6 @@
                   builtins.replaceStrings
                     [ "need_unburned\n    need_own_authority_only\n" ]
                     [ "need_unburned\n" ];
-              }
-            );
-            # The advertisement's signature is not checked: only the thumbprints are.
-            seal-no-adv-signature-check = detach (
-              _:
-              bootTest ./tests/boot-install.nix {
-                mutant = "bind-refused-forged-signature";
-                sealEdit =
-                  builtins.replaceStrings
-                    [ "if ! printf '%s' \"$sig\" | jose jws ver" ]
-                    [ "if false && printf '%s' \"$sig\" | jose jws ver" ];
               }
             );
 
@@ -1674,10 +1600,9 @@
               }
             );
 
-            # The boot report counts Clevis's attempts, every line clevis-luks-askpass
-            # logged, rather than the devices it says "Unlocked ... successfully" for. A boot
-            # Tang refused is typed through while Clevis keeps trying, so `report-passphrase`
-            # must then see it called a Clevis unlock.
+            # The boot report counts the legs that asked the TPM, refused or not, rather than
+            # the legs it opened. A boot the TPM refused is typed through after both legs
+            # asked, so `report-passphrase` must then see it called a TPM unlock.
             boot-report-counts-attempts = detach (
               _:
               bootTest ./tests/boot-fallback.nix {
@@ -1688,7 +1613,7 @@
                     cluster.bootReport.script = lib.mkForce (
                       let
                         text = config.system.build.bootReportText;
-                        edited = builtins.replaceStrings [ "n = len(clevis_ok)\n" ] [ "n = clevis_lines\n" ] text;
+                        edited = builtins.replaceStrings [ "n = len(tpm_ok)\n" ] [ "n = len(tpm_ok | tpm_refused)\n" ] text;
                       in
                       # Fails loudly when the listing moves, rather than proving nothing.
                       assert edited != text;
@@ -1724,114 +1649,7 @@
               }
             );
 
-            # ── Tang host (WS15) ───────────────────────────────────────────────────
-            # No key guard: stock tangd answers an empty directory by minting keys.
-            tang-no-guard = detach (
-              _:
-              tangServer {
-                mutant = "guard-empty-no-mint";
-                extraModule =
-                  { lib, ... }:
-                  {
-                    systemd.services."tangd@".serviceConfig.ExecStartPre = lib.mkForce [ ];
-                  };
-              }
-            );
-            # The guard counts files but never parses them, so 0-byte keys pass it and tangd,
-            # skipping them as unreadable, mints new ones.
-            tang-guard-existence-only = detach (
-              _:
-              tangServer {
-                mutant = "guard-zero-length";
-                extraModule =
-                  { config, lib, ... }:
-                  {
-                    cluster.tangServer.guardScript = lib.mkForce (
-                      let
-                        text = config.system.build.tangKeyGuardText;
-                        edited = builtins.replaceStrings [ ''if [ "$t.jwk" != "$k" ]; then'' ] [ "if false; then" ] text;
-                      in
-                      # Fails loudly when the listing moves, rather than proving nothing.
-                      assert edited != text;
-                      edited
-                    );
-                  };
-              }
-            );
-
-            # The notifier as it was: only a literal `POST /rec/<kid>` line is posted, so a
-            # recovery sent as `//rec/<kid>` (which tangd routes and answers) leaves no trace.
-            tang-rec-literal-path = detach (
-              _:
-              tangServer {
-                mutant = "rec-odd-paths-reported";
-                extraModule =
-                  { config, lib, ... }:
-                  {
-                    cluster.tangServer.recNotifyScript = lib.mkForce (
-                      let
-                        text = config.system.build.tangRecNotifyText;
-                        edited =
-                          builtins.replaceStrings
-                            [
-                              ''REC = re.compile(r"(?:^|/)rec/+(?P<kid>[0-9A-Za-z_-]+)$")''
-                              ''if m["method"] == "GET":''
-                            ]
-                            [
-                              ''REC = re.compile(r"^/rec/(?P<kid>[0-9A-Za-z_-]+)$")''
-                              ''if m["method"] != "POST" or not REC.search(m["path"]):''
-                            ]
-                            text;
-                      in
-                      # Fails loudly when the listing moves, rather than proving nothing.
-                      assert edited != text;
-                      edited
-                    );
-                  };
-              }
-            );
-            # The Tang port also open on the public NIC's firewall, by a route the module's
-            # assertion can't see. Only IPAddressAllow is left in front of tangd, and
-            # `surface` must notice once IPAddressAllow lets everyone through.
-            tang-public-port-open = detach (
-              _:
-              tangServer {
-                mutant = "surface";
-                extraModule =
-                  { lib, ... }:
-                  {
-                    networking.firewall.extraCommands = lib.mkAfter ''
-                      iptables -I nixos-fw -i eth1 -p tcp --dport 7654 -j nixos-fw-accept
-                      ip6tables -I nixos-fw -i eth1 -p tcp --dport 7654 -j nixos-fw-accept
-                    '';
-                  };
-              }
-            );
-            # The probe without its signature check: an /adv altered after signing passes.
-            tang-probe-no-signature-check = detach (
-              _:
-              tangServer {
-                mutant = "probe-tampered-adv-refused";
-                extraModule =
-                  { config, lib, ... }:
-                  {
-                    cluster.tangServer.probeScript = lib.mkForce (
-                      let
-                        text = config.system.build.tangProbeText;
-                        edited =
-                          builtins.replaceStrings
-                            [ ''printf '%s' "$sig" | jose jws ver -i <(printf '%s' "$adv") -k- -a'' ]
-                            [ ":" ]
-                            text;
-                      in
-                      # Fails loudly when the listing moves, rather than proving nothing.
-                      assert edited != text;
-                      edited
-                    );
-                  };
-              }
-            );
-
+            # ── Staged rollout ─────────────────────────────────────────────────────
             # The running closure's contract is not compared with the candidate's.
             # The staged rollout's three controls (tests/canary-gate.nix). Each edit fails
             # loudly when its listing moves, rather than proving nothing.

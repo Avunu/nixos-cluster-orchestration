@@ -352,15 +352,19 @@ in
     };
   };
 
-  # Age of the newest metadata dump JuiceFS wrote to the bucket (hourly, by the
-  # mount). A rebuilt juicefs-meta node restores from it, so its age is how much
-  # metadata a reinstall would lose. Written for alerting (JuiceFSMetaDumpStale).
+  # Age of the newest metadata dump JuiceFS wrote to the bucket (every
+  # `jfs.backupMeta`, by the mounts). A rebuilt juicefs-meta node restores from it, so
+  # its age is how much metadata a reinstall would lose. Written for alerting
+  # (JuiceFSMetaDumpStale). A new volume has no dump until the mounts write the first:
+  # that is not a failure, and the metric then counts from the first time the bucket
+  # was seen without one, so the alert still fires if none ever comes.
   systemd.services.jfs-meta-dump-age = {
     description = "Report the newest JuiceFS metadata dump (metrics)";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
     serviceConfig = {
       Type = "oneshot";
+      StateDirectory = "jfs-meta-dump-age";
       # The names of the dumps are all it reads, so no key: just the S3 pair.
       LoadCredential = [
         "${jfs.credIds.s3ak}:${vars.ovh-s3.files."access-key".path}"
@@ -373,12 +377,29 @@ in
         export RCLONE_CONFIG_JFS_TYPE=s3 RCLONE_CONFIG_JFS_PROVIDER=Other
         export RCLONE_CONFIG_JFS_ENDPOINT="${os.endpoint}" RCLONE_CONFIG_JFS_REGION="${os.region}"
         export RCLONE_CONFIG_JFS_ACCESS_KEY_ID="$s3ak" RCLONE_CONFIG_JFS_SECRET_ACCESS_KEY="$s3sk"
-        newest=$(${rclone} lsf "jfs:${os.juicefsBucket}/${jfs.jfsName}/meta/" --files-only \
-          | grep '^dump-.*\.json\.gz$' | sort | tail -1)
-        [ -n "$newest" ] || { echo "no metadata dumps in the bucket" >&2; exit 1; }
-        # dump-2026-09-25-153208.json.gz -> 2026-09-25 15:32:08 UTC
-        stamp=$(echo "$newest" | sed -E 's/^dump-([0-9-]{10})-([0-9]{2})([0-9]{2})([0-9]{2}).*/\1 \2:\3:\4/')
-        ts=$(date -u -d "$stamp" +%s)
+        # A failed listing is not an empty bucket: the unit fails and the metric stays
+        # as it was. rclone's 3 is "no such directory", which is a volume with no dump.
+        rc=0
+        listing=$(${rclone} lsf "jfs:${os.juicefsBucket}/${jfs.jfsName}/meta/" --files-only) || rc=$?
+        case "$rc" in
+          0 | 3) ;;
+          *)
+            echo "object storage unreachable (rclone exit $rc); not a judgement on the dumps" >&2
+            exit 1
+            ;;
+        esac
+        newest=$(printf '%s\n' "$listing" | grep '^dump-.*\.json\.gz$' | sort | tail -1 || true)
+        empty_since="$STATE_DIRECTORY/empty-since"
+        if [ -n "$newest" ]; then
+          # dump-2026-09-25-153208.json.gz -> 2026-09-25 15:32:08 UTC
+          stamp=$(echo "$newest" | sed -E 's/^dump-([0-9-]{10})-([0-9]{2})([0-9]{2})([0-9]{2}).*/\1 \2:\3:\4/')
+          ts=$(date -u -d "$stamp" +%s)
+          rm -f "$empty_since"
+        else
+          [ -s "$empty_since" ] || date -u +%s > "$empty_since"
+          ts=$(cat "$empty_since")
+          echo "no metadata dump in the bucket yet; counting from $(date -u -d "@$ts" +%FT%TZ)" >&2
+        fi
         m=/var/lib/prometheus-node-exporter-text
         mkdir -p "$m"
         echo "cluster_jfs_meta_dump_newest_timestamp_seconds $ts" > "$m/jfs_meta_dump.prom.tmp"

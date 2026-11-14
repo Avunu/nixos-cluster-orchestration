@@ -174,7 +174,7 @@ def test_preflight_forces_both_drvpaths(ctx, monkeypatch):
 
     def out(cmd, cwd=None, timeout=None):
         seen.append(cmd)
-        return '{"toplevel": "/nix/store/x.drv", "disko": "/nix/store/y.drv", "identity": "ab", "thumbprints": ["t"], "url": "http://192.0.2.1:7654"}'
+        return '{"toplevel": "/nix/store/x.drv", "disko": "/nix/store/y.drv", "identity": "ab"}'
 
     monkeypatch.setattr(boot_flow.proc, "out", out)
     monkeypatch.setattr(boot_flow, "_fingerprint", lambda pub: "fp")
@@ -182,6 +182,12 @@ def test_preflight_forces_both_drvpaths(ctx, monkeypatch):
     (cmd,) = seen
     assert cmd[:4] == ["nix", "eval", "--json", ".#nixosConfigurations.node1.config"]
     assert "system.build.toplevel.drvPath" in cmd[-1] and "system.build.diskoScript.drvPath" in cmd[-1]
+    # And reads nothing else but the identity hash: an option the node's configuration does
+    # not define would fail the whole evaluation.
+    assert cmd[-1] == (
+        "c: { toplevel = c.system.build.toplevel.drvPath; disko = c.system.build.diskoScript.drvPath; "
+        "identity = c.cluster.boot.identity.hash; }"
+    )
 
 
 def test_preflight_refuses_an_opted_out_node(ctx, monkeypatch):
@@ -246,16 +252,33 @@ def piped(monkeypatch):
     return sent
 
 
-def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, tmp_path, piped, ssh, capsys):
-    adv = tmp_path / "adv.jws"
-    adv.write_text('{"payload": "x"}')
+def test_bind_parses_a_node_and_two_switches():
+    parser = build_parser()
+    args = parser.parse_args(["boot", "bind", "node1", "--replace", "--device", "/dev/disk/by-partlabel/disk-nvme1-luks"])
+    assert (args.node, args.replace, args.device) == ("node1", True, "/dev/disk/by-partlabel/disk-nvme1-luks")
+    args = parser.parse_args(["boot", "bind", "node1"])
+    assert (args.node, args.replace, args.device) == ("node1", False, None)
+    # The node is the only positional: a file or a device after it is an error, not a guess.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["boot", "bind", "node1", "/dev/disk/by-partlabel/disk-nvme1-luks"])
+
+
+def test_bind_asks_for_nothing_but_the_node(ctx, monkeypatch, piped):
+    # From the menu, where nothing is given: the node is chosen, and the rest is left out.
+    from avc import ui
+
     monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
-    run(ctx, "boot", "bind", node="node1", adv=str(adv), replace=False, device=None)
-    assert piped == [
-        ("install -m 0600 /dev/stdin /run/adv.jws.pending", '{"payload": "x"}'),
-        (boot_flow.bind_script(False, None), PASSPHRASE),
-    ]
-    assert "cluster-boot-seal bind --adv /run/adv.jws.pending" in piped[1][0]
+    with ui.scripted(["node1"]):
+        run(ctx, "boot", "bind")
+    assert piped == [(boot_flow.bind_script(False, None), PASSPHRASE)]
+
+
+def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, piped, ssh, capsys):
+    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    run(ctx, "boot", "bind", node="node1", replace=False, device=None)
+    # One pipe to the node, and the passphrase is all it carries.
+    assert piped == [(boot_flow.bind_script(False, None), PASSPHRASE)]
+    assert piped[0][0].startswith("rc=0; cluster-boot-seal bind || rc=$?; ")
     # Never on a command line, and never printed.
     assert all(PASSPHRASE not in command for command, _ in piped)
     assert all(PASSPHRASE not in command for _, command in ssh[1])
@@ -263,14 +286,11 @@ def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, tmp_path, pip
     assert PASSPHRASE not in out.out and PASSPHRASE not in out.err
 
 
-def test_bind_replace_and_device(ctx, monkeypatch, tmp_path, piped):
-    adv = tmp_path / "adv.jws"
-    adv.write_text("{}")
+def test_bind_replace_and_device(ctx, monkeypatch, piped):
     monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
-    run(ctx, "boot", "bind", node="node1", adv=str(adv), replace=True, device="/dev/disk/by-partlabel/disk-nvme1-luks")
-    assert (
-        "cluster-boot-seal bind --adv /run/adv.jws.pending --replace --device /dev/disk/by-partlabel/disk-nvme1-luks"
-        in piped[-1][0]
+    run(ctx, "boot", "bind", node="node1", replace=True, device="/dev/disk/by-partlabel/disk-nvme1-luks")
+    assert piped[-1][0].startswith(
+        "rc=0; cluster-boot-seal bind --replace --device /dev/disk/by-partlabel/disk-nvme1-luks || rc=$?; "
     )
 
 
@@ -281,60 +301,67 @@ def _run_bind_script(tmp_path, seal_rc):
     stub.mkdir(exist_ok=True)
     (stub / "cluster-boot-seal").write_text(f"#!/bin/sh\ncat >/dev/null\nexit {seal_rc}\n")
     (stub / "cluster-boot-seal").chmod(0o755)
-    pending, marker = tmp_path / "adv.jws.pending", tmp_path / "adv.jws"
-    pending.write_text("{}")
-    script = boot_flow.bind_script(True, None, pending=str(pending), marker=str(marker))
+    marker = tmp_path / "bound"
+    script = boot_flow.bind_script(True, None, marker=str(marker))
     env = {**os.environ, "PATH": f"{stub}:{os.environ.get('PATH', '/bin')}"}
     p = subprocess.run(["sh", "-c", script], input=PASSPHRASE, text=True, env=env, capture_output=True)
-    return p.returncode, pending.exists(), marker.exists()
+    return p.returncode, marker.exists()
 
 
 def test_a_failed_bind_leaves_no_marker(tmp_path):
-    # An advertisement nobody pinned, say: cluster-boot-seal refuses before touching a slot.
-    rc, pending, marker = _run_bind_script(tmp_path, 1)
-    assert (rc, pending, marker) == (1, False, False)
-    # So `avc boot reboot` still refuses the short Clevis count of the boot before.
-    report = "cluster_boot_unlock_clevis_devices 0\ncluster_boot_unlock_expected_devices 2\n"
+    # Setup Mode, say: cluster-boot-seal refuses before touching a slot.
+    rc, marker = _run_bind_script(tmp_path, 1)
+    assert (rc, marker) == (1, False)
+    # So `avc boot reboot` still refuses the short TPM count of the boot before.
+    report = "cluster_boot_unlock_tpm_devices 0\ncluster_boot_unlock_expected_devices 2\n"
     refusals, _ = boot_flow.reboot_verdict(check_output(report=report) + ("bound_this_boot=yes\n" if marker else "bound_this_boot=no\n"))
     assert any("0 of 2" in r for r in refusals)
 
 
 def test_a_bind_that_succeeded_leaves_the_marker(tmp_path):
-    assert _run_bind_script(tmp_path, 0) == (0, False, True)
+    assert _run_bind_script(tmp_path, 0) == (0, True)
+
+
+def test_a_bind_whose_marker_cannot_be_written_fails(tmp_path):
+    # The bind itself returned 0, and nothing records it: say so, not "bound".
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "cluster-boot-seal").write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n")
+    (stub / "cluster-boot-seal").chmod(0o755)
+    script = boot_flow.bind_script(False, None, marker=str(tmp_path / "no such directory" / "bound"))
+    env = {**os.environ, "PATH": f"{stub}:{os.environ.get('PATH', '/bin')}"}
+    p = subprocess.run(["sh", "-c", script], input=PASSPHRASE, text=True, env=env, capture_output=True)
+    assert p.returncode != 0
 
 
 def test_a_failed_bind_after_a_good_one_keeps_the_good_ones_marker(tmp_path):
     # The first bind this boot succeeded; a second one is refused. The first one's binding is
     # still on disk, and the seal check is what judges it.
-    assert _run_bind_script(tmp_path, 0)[2]
-    assert _run_bind_script(tmp_path, 4) == (4, False, True)
+    assert _run_bind_script(tmp_path, 0)[1]
+    assert _run_bind_script(tmp_path, 1) == (1, True)
 
 
-def test_bind_reports_a_failed_bind(ctx, monkeypatch, tmp_path):
-    adv = tmp_path / "adv.jws"
-    adv.write_text("{}")
+def test_bind_reports_a_failed_bind(ctx, monkeypatch):
     monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
     monkeypatch.setattr(
         Node,
         "pipe",
         lambda self, command, data, check=True, timeout=120: subprocess.CompletedProcess(
-            [], 1 if "cluster-boot-seal" in command else 0, "", "refusing: advertisement is not signed by a pinned key"
+            [], 1 if "cluster-boot-seal" in command else 0, "", "refusing: SecureBoot=0 SetupMode=1. Binding here seals to a PCR 7 anyone can reproduce."
         ),
     )
-    with pytest.raises(AvcError, match="not signed by a pinned key"):
-        run(ctx, "boot", "bind", node="node1", adv=str(adv), replace=True, device=None)
+    with pytest.raises(AvcError, match="SecureBoot=0 SetupMode=1"):
+        run(ctx, "boot", "bind", node="node1", replace=True, device=None)
 
 
 @pytest.mark.parametrize("device", ["nvme1", "/dev/x; reboot", "/dev/$(id)", "/dev/a b"])
-def test_bind_refuses_a_device_that_is_not_a_plain_path(ctx, tmp_path, piped, device):
-    adv = tmp_path / "adv.jws"
-    adv.write_text("{}")
+def test_bind_refuses_a_device_that_is_not_a_plain_path(ctx, piped, device):
     with pytest.raises(AvcError, match="not a device path"):
-        run(ctx, "boot", "bind", node="node1", adv=str(adv), replace=False, device=device)
+        run(ctx, "boot", "bind", node="node1", replace=False, device=device)
     assert piped == []
 
 
-REPORT_OK = "cluster_boot_unlock_clevis_devices 2\ncluster_boot_unlock_expected_devices 2\n"
+REPORT_OK = "cluster_boot_unlock_tpm_devices 2\ncluster_boot_unlock_expected_devices 2\n"
 
 
 SEAL_OK = "seal_check=0\nseal: OK: /dev/a token 0\nseal: OK: /dev/b token 0\n"
@@ -394,26 +421,20 @@ def test_reboot_check_reads_the_default_entry():
     assert "/var/lib/cluster-upgrade/refused" in deploy_state.DEFAULT_ENTRY.replace("$S", deploy_state.STATE)
 
 
-def test_reboot_preflight_refuses_a_slot_bound_to_an_unpinned_tang_key():
-    seal = "seal_check=4\nseal: OK: /dev/a token 0\nseal: FAILED: /dev/b token 1: bound to a Tang key that is not pinned\n"
-    refusals, _ = boot_flow.reboot_verdict(check_output(seal=seal))
-    assert any("no longer pinned" in r and "/dev/b token 1" in r for r in refusals)
-
-
 def test_reboot_messages_point_at_the_readme_not_the_design():
     import inspect
 
     assert "design section" not in inspect.getsource(boot_flow)
 
 
-def test_reboot_preflight_refuses_a_partial_clevis_unlock():
-    report = "cluster_boot_unlock_clevis_devices 1\ncluster_boot_unlock_expected_devices 2\n"
+def test_reboot_preflight_refuses_a_partial_tpm_unlock():
+    report = "cluster_boot_unlock_tpm_devices 1\ncluster_boot_unlock_expected_devices 2\n"
     refusals, _ = boot_flow.reboot_verdict(check_output(report=report))
     assert any("1 of 2" in r for r in refusals)
 
 
 def test_reboot_preflight_refuses_a_passphrase_boot_that_nothing_rebound():
-    report = "cluster_boot_unlock_clevis_devices 0\ncluster_boot_unlock_expected_devices 2\n"
+    report = "cluster_boot_unlock_tpm_devices 0\ncluster_boot_unlock_expected_devices 2\n"
     refusals, _ = boot_flow.reboot_verdict(check_output(report=report))
     assert any("0 of 2" in r for r in refusals)
 
@@ -421,23 +442,25 @@ def test_reboot_preflight_refuses_a_passphrase_boot_that_nothing_rebound():
 def test_reboot_preflight_after_a_bind_this_boot():
     # Install S7: the last boot (S5) was typed, the node was bound since, and only a reboot
     # can prove the binding. The seal check still has to pass.
-    report = "cluster_boot_unlock_clevis_devices 0\ncluster_boot_unlock_expected_devices 2\n"
+    report = "cluster_boot_unlock_tpm_devices 0\ncluster_boot_unlock_expected_devices 2\n"
     refusals, notes = boot_flow.reboot_verdict(check_output(report=report) + "bound_this_boot=yes\n")
     assert refusals == []
     assert any("proves the new binding" in n for n in notes)
-    seal = "seal_check=1\nseal: FAILED: /dev/b has no Clevis binding\n"
+    seal = "seal_check=1\nseal: FAILED: /dev/b has no TPM binding\n"
     refusals, _ = boot_flow.reboot_verdict(check_output(report=report, seal=seal) + "bound_this_boot=yes\n")
-    assert any("/dev/b has no Clevis binding" in r for r in refusals)
+    assert any("/dev/b has no TPM binding" in r for r in refusals)
 
 
 def test_reboot_check_reports_a_bind_this_boot():
-    assert f"test -e {boot_flow.ADV_ON_NODE}" in boot_flow.REBOOT_CHECK
-    assert boot_flow.ADV_ON_NODE.startswith("/run/")
+    assert f"test -e {boot_flow.BOUND_MARKER}" in boot_flow.REBOOT_CHECK
+    # The marker the bind writes is the one the check reads, and it does not outlive the boot.
+    assert f"touch {boot_flow.BOUND_MARKER} " in boot_flow.bind_script(False, None)
+    assert boot_flow.BOUND_MARKER.startswith("/run/")
 
 
 def test_reboot_preflight_lets_a_burned_boot_through():
     # Emergency recovery burned PCR 7: the binding only looks broken, and a reboot clears it.
-    report = "cluster_boot_unlock_clevis_devices 0\ncluster_boot_unlock_expected_devices 2\n"
+    report = "cluster_boot_unlock_tpm_devices 0\ncluster_boot_unlock_expected_devices 2\n"
     refusals, notes = boot_flow.reboot_verdict(check_output(burned="yes", report=report))
     assert refusals == []
     assert any("burned" in n for n in notes)
@@ -455,9 +478,9 @@ def test_reboot_preflight_refuses_while_an_automated_hold_is_set():
 
 def test_reboot_preflight_refuses_a_leg_with_no_binding():
     # A disk replaced and never bound: the boot report from before the swap still says 2 of 2.
-    seal = "seal_check=1\nseal: OK: /dev/a token 0\nseal: FAILED: /dev/b has no Clevis binding\n"
+    seal = "seal_check=1\nseal: OK: /dev/a token 0\nseal: FAILED: /dev/b has no TPM binding\n"
     refusals, _ = boot_flow.reboot_verdict(check_output(seal=seal))
-    assert any("/dev/b has no Clevis binding" in r for r in refusals)
+    assert any("/dev/b has no TPM binding" in r for r in refusals)
 
 
 def test_reboot_preflight_refuses_when_the_seal_check_cannot_run():
@@ -467,9 +490,17 @@ def test_reboot_preflight_refuses_when_the_seal_check_cannot_run():
     assert any("could not run" in r for r in refusals)
 
 
+@pytest.mark.parametrize("rc", ["2", "4", "126"])
+def test_reboot_preflight_refuses_a_seal_check_status_it_does_not_know(rc):
+    # 0, 1 and 3 are all the check returns. Anything else proves nothing, whatever it prints.
+    seal = f"seal_check={rc}\nseal: OK: /dev/a token 0\nseal: OK: /dev/b token 0\n"
+    refusals, _ = boot_flow.reboot_verdict(check_output(seal=seal))
+    assert any(f"could not run (rc={rc})" in r for r in refusals)
+
+
 def test_reboot_preflight_lets_a_burned_seal_check_through():
     seal = "seal_check=3\nseal: BURNED: PCR 7 was burned this boot\n"
-    report = "cluster_boot_unlock_clevis_devices 0\ncluster_boot_unlock_expected_devices 2\n"
+    report = "cluster_boot_unlock_tpm_devices 0\ncluster_boot_unlock_expected_devices 2\n"
     refusals, _ = boot_flow.reboot_verdict(check_output(burned="yes", seal=seal, report=report))
     assert refusals == []
 

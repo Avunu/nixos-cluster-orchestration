@@ -1,7 +1,6 @@
 # One disk gone, in each way a disk can be gone, and what's left of a node's storage
-# promises on the disks it has. Nothing is bound yet, so the surviving leg's passphrase
-# is typed once: "unattended" below means that nothing else is asked for. WS4's Clevis
-# takes the typing away.
+# promises on the disks it has. Nothing is bound to the TPM here, so the surviving leg's
+# passphrase is typed once: "unattended" below means that nothing else is asked for.
 #
 # The ESP half: each one boots alone, and the guarded install hook refuses or skips what it
 # has to, without writing anywhere it shouldn't. Then two rescues: a damaged volume identity,

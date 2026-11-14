@@ -118,6 +118,9 @@ let
             # gate decides when to stop waiting for it.
             "nofail"
             "x-systemd.device-timeout=30s"
+            # Wait for the TPM and try this leg's TPM slot before asking anyone
+            # (cluster-boot-seal bind makes the slot; a leg without one just asks).
+            "tpm2-device=auto"
           ];
         };
         content = {

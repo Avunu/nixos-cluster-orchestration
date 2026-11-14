@@ -75,12 +75,10 @@ in
           hostKeyPub = if pub != null && pub.exists then pub.value else null;
         };
       # What `avc audit` prints for the watchdog Worker's secrets (modules/audit-ship.nix):
-      # whether this node ships at all, whether it ships Nomad's ACL changes too, and the
-      # address Tang sees its key recoveries come from.
+      # whether this node ships at all, and whether it ships Nomad's ACL changes too.
       audit = {
         enabled = cfg.cluster.audit.enable;
         nomadAcl = cfg.cluster.audit.enable && cfg.cluster.audit.nomadAcl.enable;
-        tangIp = node.tangIp or null;
       };
     }
   ) topology.nodes;

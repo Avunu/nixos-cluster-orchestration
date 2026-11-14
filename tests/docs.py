@@ -102,10 +102,10 @@ check(
 flows = read_tree(facts["avcFlows"])
 actions = set(re.findall(r'@action\(\s*"([\w-]+)",\s*"([\w-]+)"', flows))
 groups = {g for g, _ in actions}
-# Each action's flags, from its Arg(..., flag=True) declarations.
+# Each action's flags, from its Arg(..., flag=True) and Arg(..., option=True) declarations.
 flags: dict[tuple[str, str], set[str]] = {}
 for m in re.finditer(r'@action\(\s*"([\w-]+)",\s*"([\w-]+)"(.*?)\)\ndef ', flows, re.S):
-    flags[(m.group(1), m.group(2))] = set(re.findall(r'Arg\(\s*"([\w-]+)"[^)]*flag=True', m.group(3)))
+    flags[(m.group(1), m.group(2))] = set(re.findall(r'Arg\(\s*"([\w-]+)"[^)]*(?:flag|option)=True', m.group(3)))
 if len(actions) < 30 or ("boot", "bind") not in actions:
     failures.append(f"the avc action registry did not parse ({len(actions)} actions): this test proves nothing")
 
@@ -113,16 +113,10 @@ core = read_tree(facts["bootCore"])
 seal_usage = re.search(r"usage: cluster-boot-seal ([^\"]+)\"", core)
 seal_subs = {alt.split()[0] for alt in seal_usage.group(1).split("|")} if seal_usage else set()
 seal_flags = set(re.findall(r"^\s+(--[\w-]+)\)", core, re.M))
-tang = read_tree(facts["tangServer"])
-tang_usage = re.search(r"usage: tang-keys ([\w|-]+)", tang)
-tang_subs = set(tang_usage.group(1).split("|")) if tang_usage else set()
-if not seal_subs or not tang_subs or "--replace" not in seal_flags:
-    failures.append("the cluster-boot-seal or tang-keys usage line did not parse: this test proves nothing")
+if not seal_subs or "--replace" not in seal_flags:
+    failures.append("the cluster-boot-seal usage line did not parse: this test proves nothing")
 
-print(
-    f"parsed: {len(actions)} avc actions, cluster-boot-seal {sorted(seal_subs)} {sorted(seal_flags)}, "
-    f"tang-keys {sorted(tang_subs)}"
-)
+print(f"parsed: {len(actions)} avc actions, cluster-boot-seal {sorted(seal_subs)} {sorted(seal_flags)}")
 problems = []
 for where, text in docs.items():
     for frag in code_fragments(text):
@@ -142,10 +136,7 @@ for where, text in docs.items():
             for f in re.findall(r"(--[\w-]+)", m.group(2)):
                 if f not in seal_flags:
                     problems.append(f"{where}: `{frag.strip()}`: cluster-boot-seal has no flag {f}")
-        for m in re.finditer(r"tang-keys\s+([a-z][\w-]*)", frag):
-            if m.group(1) not in tang_subs:
-                problems.append(f"{where}: `{frag.strip()}`: tang-keys has no {m.group(1)!r}")
-check("every avc, cluster-boot-seal and tang-keys command in the docs exists, with its flags", problems)
+check("every avc and cluster-boot-seal command in the docs exists, with its flags", problems)
 
 # ── 3. topology fields ──────────────────────────────────────────────────────
 

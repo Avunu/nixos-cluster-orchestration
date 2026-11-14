@@ -141,26 +141,6 @@ let
     secureNode {
       inherit topology;
     };
-  # Each on its own: they share one assertion, so together they would mask each other.
-  withoutTangField =
-    field:
-    withTopology (
-      secureTopology
-      // {
-        security = secureTopology.security // {
-          tang = builtins.removeAttrs secureTopology.security.tang [ field ];
-        };
-      }
-    );
-  # The refusal's message is the type: http://<ipv4>:<port>, and nothing around it.
-  tangUrlNeedle = "tang.url must be http://<ipv4>:<port>";
-  withTangUrl =
-    url:
-    withTopology (
-      lib.recursiveUpdate secureTopology {
-        security.tang.url = url;
-      }
-    );
 
   # ── raw_exec's uid gap ────────────────────────────────────────────────────
   # The deny list leaves uid 4096 and everything above 65535. The first sweep reads
@@ -221,8 +201,8 @@ let
     );
 
   # ── the positive case ─────────────────────────────────────────────────────
-  # The secure fixture with nothing added must evaluate. Flipped in WS4, with Clevis, when
-  # the core became what satisfies the posture. While false, the subtest required the
+  # The secure fixture with nothing added must evaluate. Flipped in WS4, when the core
+  # became what satisfies the posture. While false, the subtest required the
   # failure, so it could not be forgotten.
   securePositiveEnabled = true;
 
@@ -1009,13 +989,15 @@ let
                   )
                 );
                 luksDevices = lib.mapAttrs (_: d: d.device) c.boot.initrd.luks.devices;
+                # Each leg's crypttab options, written out: the layout's, with the TPM last.
                 unlock = {
-                  enable = true;
-                  useTang = true;
-                };
-                tang = {
-                  inherit (secureTopology.security.tang) url vlanId;
-                  address = "10.40.0.11/28";
+                  tpm2 = true;
+                  crypttabExtraOpts = lib.genAttrs [ "crypt-a" "crypt-b" ] (_: [
+                    "tries=0"
+                    "nofail"
+                    "x-systemd.device-timeout=30s"
+                    "tpm2-device=auto"
+                  ]);
                 };
                 identityHash = c.clan.core.vars.generators.volume-identity.files.hash.value;
                 identityPath = "/var/lib/volume-identity/secret";
@@ -1030,7 +1012,6 @@ let
                   address4 = node.publicIp4;
                   gateway4 = node.publicGw4;
                 };
-                trunkInterface = node.vrackInterface;
                 initrdKernelModules = node.initrdNicModules;
                 authorizedKeysSha256 = builtins.hashString "sha256" (
                   lib.concatStringsSep "\n" (lib.sort lib.lessThan (import ./fixtures/admins.nix))
@@ -1041,8 +1022,7 @@ let
                   "crypt-a"
                   "crypt-b"
                 ]
-              # Rotating Tang must not stop a deploy, and keys don't belong in a closure's text.
-              && !lib.hasInfix (builtins.head secureTopology.security.tang.thumbprints) (builtins.toJSON contract)
+              # Keys don't belong in a closure's text.
               && !lib.hasInfix "ssh-" (builtins.toJSON contract);
             detail = [ ];
           }
@@ -1112,7 +1092,7 @@ let
               in
               system.config.cluster.boot.enable
               && system.config.boot.lanzaboote.enable
-              && system.config.boot.initrd.clevisLuksAskpass.enable
+              && system.config.boot.initrd.systemd.tpm2.enable
               && system.config.clan.core.vars.generators ? luks
               && !lib.any (lib.hasInfix "opted out of boot security") system.config.warnings
               # Nothing refused: null is read as "not set", so the whole posture is in force
@@ -1167,11 +1147,14 @@ let
                     "tries=0"
                     "nofail"
                     "x-systemd.device-timeout=30s"
+                    "tpm2-device=auto"
                   ]
               ) (lib.attrNames devices)
               && devices.crypt-a.device == "/dev/disk/by-partlabel/disk-nvme0-luks"
               && devices.crypt-b.device == "/dev/disk/by-partlabel/disk-nvme1-luks";
-            detail = baseline.config.boot.initrd.luks.devices;
+            detail = lib.mapAttrsToList (
+              n: d: "${n}: ${d.device} ${toString d.crypttabExtraOpts}"
+            ) baseline.config.boot.initrd.luks.devices;
           }
           {
             name = "a secure node's layout reads the luks generator's passphrase, at install only";
@@ -1253,15 +1236,16 @@ let
                 c = baseline.config;
                 i = c.boot.initrd;
                 t = secureTopology.nodes.node1;
-                vlan = "${t.vrackInterface}.${toString secureTopology.security.tang.vlanId}";
               in
               i.network.ssh.enable
               && i.network.ssh.port == 2222
               && i.network.ssh.authorizedKeys == import ./fixtures/admins.nix
               && i.network.ssh.hostKeys == [ c.cluster.boot.ssh.hostKeyPath ]
               && i.systemd.network.networks."30-wan".address == [ "${t.publicIp4}/32" ]
-              && i.systemd.network.netdevs."20-${vlan}".vlanConfig.Id == secureTopology.security.tang.vlanId
-              && i.systemd.network.networks."50-${vlan}".address == [ "10.40.0.11/28" ]
+              # The WAN NIC only: an unlock needs no network, so nothing here names the vRack's.
+              && !lib.any (lib.hasInfix t.vrackInterface) (
+                lib.attrNames i.systemd.network.networks ++ lib.attrNames i.systemd.network.netdevs
+              )
               && lib.hasPrefix "$" i.systemd.emergencyAccess
               && lib.all (m: lib.elem m i.availableKernelModules) t.initrdNicModules
               && lib.all (p: lib.elem p c.boot.kernelParams) (
@@ -1416,7 +1400,7 @@ let
               && lib.all (m: lib.hasInfix m text) [
                 "cluster_zpool_plain_vdevs"
                 "cluster_esp_mounted"
-                "cluster_tang_vlan_present"
+                "cluster_boot_tpm_tokens"
                 "cluster_iommu_groups"
                 "cluster_watchdog_device"
                 "cluster_core_pattern_ok"
@@ -1424,35 +1408,30 @@ let
             detail = [ ];
           }
 
-          # ── Clevis, the burn, and leaving the initrd (WS4) ───────────────────────
+          # ── the TPM unlock, the burn, and leaving the initrd ────────────────────
           {
-            name = "Clevis answers the prompt in parallel, with the fleet's patched package, through the TPM and Tang";
+            name = "every leg tries its TPM slot before it asks, and the initrd can open one";
             ok =
               let
                 c = baseline.config;
-                a = c.boot.initrd.clevisLuksAskpass;
+                devices = c.boot.initrd.luks.devices;
               in
-              a.enable
-              && a.useTang
-              && a.package == c.cluster.boot.clevisPackage
-              && lib.hasInfix "--max-time 15" (c.cluster.boot.clevisPackage.postPatch or "")
-              && lib.hasInfix "--replace-fail" (c.cluster.boot.clevisPackage.postPatch or "")
-              && c.boot.initrd.systemd.tpm2.enable;
-            detail = [ ];
-          }
-          {
-            name = "the fleet's Clevis recovers each device's key once per boot, and a mutant can take only that out";
-            ok =
-              let
-                build = baseline.config.system.build;
-                hasPatch =
-                  p: lib.any (x: baseNameOf (toString x) == "clevis-askpass-recover-once.patch") (p.patches or [ ]);
-              in
-              hasPatch baseline.config.cluster.boot.clevisPackage
-              && !(hasPatch (build.clevisFor { recoverOnce = false; }))
-              && hasPatch (build.clevisFor { maxTime = false; })
-              && hasPatch (build.clevisFor { replyFix = false; });
-            detail = map toString (baseline.config.cluster.boot.clevisPackage.patches or [ ]);
+              c.boot.initrd.systemd.tpm2.enable
+              &&
+                lib.attrNames devices == [
+                  "crypt-a"
+                  "crypt-b"
+                ]
+              && lib.all (
+                d:
+                lib.all (o: lib.elem o d.crypttabExtraOpts) [
+                  "tpm2-device=auto"
+                  # A mistyped passphrase or a dead disk must not give the leg up.
+                  "tries=0"
+                  "nofail"
+                ]
+              ) (lib.attrValues devices);
+            detail = lib.mapAttrsToList (n: d: "${n}: ${toString d.crypttabExtraOpts}") baseline.config.boot.initrd.luks.devices;
           }
           {
             name = "the initrd-contents check is a build gate";
@@ -1481,21 +1460,6 @@ let
                 builtins.match ".*tpm2_pcrextend.*pcr7-burned.*" (lib.replaceStrings [ "\n" ] [ " " ] burn.script)
                 != null
               && lib.any (p: lib.hasSuffix "/bin/tpm2_pcrextend" (toString p.source)) i.storePaths;
-            detail = [ ];
-          }
-          {
-            name = "the Tang VLAN is deleted before stage 2, after the root is known good";
-            ok =
-              let
-                c = baseline.config;
-                t = c.boot.initrd.systemd.services.vlan-teardown;
-                vlan = "${secureTopology.nodes.node1.vrackInterface}.${toString secureTopology.security.tang.vlanId}";
-              in
-              t.serviceConfig.ExecStart == "/bin/ip link del ${vlan}"
-              && lib.elem "volume-identity-check.service" t.after
-              && lib.elem "initrd.target" t.before
-              && lib.elem "initrd.target" t.wantedBy
-              && lib.any (p: p.pname or "" == "iproute2") c.boot.initrd.systemd.initrdBin;
             detail = [ ];
           }
           {
@@ -1559,15 +1523,13 @@ let
             detail = [ ];
           }
           {
-            name = "the seal tool is on the node, and knows its devices, Tang and identity";
+            name = "the seal tool is on the node, and knows its devices and identity";
             ok =
               let
                 c = baseline.config;
                 text = c.system.build.sealText;
               in
               lib.any (p: p.name or "" == "cluster-boot-seal") c.environment.systemPackages
-              && lib.hasInfix "url=${c.cluster.boot.tang.url}" text
-              && lib.all (t: lib.hasInfix t text) c.cluster.boot.tang.thumbprints
               && lib.hasInfix "identity_hash=${c.cluster.boot.identity.hash}" text
               && lib.all (d: lib.hasInfix d.device text) (lib.attrValues c.boot.initrd.luks.devices)
               && lib.all (f: lib.hasInfix f text) [
@@ -1575,8 +1537,8 @@ let
                 "need_unburned"
                 "need_own_authority_only\n"
                 "need_identity"
-                "verified_thp"
-                "pcr_ids:\"7\""
+                "--tpm2-device=auto --tpm2-pcrs=7 "
+                "--token-only --token-type systemd-tpm2"
                 "/run/cluster-boot/pcr7-burned"
                 "db_cert=/var/lib/sbctl/keys/db/db.pem\n"
               ]
@@ -1603,9 +1565,6 @@ let
           (refuses "a host file letting a shell start when the burn fails" (secureWith [
             { boot.initrd.systemd.services.emergency-pcr-burn.requiredBy = lib.mkForce [ ]; }
           ]) "emergency-pcr-burn must run")
-          (refuses "a host file keeping the Tang VLAN into stage 2" (secureWith [
-            { boot.initrd.systemd.services.vlan-teardown.enable = lib.mkForce false; }
-          ]) "vlan-teardown must run")
           (refuses "a host file ordering the identity check late" (secureWith [
             {
               boot.initrd.systemd.services.volume-identity-check.before = lib.mkForce [
@@ -1621,9 +1580,6 @@ let
           (refuses "a host file no longer requiring the identity check" (secureWith [
             { boot.initrd.systemd.services.volume-identity-check.requiredBy = lib.mkForce [ ]; }
           ]) "volume-identity-check must run")
-          (refuses "a host file no longer pulling in the VLAN teardown" (secureWith [
-            { boot.initrd.systemd.services.vlan-teardown.wantedBy = lib.mkForce [ ]; }
-          ]) "vlan-teardown must run")
           # The core's copy, which the posture's own message would otherwise stand in for.
           (refuses "the core refuses Lanzaboote off" (secureWith [
             { boot.lanzaboote.enable = lib.mkForce false; }
@@ -1712,12 +1668,17 @@ let
           (refuses "a host file adding plaintext swap" (secureWith [
             { swapDevices = [ { device = "/dev/sdz"; } ]; }
           ]) "swapDevices has an entry without randomEncryption")
-          (refuses "a host file forcing boot.initrd.clevisLuksAskpass.enable = false" (secureWith [
-            { boot.initrd.clevisLuksAskpass.enable = lib.mkForce false; }
-          ]) "boot.initrd.clevisLuksAskpass.enable and useTang must be true")
-          (refuses "a host file forcing boot.initrd.clevisLuksAskpass.useTang = false" (secureWith [
-            { boot.initrd.clevisLuksAskpass.useTang = lib.mkForce false; }
-          ]) "boot.initrd.clevisLuksAskpass.enable and useTang must be true")
+          (refuses "a host file taking the TPM option off one leg" (secureWith [
+            {
+              boot.initrd.luks.devices.crypt-b.crypttabExtraOpts = lib.mkForce [
+                "tries=0"
+                "nofail"
+              ];
+            }
+          ]) "boot.initrd.luks.devices has a device without tpm2-device=auto")
+          (refuses "a host file forcing boot.initrd.systemd.tpm2.enable = false" (secureWith [
+            { boot.initrd.systemd.tpm2.enable = lib.mkForce false; }
+          ]) "boot.initrd.systemd.tpm2.enable must be true")
           (refuses "a host file turning on the boot menu's editor" (secureWith [
             { boot.loader.systemd-boot.editor = lib.mkForce true; }
           ]) "boot.loader.systemd-boot.editor must be false")
@@ -1757,13 +1718,17 @@ let
               boot.loader.systemd-boot.editor = lib.mkForce true;
               boot.loader.efi.canTouchEfiVariables = lib.mkForce true;
               boot.initrd.network.flushBeforeStage2 = lib.mkForce false;
-              boot.initrd.clevisLuksAskpass.useTang = lib.mkForce false;
+              boot.initrd.systemd.tpm2.enable = lib.mkForce false;
             }
           ])
           [
             [
-              "the core refuses an unlock without Tang"
-              "cluster.boot: boot.initrd.clevisLuksAskpass needs enable and useTang"
+              "the core refuses a leg without the TPM option"
+              "cluster.boot: every LUKS device needs tpm2-device=auto"
+            ]
+            [
+              "the core refuses an initrd without TPM support"
+              "cluster.boot: boot.initrd.systemd.tpm2.enable must stay on"
             ]
             [
               "the core refuses LUKS devices that are too few or misnamed"
@@ -1796,160 +1761,42 @@ let
           ]
         )
         [
-          (refuses "the core refuses a VLAN name the kernel can't hold" (withTopology (
+          (refuses "no initrd NIC modules" (withTopology (
             lib.recursiveUpdate secureTopology {
-              nodes.node1.vrackInterface = "enp3s0f1np1xx";
+              nodes.node1.initrdNicModules = [ ];
             }
-          )) "cluster.boot: <trunk>.<vlanId> is over")
-          (refuses "the core refuses to run with no Tang VLAN" (withoutTangField "vlanId")
-            "cluster.boot: tang.vlanId, tang.address and network.kernelModules must be set"
-          )
+          )) "initrdNicModules must list")
+          (refuses "initrdNicModules that is not a list" (withTopology (
+            lib.recursiveUpdate secureTopology {
+              nodes.node1.initrdNicModules = "virtio_net";
+            }
+          )) "initrdNicModules must list")
+          (refuses "a null auditUrl" (withTopology (
+            lib.recursiveUpdate secureTopology {
+              alerting.auditUrl = null;
+            }
+          )) "topology.alerting.auditUrl is null")
         ]
-        # One node with every field wrong. Each assertion reads only its own field, so they
-        # cannot mask each other.
-        (sharing
-          (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang = {
-                url = "http://tang.example.net:7500";
-                thumbprints = [ "not-a-thumbprint" ];
-                vlanId = 4095;
-                # Overlaps vlans.control, and tangIp (below) is outside it.
-                subnet = "10.10.0.0/28";
-              };
-              alerting.auditUrl = null;
-              nodes.node1 = {
-                tangIp = "10.40.0.11";
-                initrdNicModules = [ ];
-              };
-            }
-          ))
-          [
-            [
-              "a Tang URL that needs DNS"
-              "tang.url must be http://<ipv4>:<port>"
-            ]
-            [
-              "something other than thumbprints"
-              "tang.thumbprints must be a non-empty list"
-            ]
-            [
-              "a VLAN id out of range"
-              "tang.vlanId must be a VLAN id"
-            ]
-            [
-              "a Tang subnet overlapping a VLAN"
-              "tang.subnet overlaps"
-            ]
-            [
-              "tangIp outside the Tang subnet"
-              "tangIp must be an address inside"
-            ]
-            [
-              "no initrd NIC modules"
-              "initrdNicModules must list"
-            ]
-            [
-              "a null auditUrl"
-              "topology.alerting.auditUrl is null"
-            ]
-          ]
-        )
-        # Wrong in ways the node above isn't: each value here passes the clause that node's
-        # value fails and fails another, so no clause of an assertion goes unproven because
-        # a neighbouring one always caught the value first.
-        (sharing
-          (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang = {
-                thumbprints = [ ];
-                vlanId = 0;
-                # lib.toInt throws on a leading zero, so this has to be refused before that.
-                subnet = "10.40.0.0/08";
-              };
-              alerting.auditUrl = null;
-              nodes.node1.tangIp = "10.40.0";
-            }
-          ))
-          [
-            [
-              "an empty list of thumbprints"
-              "tang.thumbprints must be a non-empty list"
-            ]
-            [
-              "VLAN 0"
-              "tang.vlanId must be a VLAN id"
-            ]
-            [
-              "a prefix with a leading zero"
-              "tang.subnet must be an IPv4 CIDR"
-            ]
-            [
-              "a malformed tangIp"
-              "tangIp must be an address inside"
-            ]
-          ]
-        )
-        (sharing
-          (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang = {
-                # One good thumbprint must not carry a bad one.
-                thumbprints = secureTopology.security.tang.thumbprints ++ [ "not-a-thumbprint" ];
-                vlanId = "40";
-                subnet = "10.40.0.0/33";
-              };
-              nodes.node1 = {
-                tangIp = 11;
-                initrdNicModules = "virtio_net";
-              };
-            }
-          ))
-          [
-            [
-              "one bad thumbprint among good ones"
-              "tang.thumbprints must be a non-empty list"
-            ]
-            [
-              "a VLAN id that is a string"
-              "tang.vlanId must be a VLAN id"
-            ]
-            [
-              "a prefix over 32"
-              "tang.subnet must be an IPv4 CIDR"
-            ]
-            [
-              "a tangIp that is not a string"
-              "tangIp must be an address inside"
-            ]
-            [
-              "initrdNicModules that is not a list"
-              "initrdNicModules must list"
-            ]
-          ]
-        )
-        # What a topology can simply leave out.
+        # What a topology can simply leave out. The core's own copy is for whoever imports
+        # it without modules/boot-security.nix.
         (sharing
           (withTopology (
             secureTopology
             // {
               alerting = builtins.removeAttrs secureTopology.alerting [ "auditUrl" ];
               nodes = secureTopology.nodes // {
-                node1 = builtins.removeAttrs secureTopology.nodes.node1 [
-                  "tangIp"
-                  "initrdNicModules"
-                ];
+                node1 = builtins.removeAttrs secureTopology.nodes.node1 [ "initrdNicModules" ];
               };
             }
           ))
           [
             [
-              "no tangIp"
-              "tangIp must be an address inside"
-            ]
-            [
               "no initrdNicModules"
               "initrdNicModules must list"
+            ]
+            [
+              "the core refuses to run without the initrd's NIC drivers"
+              "cluster.boot: network.kernelModules must be set"
             ]
             [
               "no auditUrl"
@@ -1957,80 +1804,7 @@ let
             ]
           ]
         )
-        (map
-          (
-            field:
-            refuses "no security.tang.${field}" (withoutTangField field) "topology.security.tang must set url"
-          )
-          [
-            "url"
-            "thumbprints"
-            "vlanId"
-            "subnet"
-          ]
-        )
-        (map (url: refuses "the Tang URL ${url}" (withTangUrl url) tangUrlNeedle) [
-          "http://10.40.0.1"
-          "http://10.40.0.1:"
-          "http://10.40.0.1:7500/"
-          "http://10.40.0.1:7500/path"
-          "http://10.40.0.1:0"
-          "http://10.40.0.1:65536"
-          "https://10.40.0.1:7500"
-          "http://10.40.0.256:7500"
-        ])
         [
-          (refuses "no security.tang" (withTopology (
-            secureTopology
-            // {
-              security = builtins.removeAttrs secureTopology.security [ "tang" ];
-            }
-          )) "topology.security.tang must set url")
-          # Overlaps only the mesh, which is new and easy to miss in the node above.
-          (refuses "a Tang subnet overlapping the mesh" (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang.subnet = "10.25.0.0/28";
-              nodes.node1.tangIp = "10.25.0.11";
-            }
-          )) "tang.subnet overlaps")
-          # The control VLAN's id: stage 2 would bring the Tang VLAN's segment back up.
-          (refuses "a Tang VLAN id that a stage-2 VLAN also uses" (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang.vlanId = secureTopology.vlans.control.id;
-            }
-          )) "topology.security.tang.vlanId is also a vlans.*.id")
-          (refuses "a Tang subnet that is not a CIDR" (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang.subnet = "10.40.0.0";
-            }
-          )) "tang.subnet must be an IPv4 CIDR")
-          (refuses "a Tang VLAN name over the kernel's 15 characters" (withTopology (
-            lib.recursiveUpdate secureTopology {
-              nodes.node1.vrackInterface = "enp3s0f1np1xx";
-            }
-          )) "the Tang VLAN's interface name")
-          # The same, for the entry in that list nothing else reads on this path.
-          (refuses "a Tang subnet overlapping privateServices" (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang.subnet = "10.21.0.0/28";
-              nodes.node1.tangIp = "10.21.0.11";
-            }
-          )) "tang.subnet overlaps")
-          # Contains the VLANs rather than being contained by them.
-          (refuses "a Tang subnet containing the VLANs" (withTopology (
-            lib.recursiveUpdate secureTopology {
-              security.tang.subnet = "10.0.0.0/8";
-            }
-          )) "tang.subnet overlaps")
-          {
-            name = "the Tang URL's port can be anything a port can be";
-            ok = lib.all (url: !fails (withTangUrl url) tangUrlNeedle) [
-              "http://10.40.0.1:1"
-              "http://10.40.0.1:65535"
-            ];
-            detail = [ ];
-          }
-
           # ── the wiring ──────────────────────────────────────────────────────────
           # The refusals above read results. This is the other half: what the core will be
           # given, because a wrong value here would pass every assertion and fail at boot.
@@ -2044,7 +1818,6 @@ let
               b.enable
               && b.identity.hash == gens.volume-identity.files.hash.value
               && builtins.match "[0-9a-f]{64}" b.identity.hash != null
-              && (builtins.tryEval b.clevisPackage.drvPath).success
               && b.emergency.passwordHash == gens.emergency-access.files.hash.value
               && lib.hasPrefix "$" b.emergency.passwordHash
               && b.ssh.port == 2222
@@ -2052,12 +1825,7 @@ let
               && b.network.wan.interface == secureTopology.nodes.node1.wanInterface
               && b.network.wan.address4 == secureTopology.nodes.node1.publicIp4
               && b.network.wan.gateway4 == secureTopology.nodes.node1.publicGw4
-              && b.network.trunk.interface == secureTopology.nodes.node1.vrackInterface
               && b.network.kernelModules == secureTopology.nodes.node1.initrdNicModules
-              && b.tang.url == secureTopology.security.tang.url
-              && b.tang.thumbprints == secureTopology.security.tang.thumbprints
-              && b.tang.vlanId == secureTopology.security.tang.vlanId
-              && b.tang.address == "10.40.0.11/28"
               && b.install.identitySecretFile == gens.volume-identity.files.secret.path
               &&
                 b.install.identitySecretFile == "/run/partitioning-secrets/per-machine/node1/volume-identity/secret"
@@ -2642,9 +2410,10 @@ pkgs.runCommand "security-policy-checks"
           echo ${lib.escapeShellArg "  - ${x.name}"} >&2
           ${lib.concatMapStringsSep "\n" (
             # A detail can be a set (the deny-list and bootstrap_expect subtests): shown as JSON,
-            # where toString would abort the report with "cannot coerce a set".
+            # where toString would abort the report with "cannot coerce a set". One that is not
+            # a list at all (a string, the whole boot contract) is shown as a single line.
             d: "echo ${lib.escapeShellArg "      ${if builtins.isString d then d else builtins.toJSON d}"} >&2"
-          ) x.detail}
+          ) (lib.toList x.detail)}
         '') failed}
         exit 1
       ''

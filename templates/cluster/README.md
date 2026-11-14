@@ -17,12 +17,10 @@ Keep this repository private: it names your addresses and customers, and it hold
 
 ## First steps
 
-Before anything here, the Tang server: a small separate machine with its own private repository that imports the library's `nixosModules.tangServer`. Run `tang-keys init` there and keep the thumbprints it prints. The library's README, "Encryption", says what it needs.
-
 1. Set the `cluster` input in `flake.nix` to a real commit of the library, then run `nix flake lock`.
 2. Run `age-keygen -o ~/.config/age/identities` once per operator, and put the public keys in `recipients` in `flake.nix`. Make one more identity for the offline kit (`age-keygen -o <offline media>/identity`) and add its public key too.
 3. Put your SSH public keys in `admins` in `flake.nix`.
-4. Replace every example value in `topology.nix`: `deploy.flakeUrl` to this repository's URL, `security.tang` with the Tang host's address and thumbprints, `backup.repoSalt` (`openssl rand -hex 16`), and per node `tangIp` and `initrdNicModules`. A node refuses to evaluate until its boot fields are real.
+4. Replace every example value in `topology.nix`: `deploy.flakeUrl` to this repository's URL, `backup.repoSalt` (`openssl rand -hex 16`), and per node `initrdNicModules`. A node refuses to evaluate until its boot fields are real.
 5. `nix develop`, generate the secrets, commit them, and install the first node with the library's README, "Installing a node" (S0 to S8), as far as its Secure Boot keys:
 
    ```sh
@@ -35,11 +33,11 @@ Before anything here, the Tang server: a small separate machine with its own pri
    avc boot enroll node1            # own Secure Boot keys; then reboot and unlock once more
    ```
 
-6. Deploy the watchdog Worker, set `alerting.heartbeatUrl` and `alerting.auditUrl` in `topology.nix`, and push its `AUDIT_TOKENS` (`avc audit tokens`, the Tang host's entry included). The first unattended boot is next, and its boot report, its Tang release and the `booted (clevis)` email that says S7 worked all go there.
+6. Deploy the watchdog Worker, set `alerting.heartbeatUrl` and `alerting.auditUrl` in `topology.nix`, and push its `AUDIT_TOKENS` (`avc audit tokens`). The first unattended boot is next, and its boot report and the `booted (tpm)` email that says S7 worked both go there.
 7. Bind and reboot, with nobody typing (S6, S7):
 
    ```sh
-   avc boot bind node1 adv.jws      # the Tang host's /adv, fetched on the Tang host
+   avc boot bind node1              # a TPM slot on each leg, sealed to PCR 7
    avc boot reboot node1            # nobody types; expect the Worker's email
    ```
 
@@ -89,4 +87,4 @@ What that costs: every operation waits for the gate. The two boot tests are buil
 
 With those rules auto-merge is safe: GitHub merges a pull request only once the required checks pass, and never on a red or skipped run. `.github/workflows/flake-update.yml` updates the lock on a branch, opens a pull request and asks for auto-merge. It needs a `FLAKE_UPDATE_TOKEN` secret (contents and pull-requests write), not the built-in token, whose pull requests start no workflows; and "Allow auto-merge" turned on. If your project flakes are private, put a read token in a `NIX_ACCESS_TOKENS` secret as `access-tokens = github.com=<token>`. An auto-merge that pushes to `main` itself, or merges without these checks, is exactly the gap this closes: replace it.
 
-**The canary.** One node, `canary = true` in `topology.nix`, takes each new boot stack first: a nixpkgs, kernel, Lanzaboote, clan or library bump. The others build it and wait (`DeployWaitingForCanary` after a day) until the canary has been rebooted into it and unlocked by Clevis on its own. Reboot it with `avc boot reboot <canary>` and watch the console; if it fails to come back, nothing else has the bad stack as its boot entry. If the canary cannot be rebooted, list the closure in `/run/cluster-upgrade.skip-canary` on each node you accept it on. A site of one node needs no canary; a site of more needs one, or `deploy.withoutCanary = "<reason>"`.
+**The canary.** One node, `canary = true` in `topology.nix`, takes each new boot stack first: a nixpkgs, kernel, Lanzaboote, clan or library bump. The others build it and wait (`DeployWaitingForCanary` after a day) until the canary has been rebooted into it and unlocked from the TPM on its own. Reboot it with `avc boot reboot <canary>` and watch the console; if it fails to come back, nothing else has the bad stack as its boot entry. If the canary cannot be rebooted, list the closure in `/run/cluster-upgrade.skip-canary` on each node you accept it on. A site of one node needs no canary; a site of more needs one, or `deploy.withoutCanary = "<reason>"`.

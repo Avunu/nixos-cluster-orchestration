@@ -61,13 +61,6 @@
 
   # Read by a node that does not opt out (tests/fixtures/secure).
   security = {
-    tang = {
-      url = "http://10.40.0.1:7500";
-      # Not a key anyone holds: the sha256 of the word "fixture", as a thumbprint.
-      thumbprints = [ "8W0F7GspJI0sYa2x6SY_eOT3us4blVAUotF4cs_kBk0" ];
-      vlanId = 40;
-      subnet = "10.40.0.0/28";
-    };
     initrdSshPort = 2222;
     nomadTlsRotation = 0;
   };

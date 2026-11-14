@@ -2,9 +2,9 @@
 guided menu and the `avc <group> <action>` subcommands are generated.
 
 An action is a plain function `fn(ctx, **args)`. Its arguments are declared
-with `Arg`; on the command line they are positionals or flags, and in the menu
-any that are missing are asked for — chosen from `choices(ctx)` when there is
-a fixed set (apps, nodes, generators), typed otherwise.
+with `Arg`; on the command line they are positionals, flags or options, and in
+the menu any that are missing are asked for — chosen from `choices(ctx)` when
+there is a fixed set (apps, nodes, generators), typed otherwise.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ class Arg:
     choices: Callable[[Ctx], list[str]] | None = None
     flag: bool = False  # a boolean --switch instead of a value
     optional: bool = False  # positional that may be left out (default None)
+    option: bool = False  # a --name VALUE that may be left out (default None)
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ class Action:
                 continue
             if a.flag:
                 values[a.name] = bool(values.get(a.name))
-            elif a.optional:
+            elif a.optional or a.option:
                 values[a.name] = None
             elif a.choices is not None:
                 options = a.choices(ctx)

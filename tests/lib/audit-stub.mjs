@@ -23,7 +23,6 @@ const kv = new Map();
 const env = {
   CLUSTER_NAME: "vm-test",
   AUDIT_TOKENS: process.env.AUDIT_TOKENS,
-  TANG_CLIENTS: process.env.TANG_CLIENTS || "{}",
   CF_EMAIL_TOKEN: "stub",
   ACCOUNT_ID: "stub",
   ALERT_FROM: "alerts@example.com",
@@ -31,8 +30,6 @@ const env = {
   WATCHDOG: {
     get: async (k) => kv.get(k) ?? null,
     put: async (k, v) => void kv.set(k, v),
-    delete: async (k) => void kv.delete(k),
-    list: async ({ prefix }) => ({ keys: [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })) }),
   },
   // Write-only, as the Worker uses it.
   AUDIT: { put: async (key, value) => record("audit.jsonl", { key, value: JSON.parse(value) }) },

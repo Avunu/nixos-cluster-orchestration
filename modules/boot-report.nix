@@ -4,7 +4,7 @@
 # (modules/boot-report.py says what it reads and why). It writes boot_report.prom for the
 # alerts in lib/alert-rules.nix's `boot` group, and, when the audit trail is on, a boot
 # event into its spool (modules/audit-ship-core.nix) for the Worker, which mails a
-# FIRING for a boot that was not a clean Clevis unlock under Secure Boot.
+# FIRING for a boot that was not a clean TPM unlock under Secure Boot.
 #
 # A node that opted out (insecurePlaintextBoot, so cluster.boot.enable is false) has no
 # unlock to report: it writes cluster_boot_insecure_optout 1 and the report's
@@ -44,7 +44,7 @@ in
       type = types.int;
       default = builtins.length (lib.attrNames config.boot.initrd.luks.devices);
       defaultText = lib.literalExpression "the number of boot.initrd.luks.devices";
-      description = "LUKS legs Clevis must answer for the boot to count as a Clevis unlock.";
+      description = "LUKS legs the TPM must open for the boot to count as a TPM unlock.";
     };
 
     script = mkOption {
@@ -61,11 +61,12 @@ in
     systemd.services.cluster-boot-report = {
       description = "Report how this boot unlocked (metrics, audit event)";
       wantedBy = [ "multi-user.target" ];
-      # The initrd's journal, with Clevis's lines and any initrd SSH login in it.
+      # The initrd's journal, with each leg's unlock and any initrd SSH login in it.
       after = [ "systemd-journal-flush.service" ];
       # Once per boot. A switch must not send a second boot event, or fail on this.
       restartIfChanged = false;
       environment = {
+        LUKS_NAMES = lib.concatStringsSep " " (lib.attrNames config.boot.initrd.luks.devices);
         EXPECTED_DEVICES = toString cfg.expectedDevices;
         OPTED_OUT = if cfg.optedOut then "1" else "";
         NODE = config.cluster.audit.node;

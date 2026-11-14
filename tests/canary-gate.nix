@@ -29,7 +29,7 @@ let
   reportSeries = [
     "cluster_boot_report_timestamp_seconds"
     "cluster_boot_unlock_passphrase"
-    "cluster_boot_unlock_clevis_devices"
+    "cluster_boot_unlock_tpm_devices"
     "cluster_boot_unlock_expected_devices"
   ];
   reportText = builtins.readFile ../modules/boot-report.py;
@@ -106,16 +106,16 @@ pkgs.testers.runNixOSTest {
           RemainAfterExit = true;
         };
         script = ''
-          unlock=$(cat /var/lib/canary-gate-unlock 2>/dev/null || echo clevis)
+          unlock=$(cat /var/lib/canary-gate-unlock 2>/dev/null || echo tpm)
           if [ "$unlock" = none ]; then exit 0; fi
-          if [ "$unlock" = clevis ]; then p=0; n=2; else p=1; n=0; fi
+          if [ "$unlock" = tpm ]; then p=0; n=2; else p=1; n=0; fi
           M=/var/lib/prometheus-node-exporter-text
           mkdir -p "$M"
           printf '%s\n' \
             "cluster_boot_report_timestamp_seconds $(date +%s)" \
             "cluster_boot_insecure_optout 0" \
             "cluster_boot_unlock_passphrase $p" \
-            "cluster_boot_unlock_clevis_devices $n" \
+            "cluster_boot_unlock_tpm_devices $n" \
             "cluster_boot_unlock_expected_devices 2" >"$M/boot_report.prom"
         '';
       };
@@ -305,14 +305,14 @@ pkgs.testers.runNixOSTest {
             )
 
         with subtest("stale-report-vouches-for-nothing"):
-            # A clean Clevis report, but from an earlier boot: this boot's report failed or
+            # A clean TPM report, but from an earlier boot: this boot's report failed or
             # has not run, and the file under /var/lib outlives the reboot. Its timestamp is
             # all that says it is not about this stack.
             canary.succeed(
                 "printf '%s\\n' "
                 "\"cluster_boot_report_timestamp_seconds $(( $(date +%s) - 3600 ))\" "
                 "'cluster_boot_insecure_optout 0' 'cluster_boot_unlock_passphrase 0' "
-                "'cluster_boot_unlock_clevis_devices 2' 'cluster_boot_unlock_expected_devices 2' "
+                "'cluster_boot_unlock_tpm_devices 2' 'cluster_boot_unlock_expected_devices 2' "
                 "> /var/lib/prometheus-node-exporter-text/boot_report.prom"
             )
             boot_canary_into(bumped_c, "none")
@@ -321,7 +321,7 @@ pkgs.testers.runNixOSTest {
             rc = tick(follower, bumped_f)
             control(
                 "stale-report-vouches-for-nothing",
-                "cluster_boot_unlock_clevis_devices 2" in report
+                "cluster_boot_unlock_tpm_devices 2" in report
                 and m.get("cluster_deploy_canary_unproven") == "1"
                 and not published(key_b)
                 and logged(canary, "cluster-deploy-canary-publish.service", "no boot report from this boot") >= 1
@@ -332,7 +332,7 @@ pkgs.testers.runNixOSTest {
             )
 
         with subtest("canary-reboot-publishes"):
-            boot_canary_into(bumped_c, "clevis")
+            boot_canary_into(bumped_c, "tpm")
             m = metrics(canary, PUBLISH)
             marker = {}
             if published(key_b):

@@ -1,6 +1,6 @@
 # Reading a boot report, on the target and at the audit receiver. Spliced before the
 # script of the boot tests that check it (boot-install, boot-fallback), after the boot
-# harness. The receiver is the real Worker on the tang VM (tests/lib/audit-stub.mjs).
+# harness. The receiver is the real Worker on the peer VM (tests/lib/audit-stub.mjs).
 import json
 
 AUDIT_OUT = "/var/lib/audit-stub"
@@ -28,7 +28,7 @@ def this_boot():
 
 def stored(kind):
     """What the Worker put in its trail, of one kind, oldest first."""
-    _, out = tang.execute(f"cat {AUDIT_OUT}/audit.jsonl 2>/dev/null")
+    _, out = peer.execute(f"cat {AUDIT_OUT}/audit.jsonl 2>/dev/null")
     return [o["value"] for o in map(json.loads, out.splitlines()) if o["value"].get("kind") == kind]
 
 
@@ -46,11 +46,11 @@ def delivered_boot_event(boot_id, timeout=180):
 
 def refused_requests():
     """Requests the Worker answered with anything but 204, for the detail of a failure."""
-    _, out = tang.execute(f"cat {AUDIT_OUT}/requests.jsonl 2>/dev/null")
+    _, out = peer.execute(f"cat {AUDIT_OUT}/requests.jsonl 2>/dev/null")
     return [r for r in map(json.loads, out.splitlines()) if r.get("status") != 204]
 
 
 def last_email():
     """The subject of the Worker's last email, for the record."""
-    _, out = tang.execute(f"tail -n 1 {AUDIT_OUT}/emails.jsonl 2>/dev/null")
+    _, out = peer.execute(f"tail -n 1 {AUDIT_OUT}/emails.jsonl 2>/dev/null")
     return json.loads(out).get("subject") if out.strip() else None

@@ -14,10 +14,10 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 
 ## Architecture
 
-- **The topology is the single source of truth.** Nodes, VLANs, addressing, object storage, the Tang server and role tags are one plain Nix attrset. Every module derives its networkd units, nftables ruleset, Nomad settings, quorum membership and Prometheus targets from it.
+- **The topology is the single source of truth.** Nodes, VLANs, addressing, object storage and role tags are one plain Nix attrset. Every module derives its networkd units, nftables ruleset, Nomad settings, quorum membership and Prometheus targets from it.
 - **clan-core is the fleet substrate.** It owns the machine registry, role assignment, the secret lifecycle (`vars`) and bare-metal install. It has no analogue for the orchestration below, which this library owns. The clan inventory is a mechanical projection of the topology.
 - **Bootstrap is push, steady state is pull.** `clan machines install` installs a node (through `avc boot install`, see [Installing a node](#installing-a-node)). After that, every node rebuilds itself from your flake on a timer (`modules/pull-deploy.nix`), so deploying means pushing a commit.
-- **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the disk key is released only to that signed boot with the Tang server reachable. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
+- **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the TPM releases the disk key only to that signed boot. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
 - **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it.
 - **Ingress is a tunnel per app, over a unix socket.** Each container runs its own `cloudflared` against a unix socket. See [Ingress](#ingress).
 - **Storage has two tiers.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories. JuiceFS over S3 (`modules/storage-juicefs.nix`) holds shared state that follows an app between nodes. The volume is encrypted, and every mount refuses one that is not.
@@ -100,7 +100,7 @@ export NOMAD_TOKEN=$(cat /run/nomad-tokens/avc)   # read, restart, logs: the eve
 
 ### Assumptions about the hardware
 
-The network modules were written for bare-metal hosts on OVHcloud's model, and some comments still describe it: a WAN NIC with an off-subnet gateway on both address families, a routed /64 with no router advertisements, and a second NIC trunking tagged private VLANs (`vrackInterface`). Another provider fits if it offers the same shape. Each node needs two NVMe disks for the ZFS mirror (`lib/mk-disk-layout.nix`, `nodes.<n>.disks`), UEFI with Secure Boot that can enter Setup Mode, and a TPM 2.0. The Tang server is a separate small machine on a private VLAN of its own that the nodes reach only from their initrd.
+The network modules were written for bare-metal hosts on OVHcloud's model, and some comments still describe it: a WAN NIC with an off-subnet gateway on both address families, a routed /64 with no router advertisements, and a second NIC trunking tagged private VLANs (`vrackInterface`). Another provider fits if it offers the same shape. Each node needs two NVMe disks for the ZFS mirror (`lib/mk-disk-layout.nix`, `nodes.<n>.disks`), UEFI with Secure Boot that can enter Setup Mode, and a TPM 2.0.
 
 ## The interface
 
@@ -157,7 +157,6 @@ Other exports:
 | `lib.mkOpsIndex { clan, topology; }` | What `avc` reads, exposed as your flake's `opsIndex`. |
 | `lib.net`, `lib.juicefs`, `lib.backupTarget`, `lib.mkAppContainer`, `lib.nomad` | The pure helpers the modules use. |
 | `nixosModules.*` | The modules. They read `topology`, `clusterLib` and `clusterSite` from `specialArgs`, which `mkCluster` provides. |
-| `nixosModules.tangServer` | The Tang server's module, for the Tang host's own repository. Not part of `mkCluster`: it needs no topology, clan or cluster arguments. See [The Tang server](#the-tang-server). |
 | `packages.avc`, `devShells.default` | The operations tool, and a shell with `avc`, `clan`, `nomad`, `juicefs`, `age` and friends. |
 | `templates.default` | The consumer flake skeleton. |
 | `nixosConfigurations`, `clanInternals`, `opsIndex` | The **fixture** cluster's, for this repository's checks. Yours come from your own `mkCluster` call. |
@@ -179,59 +178,29 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | Where data is | How it is protected |
 | --- | --- |
 | Both disks | LUKS2 on each leg of the ZFS mirror (`crypt-a`, `crypt-b`); evaluation refuses a vdev that is not on dm-crypt, and `PoolVdevNotEncrypted` checks it at run time. Swap takes a random key every boot. The ESPs are plaintext and hold the signed boot files, public values, and one secret: the initrd's SSH host key, inside the initrd (see [Residual risks](#residual-risks)). |
-| The disk key | Clevis, two shares of two (`sss`, t=2): the Tang server, reachable only from the initrd over a VLAN of its own, and the TPM sealed to PCR 7, which records Secure Boot's state and keys. Neither alone unlocks. |
+| The disk key | A TPM2 key slot on each leg, enrolled with `systemd-cryptenroll` and sealed to PCR 7, which records Secure Boot's state and keys. The TPM is the one unattended factor: see [Residual risks](#residual-risks). |
 | The boot | Secure Boot through Lanzaboote, with keys made on the node at install and never copied off it (`/var/lib/sbctl`, on the encrypted root). No Microsoft keys by default: option ROMs this boot measured are enrolled by hash. |
 | A swapped volume | A per-node secret on the encrypted root whose hash is compiled into the signed initrd. The initrd checks it before it mounts anything from the pool, and halts on a mismatch, so a forged disk with copied identifiers gets nothing. |
-| The emergency shell | Protected by a hashed password, and entering it first extends PCR 7 with a burn, so the TPM refuses its share for the rest of that boot. |
+| The emergency shell | Protected by a hashed password, and entering it first extends PCR 7 with a burn, so the TPM refuses the disk key for the rest of that boot. |
 | The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount and the metadata node refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
 | Logs | Loki keeps its store on the `metrics` node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
 | Backups | restic, with each app's repository at a salted hash of its name. |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
 
-Unattended unlock needs no person, and never stands in one's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`), in parallel with Clevis. If Tang is down or the TPM refuses, the node waits at the prompt.
+Unattended unlock needs no person and no network, and never stands in a person's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
 
-Two independent records watch this from outside: each node's **boot report** (`modules/boot-report.nix`: how it unlocked, Secure Boot state, PCR 7, initrd SSH logins) becomes metrics and alerts, and an **off-host audit trail** sends boots, deploys, SSH logins, Nomad ACL changes, canary hits and Tang's own key releases to a Cloudflare Worker that only appends (see [Audit trail](#audit-trail)). A Tang release with no boot report after it is an email: someone may be trying the real hardware.
-
-### The Tang server
-
-Tang holds the network share. It runs on a separate small machine that no node and no person uses for anything else, from its own private repository that imports `nixosModules.tangServer`:
-
-```nix
-{
-  imports = [ cluster.nixosModules.tangServer ];
-  cluster.tangServer = {
-    privateInterface = "ens4";            # the Tang VLAN: the only interface Tang listens on
-    publicInterface = "ens3";             # the only interface SSH answers on
-    allowedClients = [ "10.40.0.0/28" ];  # security.tang.subnet
-    pinnedThumbprints = [ ];              # empty only until `tang-keys init`
-    # port = 7654;
-    monitor = {
-      heartbeatUrl = "https://watchdog.example.com/event";
-      eventUrl = "https://watchdog.example.com/event";
-      tokenFile = "/var/lib/tang-monitor/token";   # delivered out of band
-    };
-  };
-}
-```
-
-- `tang-keys init` makes the first keys and prints the signing key's thumbprint. Pin it here and in the site's `security.tang.thumbprints`. The cluster learns only the URL and the thumbprints.
-- A guard runs before every connection and refuses to answer when tangd would mint new keys by itself: an empty key directory, only hidden keys, corrupt or 0-byte key files, or a pinned key missing. Without it, `/adv` answers 200 signed by keys no node is bound to, and every node's next boot needs its passphrase.
-- **Never run stock `tangd-rotate-keys` as root.** It leaves root-owned keys tangd can't read, and tangd then mints its own. Use `tang-keys rotate-begin` and `tang-keys rotate-finish` (see [Tang rotation](#tang-rotation)). `tang-keys list` shows what is there.
-- A self-probe fetches `/adv` every 5 minutes, verifies its signature against the pinned thumbprints, and posts `tang_probe` to the Worker; silence for 20 minutes is an email. That proves Tang is alive, not that a node's path to it works: only a real reboot proves that, so reboot the canary node now and then.
-- Each `/rec` tangd answers is posted to the Worker as `tang_rec`, so every key release is on the audit trail. The Worker's `AUDIT_TOKENS` needs the Tang host's entry: `"<its token>": {"sender": "tang", "kinds": ["tang_rec", "tang_probe"]}`.
-- Don't back up Tang's keys. A provider snapshot of the Tang machine is one of the two shares, which is why there are two.
+Two records watch this: each node's **boot report** (`modules/boot-report.nix`: how it unlocked, Secure Boot state, PCR 7, initrd SSH logins) becomes metrics and alerts, and an **off-host audit trail** sends boots, deploys, SSH logins, Nomad ACL changes and canary hits to a Cloudflare Worker that only appends (see [Audit trail](#audit-trail)). Both are the node's own account. Nothing off the node sees a disk key released, so a machine that boots where it reaches neither leaves no record: see [A node left your control](#a-node-left-your-control).
 
 ### What the private repository holds
 
 | Thing | Where | Notes |
 | --- | --- | --- |
-| Topology, apps, hosts | `topology.nix`, `apps/`, `hosts/` | Including `security.tang.thumbprints`, copied from the Tang host after `tang-keys init`. |
+| Topology, apps, hosts | `topology.nix`, `apps/`, `hosts/` | The site's description, in plain Nix. |
 | Vars ciphertext and public values | `secrets/`, `vars/` | See [Secrets](#secrets). `git add` and commit them before any install: flakes only see tracked files, and `avc boot preflight` refuses uncommitted vars. |
 | Age recipients | `recipients` in `flake.nix` | The operators, plus one **offline** recipient that exists only on paper or sealed media. After adding a recipient, run `clan vars fix <machine>` for each machine (`avc secrets fix` does every one): partitioning secrets are encrypted to each machine's key, and that key to the recipients. |
 | `secrets/policy.toml` | `avc`'s rotation policy | The template's marks `luks`, `volume-identity`, `juicefs-rsa` and `restic` never, and `nomad-ca`, `nomad-jwt`, `wg-ctrl` and `juicefs-pg` manual. `avc` refuses the never-ones in code too. |
-| Nothing of Tang's | the Tang host's own repository | Tang's configuration, keys and access stay out of the site's repository entirely. |
 
-**Name a second unlocker for each site**: a second person with their own age identity in `recipients`, an SSH key in `admins`, and access to the provider's console, who has run `avc boot unlock` once. Unattended unlock depends on Tang and the TPM; a typed passphrase depends on a person.
+**Name a second unlocker for each site**: a second person with their own age identity in `recipients`, an SSH key in `admins`, and access to the provider's console, who has run `avc boot unlock` once. Unattended unlock depends on the TPM and an unchanged PCR 7; a typed passphrase depends on a person.
 
 ### The offline kit
 
@@ -246,23 +215,22 @@ With the bundle and the offline identity, `clan vars get` gives back every other
 
 ### Opting out
 
-`nodes.<n>.insecurePlaintextBoot = "<reason>"` is the one switch, per node. That node gets plain disks, systemd-boot, no Secure Boot, no Clevis, no initrd SSH and no volume identity. Every evaluation warns, the node exports `cluster_boot_insecure_optout 1`, and `BootSecurityOptedOut` fires. Nothing else changes: Nomad mTLS, the mesh, the raw_exec lockdown, default-deny and the encrypted JuiceFS volume have no opt-out.
+`nodes.<n>.insecurePlaintextBoot = "<reason>"` is the one switch, per node. That node gets plain disks, systemd-boot, no Secure Boot, no TPM binding, no initrd SSH and no volume identity. Every evaluation warns, the node exports `cluster_boot_insecure_optout 1`, and `BootSecurityOptedOut` fires. Nothing else changes: Nomad mTLS, the mesh, the raw_exec lockdown, default-deny and the encrypted JuiceFS volume have no opt-out.
 
 Like every node, an opted-out one holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) beside the age key that decrypts them, so one pulled drive of it reads every client's files and backups, whatever runs on it. The site has to say it knows: `insecureFleetKeysOnPlaintextDisk = "<reason>"` at the top level, or evaluation fails. The test fixtures opt out on every node; a real site should not.
 
-Without the opt-out, evaluation fails unless the **resulting** configuration has LUKS under the pool, Lanzaboote, Clevis, the identity check and the rest. The assertions read results, not intent: a host file that swaps the disk layout fails too.
+Without the opt-out, evaluation fails unless the **resulting** configuration has LUKS under the pool, Lanzaboote, the TPM option on every leg, the identity check and the rest. The assertions read results, not intent: a host file that swaps the disk layout fails too.
 
 ### Never
 
 - **Never `clan vars generate --regenerate` `luks` or `volume-identity` on an installed node.** A new passphrase opens nothing, and a new identity halts the node at its next boot. `avc secrets rotate` refuses both.
-- **Never `clevis luks regen`.** It hard-codes `-y` and drops the pinned thumbprint, so it trusts whatever `/adv` serves. Rebind with `avc boot bind <node> <adv-file> --replace`.
+- **Never enroll a TPM slot by hand.** A bare `systemd-cryptenroll` runs none of `cluster-boot-seal bind`'s checks (Setup Mode, the burn, a foreign authority, the identity), so it can seal to a PCR 7 that someone else can reproduce. Rebind with `avc boot bind <node> --replace`.
 - **Never bind in Setup Mode.** PCR 7 in Setup Mode is the same constant on every machine, so a seal taken then can be reproduced by anyone who clears the keys. `cluster-boot-seal bind` refuses.
-- **Never run stock `tangd-rotate-keys` as root** on the Tang host.
 - **A manual `juicefs dump` is plaintext**, file names included. The automatic dumps in the bucket are encrypted; one you take by hand is not. Keep it on an encrypted disk and delete it.
 
 ## Installing a node
 
-The order: install in Setup Mode, first boot with the passphrase, enroll the node's own keys from the running system, reboot enforcing with the passphrase, bind Clevis with a delivered Tang advertisement, reboot unattended. Each `avc boot` command runs one step and says what comes next. The sequence ran end to end in a VM, driven by the boot test harness rather than `avc` and `clan` (`checks.boot-install`); `avc boot preflight` and `clan vars generate` ran on a site made from the template; real firmware has its own [checklist](#real-hardware-checklist).
+The order: install in Setup Mode, first boot with the passphrase, enroll the node's own keys from the running system, reboot enforcing with the passphrase, bind the TPM, reboot unattended. Each `avc boot` command runs one step and says what comes next. The sequence ran end to end in a VM, driven by the boot test harness rather than `avc` and `clan` (`checks.boot-install`); `avc boot preflight` and `clan vars generate` ran on a site made from the template; real firmware has its own [checklist](#real-hardware-checklist).
 
 Three rules behind the order:
 
@@ -272,18 +240,18 @@ Three rules behind the order:
 
 ### S0. Prepare the private repository
 
-You, at your workstation, in `nix develop`, with the Tang server already running and `tang-keys init` done. The node doesn't exist yet.
+You, at your workstation, in `nix develop`. The node doesn't exist yet.
 
 ```sh
 age-keygen -o ~/.config/age/identities        # once per operator
 age-keygen -o /secure/offline-identity        # once; keep it offline, put its public key in `recipients`
-$EDITOR topology.nix                          # security.tang.*, mesh, nodes.<n>.{tangIp,initrdNicModules,disks}
+$EDITOR topology.nix                          # mesh, nodes.<n>.{initrdNicModules,disks}
 clan vars generate                            # every machine, placeholders too, so their mesh keys exist
 git add vars secrets topology.nix && git commit -m "vars"
 avc boot preflight <node>
 ```
 
-`avc boot preflight` must pass. It evaluates the node's system and disk script, so every posture assertion fires here and not on the server, and it prints the identity hash, the initrd host key's fingerprint and the Tang thumbprints for your records.
+`avc boot preflight` must pass. It evaluates the node's system and disk script, so every posture assertion fires here and not on the server, and it prints the identity hash and the initrd host key's fingerprint for your records.
 
 If it fails, nothing has touched a machine: fix and repeat.
 
@@ -312,7 +280,7 @@ avc boot unlock <node>        # types the passphrase over the initrd's SSH, port
 avc boot status <node>
 ```
 
-The prompt appears within seconds, whatever Tang does. `avc boot unlock` asks you for the passphrase (`clan vars get <node> luks/passphrase`); one passphrase opens both legs. Typing it at the console works as well. `avc boot unlock` checks the initrd's host key against the repository's copy, which protects against reaching the wrong machine by accident. It does **not** authenticate the machine: the key is readable on the ESP, so anyone who has read the ESP can impersonate the initrd. A passphrase can be typed into a tampered machine.
+Nothing is bound yet, so the prompt appears within seconds. `avc boot unlock` asks you for the passphrase (`clan vars get <node> luks/passphrase`); one passphrase opens both legs. Typing it at the console works as well. `avc boot unlock` checks the initrd's host key against the repository's copy, which protects against reaching the wrong machine by accident. It does **not** authenticate the machine: the key is readable on the ESP, so anyone who has read the ESP can impersonate the initrd. A passphrase can be typed into a tampered machine.
 
 `avc boot status` should show Setup Mode, both legs `ONLINE`, and `identity OK`.
 
@@ -338,18 +306,15 @@ avc boot status <node>        # Secure Boot: enabled (user), PCR 7 different fro
 
 Some firmware needs Secure Boot switched on by hand at this point.
 
-### S6. Bind Clevis
-
-The node's stage 2 has no route to Tang (its VLAN exists only in the initrd), so the advertisement is fetched on the Tang host and delivered:
+### S6. Bind the TPM
 
 ```sh
-ssh root@<tang-public-address> 'curl -fsS http://127.0.0.1:7654/adv' > adv.jws
-avc boot bind <node> adv.jws
+avc boot bind <node>
 ```
 
-`avc` copies the advertisement to the node and runs `cluster-boot-seal bind`, with the passphrase on stdin from `clan vars get`. It refuses unless Secure Boot is enforcing and Setup Mode is off; if PCR 7 was burned this boot (the node went through emergency mode: reboot first); unless PCR 7's event log shows only this node's own certificate (or hash entries) as the authority that let the boot run; unless the identity secret matches the hash; and unless the advertisement's signature verifies against a key in `security.tang.thumbprints`. Then for each leg it adds a Clevis slot, `sss` with t=2 over Tang and the TPM's PCR 7, and finally checks that the TPM share decrypts. The passphrase slot is never touched.
+`avc` runs `cluster-boot-seal bind` on the node, with the passphrase on stdin from `clan vars get`. It refuses unless Secure Boot is enforcing and Setup Mode is off; if PCR 7 was burned this boot (the node went through emergency mode: reboot first); unless PCR 7's event log shows only this node's own certificate (or hash entries) as the authority that let the boot run; unless the identity secret matches the hash; and if a leg is already bound. Then for each leg it enrolls a TPM2 key slot sealed to PCR 7 with `systemd-cryptenroll`, and finally checks that each slot opens. The passphrase slot is never touched.
 
-To redo it: `avc boot bind <node> adv.jws --replace` binds a new slot first and only then removes the old one, so a bad advertisement loses nothing. Always bind from a delivered advertisement: Tang answers `/adv/<thumbprint>` for hidden, retired keys too.
+To redo it: `avc boot bind <node> --replace` enrolls the new slot first and only then removes the leg's older TPM slots, so a failure loses nothing.
 
 ### S7. Third boot: nobody types
 
@@ -357,11 +322,11 @@ To redo it: `avc boot bind <node> adv.jws --replace` binds a new slot first and 
 avc boot reboot <node>
 ```
 
-`avc boot reboot` refuses unless the next boot should come back by itself: the default entry's boot contract is the running one, the default entry is not on the rollback denylist ([Rolling back](#rolling-back-a-bad-closure)), an ESP is mounted, no automated hold is set, every leg has a binding whose TPM share opens and whose Tang key is still in `security.tang.thumbprints` (`cluster-boot-seal check`), the identity secret is in place (`cluster-boot-seal identity`), and the last boot unlocked every leg through Clevis. A short Clevis count is only a note in two cases. When `avc boot bind` succeeded this boot (it moves its advertisement to `/run/adv.jws` only once the bind has returned 0; `/run` clears at boot), the last unlock was the typed one from before the binding, as at S7, and only this reboot can prove the binding; `cluster-boot-seal check` must still pass. When PCR 7 was burned this boot (emergency mode), the binding only looks broken until a reboot; a leg with no binding still refuses. Then it reboots the node and waits for a new boot.
+`avc boot reboot` refuses unless the next boot should come back by itself: the default entry's boot contract is the running one, the default entry is not on the rollback denylist ([Rolling back](#rolling-back-a-bad-closure)), an ESP is mounted, no automated hold is set, every leg has a TPM slot that opens now (`cluster-boot-seal check`), the identity secret is in place (`cluster-boot-seal identity`), and the last boot unlocked every leg from the TPM. A short TPM count is only a note in two cases. When `avc boot bind` succeeded this boot (it writes `/run/avc-boot-bound` only once the bind has returned 0; `/run` clears at boot), the last unlock was the typed one from before the binding, as at S7, and only this reboot can prove the binding; `cluster-boot-seal check` must still pass. When PCR 7 was burned this boot (emergency mode), no TPM slot can be tried, so the check says nothing about the binding and only the reboot shows it. Then it reboots the node and waits for a new boot.
 
-Expect stage 2 within about a minute, and Tang to see one `/rec` per leg. On the node: `cluster_boot_unlock_clevis_devices` equal to the number of legs, `cluster_boot_secure_boot_enabled 1`, `cluster_boot_setup_mode 0`, `cluster_tang_vlan_present 0`; and an email from the Worker, `[NOTICE] <site>: <node> booted (clevis)`.
+Expect stage 2 within about a minute. On the node: `cluster_boot_unlock_tpm_devices` equal to the number of legs, `cluster_boot_secure_boot_enabled 1`, `cluster_boot_setup_mode 0`; and an email from the Worker, `[NOTICE] <site>: <node> booted (tpm)`.
 
-If Tang is unreachable or the TPM refuses, the prompt is there: type the passphrase, then go back to S6 with `--replace` if PCR 7 changed.
+If the TPM refuses, the prompt is there: type the passphrase, then go back to S6 with `--replace`.
 
 ### S8. Attack it, then seal it
 
@@ -378,16 +343,17 @@ A freshly installed node runs generation 1, which has a boot contract and a boot
 | Event | What it takes |
 | --- | --- |
 | A kernel update, a new generation | Nothing. PCR 7 does not change. |
-| Secure Boot toggled off; db or dbx changed; the TPM cleared | The signed loader still runs, PCR 7 differs, and the TPM refuses its share: type the passphrase at the next boot (`avc boot unlock <node>`), then `avc boot bind <node> <adv-file> --replace`. |
-| A firmware update **cleared** the keys (the firmware is in Setup Mode) | Bind refuses in Setup Mode. `avc boot unlock <node>`, `avc boot enroll <node>`, reboot, `avc boot unlock <node>` again, then `avc boot bind <node> <adv-file> --replace`. |
-| The firmware restored its **factory** keys | The node's own loader is refused (Access Denied), so no prompt appears. At the BIOS: put the firmware in Setup Mode (or turn Secure Boot off), boot with the passphrase, then `avc boot enroll <node>`, reboot, unlock, `avc boot bind <node> <adv-file> --replace`. How real firmware behaves here is on the [checklist](#real-hardware-checklist). |
+| Secure Boot toggled off; db or dbx changed; the TPM cleared | The signed loader still runs, but PCR 7 differs or the TPM's seal is gone, and the TPM refuses the disk key: type the passphrase at the next boot (`avc boot unlock <node>`), then `avc boot bind <node> --replace`. |
+| A firmware update **cleared** the keys (the firmware is in Setup Mode) | Bind refuses in Setup Mode. `avc boot unlock <node>`, `avc boot enroll <node>`, reboot, `avc boot unlock <node>` again, then `avc boot bind <node> --replace`. |
+| The firmware restored its **factory** keys | The node's own loader is refused (Access Denied), so no prompt appears. At the BIOS: put the firmware in Setup Mode (or turn Secure Boot off), boot with the passphrase, then `avc boot enroll <node>`, reboot, unlock, `avc boot bind <node> --replace`. How real firmware behaves here is on the [checklist](#real-hardware-checklist). |
 | A disk died | The node boots on the other one, unattended and DEGRADED (`ZfsPoolUnhealthy`, `EspNotMounted`). See [Replacing a disk](#replacing-a-disk). |
 | The Secure Boot signing keys are lost (`/var/lib/sbctl` gone, root intact) | Every new generation fails to install (`DeployActivationFailing`), but the installed ones still boot. See [Signing keys lost, or rotated on purpose](#signing-keys-lost-or-rotated-on-purpose). |
 | The identity secret is damaged or missing | The node halts at boot (`volume-identity: MISMATCH`). See [Identity secret damaged](#identity-secret-damaged). `VolumeIdentityMissing` warns while the node is still running. |
 | An initrd authorized key must be retired, or a fix to the boot path must stick | Rotate the Secure Boot keys and rebind: [Signing keys lost, or rotated on purpose](#signing-keys-lost-or-rotated-on-purpose). Removing the key from `admins` alone is not enough (D26). |
 | The initrd's SSH host key | `avc secrets rotate` refuses it and prints the procedure: `clan vars generate <node> --generator initrd-ssh --regenerate`, then `clan vars get <node> initrd-ssh/ssh_host_ed25519_key \| ssh root@<node> install -m 0400 /dev/stdin /var/lib/initrd-ssh/ssh_host_ed25519_key`, then deploy. It takes effect at the next **new** generation; the ones already on the ESP keep the old key. |
-| Tang's keys | [Tang rotation](#tang-rotation). |
-| The Tang machine reinstalled | New keys, so no binding works any more: a node that reboots needs its passphrase. `tang-keys init`, replace the thumbprints in `security.tang.thumbprints` with the new one and deploy, then on each node, before it next reboots if you can, `avc boot bind <node> <adv-file> --replace`. Running nodes are unaffected until they reboot. Once the new thumbprints are deployed, a node not yet rebound shows `ClevisBoundToUnpinnedTang`, and `avc boot reboot` refuses it. |
+| The mainboard, or its TPM, was replaced | The new TPM holds no seal and the firmware none of the node's keys. At the BIOS: Setup Mode. Boot with the passphrase, `avc boot enroll <node>` (the keys are on the encrypted root), reboot, unlock, `avc boot bind <node> --replace`. Not rehearsed as one sequence. |
+| The machine is going back to the provider, or being retired | [Returning hardware](#returning-hardware), before it leaves. |
+| The machine left your control: stolen, seized, returned unwiped, or booted where you can't account for it | [A node left your control](#a-node-left-your-control). |
 | Everything lost | [Total loss](#total-loss). |
 
 ### Booting an older generation
@@ -396,7 +362,7 @@ The boot menu's timeout is 0, so it shows only if you press a key (hold space) a
 
 1. **At the console:** press a key as the loader starts, choose the generation. Any signed generation still on the ESP boots and unlocks unattended.
 2. **From rescue:** mount the ESPs and set `default` in `/loader/loader.conf` on both (`default nixos-generation-<n>-*.efi`, the names are in `/EFI/Linux`). `loader.conf` is not signed.
-3. **When the provider's rescue can't boot under enforcing Secure Boot:** turn Secure Boot off at the BIOS, do the above from rescue, and turn it back on. That changes PCR 7 while it is off, so expect the passphrase at the next boot and run `avc boot bind <node> <adv-file> --replace` afterwards.
+3. **When the provider's rescue can't boot under enforcing Secure Boot:** turn Secure Boot off at the BIOS, do the above from rescue, and turn it back on. That changes PCR 7 while it is off, so expect the passphrase at the next boot and run `avc boot bind <node> --replace` afterwards.
 
 ### Rolling back a bad closure
 
@@ -431,7 +397,7 @@ zpool status rpool                         # wait for "resilvered"
 mount /boot && /run/current-system/bin/switch-to-configuration boot   # signs onto both ESPs again
 ```
 
-Then bind only the new leg, from a fresh advertisement: `avc boot bind <node> adv.jws /dev/disk/by-partlabel/disk-nvme0-luks`. Not a bare `bind`, which refuses because the healthy leg is bound, and not `--replace`, which would rebind the healthy leg too. Release the hold. If the new disk enumerates differently, point `nodes.<n>.disks` at `/dev/disk/by-id/...`; the disks are in the boot contract, so that deploy waits for an approval on the node.
+Then bind only the new leg: `avc boot bind <node> --device /dev/disk/by-partlabel/disk-nvme0-luks`. Not a bare `bind`, which refuses because the healthy leg is bound, and not `--replace`, which would rebind the healthy leg too. Release the hold. If the new disk enumerates differently, point `nodes.<n>.disks` at `/dev/disk/by-id/...`; the disks are in the boot contract, so that deploy waits for an approval on the node.
 
 ### Identity secret damaged
 
@@ -454,33 +420,79 @@ Lost keys and a deliberate rotation are the same procedure. A rotation is what r
 3. On the node, move the old keys away if they still exist (`mv /var/lib/sbctl /root/sbctl.old`), then `sbctl create-keys`.
 4. `avc boot enroll <node>`.
 5. **Sign again before any reboot:** `/run/current-system/bin/switch-to-configuration boot`, which writes both ESPs. Rebooting first would leave a loader the new keys refuse.
-6. Reboot, type the passphrase, then `avc boot bind <node> <adv-file> --replace`. Delete the old keys.
+6. Reboot, type the passphrase, then `avc boot bind <node> --replace`. Delete the old keys.
 
-### Tang rotation
+### A node left your control
 
-The order matters: the Tang host's guard refuses every connection while a pinned key is missing.
+A whole machine that powers on unlocks itself: the TPM asks nobody. So when a node is stolen, seized, kept by the provider, returned without [its headers wiped](#returning-hardware), or booted somewhere you can't account for, assume it booted, and count everything on it as read. What stood in the way was the running system's logins and the attacks this design leaves [out of scope](#residual-risks), and nothing will tell you whether they held: a machine with no route to the Worker sends no boot report. Drives that left without their mainboard are a different case. They stay closed without the passphrase, and nothing here is needed for them.
 
-1. On the Tang host: `tang-keys rotate-begin`. It makes a new key pair and hides the old one (hidden keys still decrypt).
-2. Pin the new thumbprint: in the Tang host's `pinnedThumbprints` (deploy it) and in the site's `security.tang.thumbprints` (ship it, `avc deploy ship`). Thumbprints are not in the boot contract, so this needs no approval.
-3. Once every node has deployed the new thumbprint, rebind each from a freshly delivered advertisement: `avc boot bind <node> adv.jws --replace`. Then `avc boot reboot <node>`, one at a time, proves each.
-4. Unpin the old thumbprint on the Tang host and deploy; take it out of `security.tang.thumbprints` and ship that.
-5. **Before the next step, check every node.** Once a node has deployed step 4, a Clevis slot still bound to the old key fails `cluster-boot-seal check` with exit status 4, `avc boot reboot` refuses, and the boot audit raises `ClevisBoundToUnpinnedTang`. Rebind any node that shows it, as in step 3. `tang-keys rotate-finish` on the Tang host can't see the nodes, so this is the only place a node missed in step 3 shows.
-6. `tang-keys rotate-finish`, which deletes the hidden keys. It refuses while a hidden key is still pinned.
+What the node held, and what replaces it:
 
-Revoking Tang for every node at once: stop `tangd.socket`. For one node: rotate, rebind the others, and finish. Neither protects against the provider, who can read the Tang machine's disk.
+| On the node | How it is replaced |
+| --- | --- |
+| Client data: the local state of the apps homed there and, through its mount, every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
+| The machine's age key (`/etc/secret-vars/key.txt`), which decrypts that machine's vars at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
+| `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
+| `ovh-s3`, `backup-target` | New pairs from the provider, `avc secrets rotate ovh-s3` and `avc secrets rotate backup-target`, then delete the old pairs at the provider. |
+| `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
+| `nomad-gossip` on a server, `nomad-acl` on the leader, the alerting tokens on the `metrics` node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
+| `juicefs-pg` | By hand, in a window: every mount and the metadata role change together. |
+| Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
+| `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
+| `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
+
+The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
+
+**The data-bound keys.** `avc secrets rotate` refuses `juicefs-rsa` and `restic`, and goes on refusing: a new value opens nothing that exists. Here that is the purpose, so the new values are made by hand, and only once the old ones are safe. Before either procedure, compare the [offline kit](#the-offline-kit)'s `juicefs-rsa/rsa.pem`, `juicefs-rsa/rsa-passphrase` and `restic/password` with the repository's (`avc secrets reveal juicefs-rsa/rsa.pem`, and so on). The old volume and the old repositories open with those and with nothing else, and after a regeneration the repository holds them only in its history.
+
+**A new JuiceFS volume.** A volume's key can't be changed, so this is a deliberate loss of the storage tier: a new, empty volume in a new bucket, and every app back from its backup.
+
+1. `cluster-backup` on each app's home node, and look at the result (`cluster-backup-list <app>`). These snapshots are what comes back.
+2. Hold every node (`avc deploy hold <node>`), and stop the apps (`nomad job stop app-<name>`) and then `juicefs-mount` on every node.
+3. Create a new, empty bucket. In one commit: its name in `objectStorage.juicefsBucket`, and a new key from `clan vars generate <node> --generator juicefs-rsa --regenerate`. Merge it.
+4. On the `juicefs-meta` node, empty the metadata database (as `postgres`: `dropdb juicefs`, then `createdb -O juicefs juicefs`). This is the step that makes the volume new. With the old metadata still there, `juicefs-format` finds a volume it knows and keeps it, old bucket and old key.
+5. Release the `juicefs-meta` node first (`avc deploy release <node>`). `juicefs-format` finds no metadata and an empty bucket, which is a first bring-up: it formats an encrypted volume with the new key. Then release the others.
+6. With each app's container running on the new volume, `cluster-restore <app> --yes` on its home node.
+7. When every app has been checked, delete the old bucket. Until then the old volume can be read from the kit ([Restore without a node](#restore-without-a-node)).
+
+**New restic repositories**, after the restores above, which read the old ones. `restic key add` and `restic key remove` change a repository's password but not its master key, and the old password has already given that away. In one commit: a new `backup.repoSalt`, and a new password from `clan vars generate <node> --generator restic --regenerate`. A repository's path is a hash of the salt and the app's name, so every app moves to a new, empty repository, and the first backup creates it under the new password. Run `cluster-backup` for every app at once, and check each. The old repositories stay where they were, readable with the old password, until you delete them.
+
+Afterwards, put the new key, password, pairs, bucket and salt in the offline kit, with a new bundle.
+
+Two limits. A new key protects what is written from then on: whoever copied the old bucket or the old repositories while holding the old key can read that copy for good. And each step above follows from what the code does in that state (`checks.jfs-encrypted` proves `juicefs-format`'s states one at a time, `checks.backup-roundtrip` a restore), but neither migration has been rehearsed as a sequence, in a VM or on machines. Rehearse it on a scratch site before you need it.
+
+### Returning hardware
+
+Before a machine goes back to the provider or is retired, while it is still yours. Done in this order, nothing in [A node left your control](#a-node-left-your-control) is needed afterwards.
+
+1. Move its work away. For each app homed there: a last `cluster-backup <app>`, a new `homeNode`, and `cluster-restore <app> --yes` on that node ([Backups and restore](#backups-and-restore)). Its role tags go to another node first.
+2. **Wipe both LUKS headers**, on the running node, before any step that can fail or be interrupted:
+
+   ```sh
+   cryptsetup erase /dev/disk/by-partlabel/disk-nvme0-luks
+   cryptsetup erase /dev/disk/by-partlabel/disk-nvme1-luks
+   cryptsetup luksDump /dev/disk/by-partlabel/disk-nvme0-luks   # no key slot is left
+   ```
+
+   `erase` destroys every key slot, the passphrase's and the TPM's, so from here no passphrase and no TPM opens these disks. The running system still has the volume key in memory.
+3. Power it off. It can't unlock again.
+4. At the firmware, clear the TPM and the Secure Boot keys. A copy of a header made before step 2 still carries a TPM slot, which opens only on this TPM with this PCR 7. Clearing ends that, and leaves such a copy the passphrase alone.
+5. From the provider's rescue, discard both whole disks (`blkdiscard /dev/nvme0n1`, then `nvme1n1`). The ESPs are plaintext and hold the initrd's SSH host key and the emergency password's hash.
+6. Take the node out of `nodes`, ship it, and push `AUDIT_TOKENS` again without it.
+
+`checks.boot-attack` shows that a cleared TPM withholds the disk key. The header wipe is `cryptsetup`'s own and is not in the VM tests.
 
 ### Total loss
 
 All nodes gone, or a rebuild from scratch, in this order:
 
-1. The Tang server up (`tang-keys init`).
-2. The private repository from the offline kit: `git clone site-<date>.bundle site`, `AGE_KEYFILE=<offline identity>`, a new operator key added to `recipients`, and `clan vars fix <machine>` for each machine.
-3. The first node installed and sealed, S0 to S8.
-4. The JuiceFS metadata restored from the bucket with the PEM and its passphrase: the reinstalled `juicefs-meta` node does it by itself from a recent dump ([below](#when-the-juicefs-metadata-node-is-reinstalled)), or by hand ([Restore without a node](#restore-without-a-node)).
-5. Nomad bootstraps itself on the first voter, and the leader registers every job.
-6. `cluster-restore <app> --yes` per app.
+1. The private repository from the offline kit: `git clone site-<date>.bundle site`, `AGE_KEYFILE=<offline identity>`, a new operator key added to `recipients`, and `clan vars fix <machine>` for each machine.
+2. The first node installed and sealed, S0 to S8.
+3. The JuiceFS metadata restored from the bucket with the PEM and its passphrase: the reinstalled `juicefs-meta` node does it by itself from a recent dump ([below](#when-the-juicefs-metadata-node-is-reinstalled)), or by hand ([Restore without a node](#restore-without-a-node)).
+4. Nomad bootstraps itself on the first voter, and the leader registers every job.
+5. `cluster-restore <app> --yes` per app.
 
-`checks.jfs-encrypted`'s `total-loss-escrow-only` proves step 4 from the kit alone, and `checks.boot-install` the mechanism of step 3; the whole chain has not been rehearsed on real machines.
+`checks.jfs-encrypted`'s `total-loss-escrow-only` proves step 3 from the kit alone, and `checks.boot-install` the mechanism of step 2; the whole chain has not been rehearsed on real machines.
 
 ## Real hardware checklist
 
@@ -491,18 +503,17 @@ A VM can't prove these. Run each on the first real node, with canary data only, 
 - **Option ROMs, before enrollment:** from rescue, `tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurements` on each node: list every PCR 7 authority and every option ROM measured. Confirm that `cluster-boot-seal enroll` (`--tpm-eventlog`) enrolls them by hash, that the node boots with every device present (NICs, NVMe, any RAID controller or GPU), and that `avc boot bind` accepts. Repeat after a BIOS update: an option ROM whose hash changed is no longer allowed and won't run.
 - Booting from `\EFI\BOOT\BOOTX64.EFI` with no NVRAM entry, and which ESP the firmware picks after a disk swap.
 - Real PCR 7 contents and their stability across a BIOS update and a dbx update; `tpm2_eventlog` across a rescue cycle.
-- The TPM's lockout state and leftover handles; whether a TPM clear is offered.
+- The TPM's lockout state and leftover handles; whether a TPM clear is offered. Whether the TPM is a discrete chip or part of the firmware, from the board's documentation: it decides what a [bus attack](#residual-risks) can reach.
 - The provider's own signed software: its rescue with Secure Boot on (netboot, iPXE). Record what happens.
 - After install, read the raw disks: no canary. Rescue boot, a BIOS toggle, key changes: the TPM refuses. A volume swap, if the provider allows one.
 - A kernel update and a reboot: unlocks by itself.
 - `kexec` from the provider's rescue before enrollment.
 
 **Network**
-- The real NIC names and drivers in the initrd (`lspci -k`), so `initrdNicModules` is right; the Tang VLAN on the trunk.
+- The WAN NIC's real name and driver in the initrd (`lspci -k`), so `initrdNicModules` is right and `avc boot unlock` reaches the prompt.
 - Whether frames from another machine attached to the private network reach the node as they would in the test switch, and whether a spoofed source address passes.
 - **Jumbo frames, before any data:** between every pair of nodes, both ways, on every VLAN, `ping -M do -s 8972 <peer>` must pass; on the mesh, `ping -M do -s 8892 <peer mesh address>` must pass and `-s 8893` fail. Check `ip link` on the trunk and VLANs: a VLAN whose MTU the NIC refused is simply absent. Then a bulk transfer. If any of it fails, set `vlans.*.mtu = 1500`; the mesh follows to 1420.
-- That Tang answers only on its VLAN, from outside.
-- A NIC that never comes up delays Clevis, not the prompt.
+- With every cable out, the node still unlocks by itself. With the TPM refusing, the prompt still appears on the console.
 
 **Hardware**
 - The IOMMU is on: `/sys/class/iommu` is not empty (`IommuDisabled`).
@@ -520,11 +531,12 @@ A VM can't prove these. Run each on the first real node, with canary data only, 
 Accepted, and written here so they are accepted knowingly.
 
 **Out of scope.**
-- **Hardware bus attacks.** Clevis's TPM unseal uses no session encryption, so the TPM's share likely crosses the bus in clear. Against someone on the bus with the node's network position, Tang is the only barrier.
+- **Hardware bus attacks.** Nothing stands behind the TPM. `systemd-cryptsetup` unseals over an encrypted session, which should defeat a passive tap on a discrete TPM's bus; that was not tested here. There is no PIN, so someone who can reset a discrete TPM and replay the boot's measurements into it gets the disk key. A firmware TPM has no such bus, and falls with the firmware.
 - Firmware tampering, BMC compromise and memory attacks.
 - A full takeover of the provider account that boots the real system: it unlocks, and still needs a login. Nothing here defends a running system with its disk key.
 
 **Accepted with the design.**
+- **The TPM is the only unattended factor.** A whole machine, powered on anywhere, unlocks itself. Nothing on a network has to agree, and nothing off the machine sees it happen. Whoever holds it then faces the running system: its logins, and the attacks above. Drives pulled without the mainboard stay closed. So a machine that leaves your control counts as read ([A node left your control](#a-node-left-your-control)), and one that goes back gets its headers wiped first ([Returning hardware](#returning-hardware)).
 - **An older signed generation passes PCR 7 for as long as the Secure Boot keys are the same (D26, accepted by the user).** `configurationLimit` bounds only what stays on the ESP. Anyone with the disk can copy a generation off and put it back later, and `loader.conf` is unsigned, so it can be made the default. So an initrd authorized key removed from `admins` still opens every older signed initrd anyone kept, and a fix to the boot path can be undone the same way. Retiring either needs new signing keys and a rebind ([procedure](#signing-keys-lost-or-rotated-on-purpose)). The tick says so when `admins` changes. A forward-moving seal (systemd-pcrlock, or a signed PCR 11 policy) would close this, and is not built.
 - **Own Secure Boot keys only, no Microsoft keys (D27, chosen by the user).** Option ROMs are enrolled by hash from this boot's event log. An option ROM whose hash changes with a firmware update no longer runs. `bind` refuses when PCR 7 records any authority but the node's own, because anything a Microsoft-signed component lets run could replay PCR 7. `cluster.boot.enrollMicrosoftKeys = true` is a written risk acceptance: it lets the provider's Microsoft-signed rescue images run under Secure Boot, and makes binding impossible on a node with a Microsoft-signed option ROM.
 - **`loader.conf` on the ESP is unsigned.** An attacker can pick any signed entry. Production closures have no specialisations; that is asserted.
@@ -534,7 +546,6 @@ Accepted, and written here so they are accepted knowingly.
 - **An old LUKS header copy with the old passphrase stays valid** until `cryptsetup reencrypt`; changing the passphrase does not change the volume key.
 - **The passphrase's ciphertext is in git for good,** decryptable with an operator's age key or the machine's. The answer to a lost operator key is `cryptsetup reencrypt`.
 - **`allowDiscards`** shows which blocks are free.
-- **Tang's keys are readable by the provider,** and a snapshot can bring back a deleted key. That is why Tang is one of two shares.
 - **A stolen gossip key plus a server's certificate makes a Nomad voter** within about 20 seconds, with the tokens in raft state. That is why both stay off workers. Root on a server can always mint a management token.
 - **A stolen client certificate can register a Nomad client,** and the scheduler can place work on it. Job specs hold only store paths and names. A machine's pre-signed login JWTs are long-lived; retiring them means a new `nomad-jwt` signing key.
 - **A stolen `submit-job` token** (the `registrar`'s) runs code as uid 4096 on every node, with no network, and can start or stop declared containers. Nomad gives task processes supplementary group 0 (a Nomad bug): they can read what group root can, such as `/etc/sudoers`. `denied_host_gids` must never be set, because it would refuse every task. An account above uid 65535 made by hand at run time would run a task: the evaluation-time check covers configured accounts only.
@@ -561,9 +572,6 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `mesh.subnet` | Required. A /24 for the WireGuard control mesh; a node takes `<subnet base>.<index>`. |
 | `mesh.port` | UDP port on the control VLAN. Default 51820. |
 | `mesh.mtu` | Default `vlans.control.mtu - 80`: 8920 at 9000, 1420 at 1500. Asserted to fit. |
-| `security.tang.url` | `http://<ipv4>:<port>`, exactly: the initrd has no DNS. The port is the Tang host's `cluster.tangServer.port` (7654 by default). |
-| `security.tang.thumbprints` | The Tang host's signing key thumbprints, from `tang-keys init`. Public. `bind` accepts only an advertisement signed by one of these. Not in the boot contract. |
-| `security.tang.vlanId`, `security.tang.subnet` | The Tang VLAN, which exists only in the initrd, and its subnet, asserted not to overlap anything else. |
 | `security.initrdSshPort` | The initrd's SSH port. Default 2222, deliberately not 22, so its host key never meets the running system's in `known_hosts`. |
 | `security.nomadTlsRotation` | Bump to reissue every Nomad agent certificate. Default 0. |
 | `deploy.flakeUrl` | What nodes rebuild from, as `github:owner/repo`. Also how `avc` finds the deploy remote. |
@@ -572,7 +580,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
-| `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it. |
+| `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it: a new salt moves every app to a new, empty repository, which is wanted only in [A node left your control](#a-node-left-your-control). |
 | `backup.target` | `{ type; ... }`, where `type` is `s3`, `rest`, `b2` or `local` (`lib/backup-target.nix`), with `endpoint`, `bucket` and `region` for S3. Keep it away from the object storage it protects. |
 | `backup.{schedule,maintenance,verify}` | systemd `OnCalendar`, in the node's clock (UTC). |
 | `backup.retention` | `{ daily; weekly; monthly; }`. |
@@ -598,14 +606,13 @@ The attribute key under `nodes` is the machine name everywhere: the clan machine
 | `controlIp`, `storageIp` | Addresses on the control and storage VLANs. |
 | `appBridgeIp`, `appSubnet` | `br-app`'s address and the containers' subnet. |
 | `appDhcpPoolOffset`, `appDhcpPoolSize` | The containers' DHCP pool. Addresses below the offset are free for static use, such as `wpdb.address`. |
-| `tangIp` | The node's address on the Tang VLAN, inside `security.tang.subnet`. Initrd only. |
-| `initrdNicModules` | Kernel modules for both NICs in the initrd, such as `[ "igb" "mlx5_core" ]`. Not detectable at evaluation; `lspci -k` on the node names them. Required unless opted out. |
+| `initrdNicModules` | Kernel modules for the WAN NIC in the initrd, such as `[ "igb" ]`, so the passphrase can be typed over SSH. Not detectable at evaluation; `lspci -k` on the node names them. Required unless opted out. |
 | `disks` | `{ a; b; }`, the two disk devices. Default `/dev/nvme0n1` and `/dev/nvme1n1`. Use `/dev/disk/by-id/...` on hardware whose enumeration swaps. |
 | `insecurePlaintextBoot` | `"<reason>"`: the one opt-out from disk encryption and Secure Boot. See [Opting out](#opting-out). |
 | `provisioned` | `false` for a placeholder: not scraped or alerted on. Delete the line when the machine exists. |
 | `canary` | `true` on exactly one real node once the site has more than one: it takes each new boot stack first, and the others wait until it has rebooted into it (see [Deploying](#deploying)). Not a placeholder, and not an opted-out node while any node has boot security. |
 
-What an unlock depends on (the node's `initrdNicModules`, `wanInterface`, `vrackInterface`, `publicIp4`, `publicGw4`, `tangIp`, the Tang URL and VLAN, the disks and required mounts, the initrd SSH port, and a hash of `admins`) is the node's **boot contract**. A change to any of them waits for approval on each node (see [Deploying](#deploying)).
+What an unlock depends on (the node's `initrdNicModules`, `wanInterface`, `publicIp4`, `publicGw4`, the disks, how each leg is opened (its unlock options and the initrd's TPM support), the required mounts, the initrd SSH port, and a hash of `admins`) is the node's **boot contract**. A change to any of them waits for approval on each node (see [Deploying](#deploying)).
 
 | Tag | What it does |
 | --- | --- |
@@ -680,7 +687,7 @@ Odoo and Frappe databases are not initialised for you. Restore or create one aft
 
 ### First install
 
-Minimum before the first node: the Tang server running with its thumbprints, an operator age identity and the offline one in `recipients`, the topology filled in, and the `ovh-s3` and `github-token` generators. Then [Installing a node](#installing-a-node), S0 to S8:
+Minimum before the first node: an operator age identity and the offline one in `recipients`, the topology filled in, and the `ovh-s3` and `github-token` generators. Then [Installing a node](#installing-a-node), S0 to S8:
 
 ```sh
 nix develop
@@ -691,7 +698,7 @@ avc boot preflight node1
 avc boot install node1 root@<rescue-address>
 ```
 
-Then, after S5 (`avc boot unlock` and `avc boot enroll`) and before S6 and S7 (`avc boot bind`, `avc boot reboot`), deploy the [watchdog Worker](#dead-man), set `alerting.heartbeatUrl` and `alerting.auditUrl`, and push `AUDIT_TOKENS` with the Tang host's entry. S7's boot report, its Tang release and the `booted (clevis)` email that says S7 worked all go there.
+Then, after S5 (`avc boot unlock` and `avc boot enroll`) and before S6 and S7 (`avc boot bind`, `avc boot reboot`), deploy the [watchdog Worker](#dead-man), set `alerting.heartbeatUrl` and `alerting.auditUrl`, and push `AUDIT_TOKENS`. S7's boot report and the `booted (tpm)` email that says S7 worked both go there.
 
 ### Secrets
 
@@ -740,7 +747,7 @@ Rotation notes:
 - **`nomad-ca`:** regenerating reissues every machine's certificates: a hard cut, every node at once. `security.nomadTlsRotation` reissues the agent certificates alone. `NomadTlsCertExpiring` and `NomadTlsCaExpiring` warn first.
 - **`nomad-jwt`:** regenerating reissues every node's logins, and the leader's `nomad-acl-init` updates the auth method on its next switch. Manual in the policy.
 - **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots, and its mesh services retry.
-- **`audit`:** a new token must reach the Worker (`avc audit tokens | wrangler secret put AUDIT_TOKENS`, with the Tang entry added), or that node's events are refused (`AuditEventRejected`).
+- **`audit`:** a new token must reach the Worker (`avc audit tokens | wrangler secret put AUDIT_TOKENS`), or that node's events are refused (`AuditEventRejected`).
 - **`canary`:** harmless to regenerate; the next scan plants the new value.
 
 ### Deploying
@@ -773,7 +780,7 @@ ssh root@node1 rm /run/cluster-upgrade.hold          # or: avc deploy release no
 
 The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (a backup dumping a database, a restore) use one file each in `/run/cluster-upgrade.hold.d/`, so they cannot release each other, and `avc boot reboot` refuses while any is set. Keep a console open for changes to `br-wan` or the WAN stanza: on a remote machine a mistake there is a lockout.
 
-**New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, clan-core, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked by Clevis on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
+**New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, clan-core, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
 
 Bump `clan-core` alone, as one reviewable commit. It tracks clan's unstable channel, and `checks.clan-coexist` is what catches an upstream change to host configuration. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
 
@@ -836,15 +843,13 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 
 | Alert | Severity | Means |
 | --- | --- | --- |
-| `BootUnlockedByPassphrase` | critical | The last boot was unlocked by a typed passphrase, not by Clevis. Expected only after an attended recovery. |
-| `UnlockTpmShareFailing` | critical | Clevis did not unlock every leg on the last boot: fix the binding before the next reboot. |
-| `ClevisBindingMissing` | critical | A leg has no Clevis binding (after a disk replacement, until `avc boot bind ... <device>`). |
-| `ClevisBoundToUnpinnedTang` | critical | A Clevis slot is bound to a Tang key no longer in `security.tang.thumbprints`: a node not rebound after a [Tang rotation](#tang-rotation) or reinstall. Rebind before `tang-keys rotate-finish`. |
+| `BootUnlockedByPassphrase` | critical | The last boot was unlocked by a typed passphrase, not from the TPM. Expected only after an attended recovery. |
+| `UnlockTpmFailing` | critical | The TPM did not unlock every leg on the last boot: fix the binding before the next reboot. |
+| `TpmBindingMissing` | critical | A leg has no TPM binding (after a disk replacement, until `avc boot bind <node> --device <device>`). |
 | `SecureBootOff` | critical | The node booted without Secure Boot enforcing. |
 | `Pcr7Changed` | critical | PCR 7 changed within the last day: firmware, keys or Secure Boot state changed. |
 | `VolumeIdentityMissing` | critical | The identity secret is missing or wrong: the next boot would halt. |
 | `PoolVdevNotEncrypted` | critical | A vdev of `rpool` is not on dm-crypt. |
-| `TangVlanPresent` | critical | The Tang VLAN is still up in stage 2. |
 | `BootReportMissing` | critical | The node has not reported on its boot. |
 | `BootSecurityOptedOut` | critical | The node runs with `insecurePlaintextBoot`, holding the fleet's keys on a plaintext disk. |
 | `EspNotMounted` | warning | An ESP is not mounted: that disk's boot files are going stale. |
@@ -857,13 +862,13 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `DeployBlockedByBootContract` | critical | A closure changes what an unlock depends on, and waits for `/run/cluster-upgrade.approve`. |
 | `DeployRollbackHeld` | warning | A closure on the rollback list is being held back, or the node booted a non-default generation. |
 | `DeployWaitingForCanary` | warning | A new boot stack has waited a day for the canary's reboot. |
-| `CanaryBootUnproven` | warning | The canary booted without a clean Clevis unlock, so it vouches for nothing. |
+| `CanaryBootUnproven` | warning | The canary booted without a clean TPM unlock, so it vouches for nothing. |
 | `CanaryFound` | critical | The canary turned up in plaintext somewhere it must never be: find the writer. |
 | `CanaryScanStale` | warning | The canary scan has not run for 8 days. |
 | `JuiceFSVolumeNotEncrypted` | critical | A node refused a JuiceFS volume that is not encrypted. |
 | `JuiceFSUnwritable` | critical | `/mnt/jfs` is not writable. |
 | `JuiceFSProbeStale` | warning | The JuiceFS probe has not run. |
-| `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old. |
+| `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old, or a volume has gone that long without writing its first. |
 | `AuditDeliveryStale` | warning | Audit events are held on the node, undelivered. |
 | `AuditProducerStale` | warning | An audit producer (sender, journal follower, Nomad stream) has stopped working. |
 | `AuditNomadStreamRefused` | warning | Nomad's ACL event stream refuses the audit follower. |
@@ -912,9 +917,7 @@ wrangler kv namespace create WATCHDOG          # put the printed id in wrangler.
 wrangler r2 bucket create <bucket_name in wrangler.toml>   # the audit trail; add a bucket lock rule
 clan vars get <metrics node> alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
 wrangler secret put CF_EMAIL_TOKEN             # the Email-Sending-only token
-avc audit tokens                               # add the Tang host's entry, then:
-wrangler secret put AUDIT_TOKENS               # paste the JSON
-avc audit tang-clients | wrangler secret put TANG_CLIENTS
+avc audit tokens | wrangler secret put AUDIT_TOKENS
 wrangler deploy
 ```
 
@@ -922,7 +925,7 @@ Then set `alerting.heartbeatUrl` to its `/heartbeat` URL and `alerting.auditUrl`
 
 #### Audit trail
 
-Each node sends events to the Worker's `/event`, with its own `audit/token`, from a spool on the node that survives outages: `boot` (the boot report: unlock method, devices, initrd SSH logins, Secure Boot, PCR 7, generation), `deploy` (each tick's result), `ssh_login`, `nomad_acl` (token and policy changes, from the leader) and `canary` (a hit). The Tang host sends `tang_rec` (each key release) and `tang_probe` (its heartbeat). The Worker accepts only the fields each kind's schema names, each required, from a token allowed that kind, and stores each event in the R2 bucket before it emails: it can append, never read or delete. It emails each boot (`[NOTICE]` for a clean Clevis boot, `[FIRING]` otherwise), each refused `/rec`, a Tang release with no boot report after it within 15 minutes, and a silent Tang probe.
+Each node sends events to the Worker's `/event`, with its own `audit/token`, from a spool on the node that survives outages: `boot` (the boot report: unlock method, devices, initrd SSH logins, Secure Boot, PCR 7, generation), `deploy` (each tick's result), `ssh_login`, `nomad_acl` (token and policy changes, from the leader) and `canary` (a hit). The Worker accepts only the fields each kind's schema names, each required, from a token allowed that kind, and stores each event in the R2 bucket before it emails: it can append, never read or delete. It emails each boot: `[NOTICE]` when the report says every leg unlocked from the TPM under enforcing Secure Boot, `[FIRING]` otherwise. The report is the node's own account, so a clean one is a notice to read, not proof.
 
 Lock the R2 bucket against deletion with a bucket lock rule, so a stolen Cloudflare token cannot rewrite history either. How long to keep events is the site's decision ([Defaults awaiting a decision](#defaults-awaiting-a-decision)); until a rule says otherwise, they are kept. The sender is strict about TLS: a private CA in front of the Worker needs proper CA extensions.
 
@@ -975,15 +978,14 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | --- | --- |
 | `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets and audit flows. |
 | `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
-| `docs` | This README against the code: every check has a row here, every `avc`, `cluster-boot-seal` and `tang-keys` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
+| `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
 | `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that `clan vars generate` can read every generator of a new site. Evaluation only. |
 | `security-policy-fixture` | The posture checks that need a whole fixture system per node. |
-| `boot-closure` | What can be proven about an encrypted closure without booting it: the ESP budget, the initrd's contents (a stock Clevis fails the build), and when the boot contract moves (not on a kernel bump; on every field an unlock depends on). |
-| `boot-install` | An encrypted node installed with the real disko script, under Secure Boot with keys made on the node: unattended unlock through Tang and the TPM, bind refused in Setup Mode and for a wrong thumbprint, the Tang VLAN gone in stage 2, a second kernel and generation on both ESPs. |
-| `boot-fallback` | Tang refused, silent or dropped: the prompt within seconds, typing on serial, tty0 and SSH; wrong passphrases ask again; one leg waiting does not import the pool degraded; the boot report counts the passphrase. |
+| `boot-closure` | What can be proven about an encrypted closure without booting it: the ESP budget, the initrd's contents (one without TPM support fails the build), and when the boot contract moves (not on a kernel bump; on every field an unlock depends on). |
+| `boot-install` | An encrypted node installed with the real disko script, under Secure Boot with keys made on the node: unattended unlock from the TPM on both legs, with and without a network, bind refused in Setup Mode, one leg rebound, a second kernel and generation on both ESPs. |
+| `boot-fallback` | The TPM refuses: the prompt within seconds, typing on serial, tty0 and SSH; wrong passphrases ask again; one leg waiting does not import the pool degraded; the boot report counts the passphrase. |
 | `boot-degraded` | A dead, absent or corrupt disk boots unattended and DEGRADED; each ESP boots alone; a full or unmounted ESP refuses a new generation without writing to the root; a disk replacement onto a new LUKS leg; signing keys lost and recovered; the identity repair from rescue; no plain vdev. |
-| `boot-attack` | A swapped volume with forged identifiers halts before it can steal anything (and steals the keys with the check removed); the emergency shell burns PCR 7; a tampered initrd or unsigned loader is refused; Secure Boot off, a db certificate added, keys cleared, another signed loader or a cleared TPM all withhold the TPM share; a foreign authority in PCR 7 refuses bind. |
-| `tang-server` | The Tang host: Tang only on its private NIC and to its clients, SSH only on the public one; the key guard refuses where stock tangd would mint keys; rotation with a t=2 Clevis client; the verified probe and `/rec` events reach the real Worker. |
+| `boot-attack` | A swapped volume with forged identifiers halts before it can steal anything (and steals the keys with the check removed); the emergency shell burns PCR 7; a tampered initrd or unsigned loader is refused; Secure Boot off, a db certificate added, keys cleared, another signed loader or a cleared TPM all withhold the disk key; a foreign authority in PCR 7 refuses bind. |
 | `deploy-safety` | What a pull deploy does with a closure that fails, one whose boot contract changed, a refused one after a rollback (by hand and at boot), a held node, and a frozen PID 1 under the hardware watchdog. |
 | `canary-gate` | The staged rollout, with two VMs and the real tick and publisher: a follower waits for a new boot stack and takes an app release on the same stack at once; the canary takes the stack first; a switch and a passphrase boot publish nothing; a clean reboot publishes it and the follower then activates it; `/run/cluster-upgrade.skip-canary` is per closure; an unmounted store proves nothing either way. |
 | `nomad-pki` | Nomad's PKI without booting anything: the real generators' certificates, names, chain and validity, the gossip file, and a minted login JWT. |
@@ -1009,7 +1011,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 
-The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths clan's age backend would decrypt to, NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `tang` VM on the Tang VLAN.
+The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths clan's age backend would decrypt to, NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
 
 ### Continuous integration
 
@@ -1055,8 +1057,7 @@ These are accepted deliberately.
 6. **Backups are nightly, not point-in-time.** Local ZFS snapshots narrow that to 15 minutes, but only for losses on the node itself.
 7. **The JuiceFS metadata engine is a single point of failure.** If the `juicefs-meta` node dies, every node's `/mnt/jfs` is stranded until it returns.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
-9. **A reboot needs Tang or a person.** If the Tang server is down, every rebooting node waits at its prompt.
-10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
+9. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
 
 ## License
 

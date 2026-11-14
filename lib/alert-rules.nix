@@ -28,7 +28,7 @@ let
   days = d: toString (d * 86400);
 
   # A node that opted out of boot security (topology.nodes.<n>.insecurePlaintextBoot)
-  # has no Tang VLAN, ESP pair or hardware checks to speak of, and BootSecurityOptedOut
+  # has no ESP pair or hardware checks to speak of, and BootSecurityOptedOut
   # already says so once. Its own boot report writes cluster_boot_insecure_optout 1.
   # `unless`, not `and ... == 0`: a node whose boot report never ran must still alert.
   notOptedOut = expr: "(${expr}) unless on (instance) cluster_boot_insecure_optout == 1";
@@ -204,8 +204,9 @@ in
     {
       # What a node says about its own boot (modules/boot-report.nix, boot_report.prom)
       # and the boot security audit every 5 minutes (modules/boot-security-core.nix,
-      # boot_audit.prom). Neither alerts on cluster_boot_clevis_errors alone: a healthy
-      # boot has two, from the second leg trying the first's cached passphrase.
+      # boot_audit.prom). Nothing alerts on cluster_boot_tpm_refusals alone: a leg the TPM
+      # refused is a leg the TPM did not open, which BootUnlockedByPassphrase and
+      # UnlockTpmFailing already say.
       name = "boot";
       rules = [
         (rule {
@@ -221,8 +222,8 @@ in
           alert = "BootUnlockedByPassphrase";
           expr = "cluster_boot_unlock_passphrase == 1 and time() - cluster_boot_report_timestamp_seconds < ${days 1}";
           severity = "critical";
-          summary = "{{ $labels.instance }}: the last boot was unlocked by a typed passphrase, not by Clevis";
-          description = "If nobody typed it, someone else did. Otherwise Tang or the TPM share failed: `cluster-boot-seal check` and the boot's journal (`journalctl -b -u clevis-luks-askpass`).";
+          summary = "{{ $labels.instance }}: the last boot was unlocked by a typed passphrase, not by the TPM";
+          description = "If none of you typed it, someone else did. If one of you did, it was needed because the TPM refused (PCR 7 changed: firmware or Secure Boot keys) or a leg has no TPM binding: `cluster-boot-seal check` on the node, and the boot's journal (`journalctl -b -u 'systemd-cryptsetup@*'`).";
         })
         # A report from before this boot, or none 15 minutes in. Opted-out nodes write the
         # timestamp too, so this covers them.
@@ -240,7 +241,7 @@ in
           expr = "cluster_boot_secure_boot_enabled != 1 or cluster_boot_setup_mode != 0";
           severity = "critical";
           summary = "{{ $labels.instance }} booted without Secure Boot enforcing";
-          description = "Firmware reset or tampered with. Clevis cannot have unlocked this boot. Check the BIOS, then the README's 'Who can do what, once sealed' (Recovery), its firmware rows.";
+          description = "Firmware reset or tampered with. The TPM cannot have unlocked this boot. Check the BIOS, then the README's 'Who can do what, once sealed' (Recovery), its firmware rows.";
         })
         # Two values of PCR 7 within a day: the firmware's Secure Boot state changed.
         (rule {
@@ -248,17 +249,17 @@ in
           expr = "count by (instance) (count_over_time(cluster_boot_pcr7_info[1d])) > 1";
           severity = "critical";
           summary = "PCR 7 on {{ $labels.instance }} changed within the last day";
-          description = "Keys enrolled, cleared or added in firmware. Clevis will not unlock until the change is explained and the node rebound (`avc boot bind`).";
+          description = "Keys enrolled, cleared or added in firmware. The TPM will not unlock the disks until the change is explained and the node rebound (`avc boot bind <node> --replace`).";
         })
-        # From the boot report: every expected leg answered by Clevis. A stage-2 decrypt of
-        # the TPM share is not the producer (design D24).
+        # From the boot report: the TPM opened every expected leg. The unlock that really ran
+        # is the producer, not a trial of the TPM slot in stage 2 (design D24).
         (rule {
-          alert = "UnlockTpmShareFailing";
-          expr = "cluster_unlock_tpm_share_ok == 0";
+          alert = "UnlockTpmFailing";
+          expr = "cluster_unlock_tpm_ok == 0";
           for = "15m";
           severity = "critical";
-          summary = "{{ $labels.instance }}: Clevis did not unlock every leg on the last boot";
-          description = "The next reboot needs a human too. `cluster-boot-seal check` on the node; rebind with `avc boot bind` once the cause is known.";
+          summary = "{{ $labels.instance }}: the TPM did not unlock every leg on the last boot";
+          description = "The next reboot needs a human too. `cluster-boot-seal check` on the node; rebind with `avc boot bind <node> [--replace]` once the cause is known.";
         })
         (rule {
           alert = "RebootPendingTooLong";
@@ -282,27 +283,15 @@ in
           summary = "{{ $labels.instance }}: the volume identity secret is missing or wrong";
           description = "The next boot halts at volume-identity-check, on every generation. `cluster-boot-seal identity`; the repair is the README's 'Identity secret damaged' (Recovery).";
         })
-        # A leg with no Clevis binding holds the next boot at the prompt. A rebind in
-        # progress (unbind, then bind) is minutes, hence the `for`.
+        # A leg with no TPM binding holds the next boot at the prompt. A rebind in progress
+        # is minutes, hence the `for`.
         (rule {
-          alert = "ClevisBindingMissing";
-          expr = "cluster_boot_clevis_tokens == 0";
+          alert = "TpmBindingMissing";
+          expr = "cluster_boot_tpm_tokens == 0";
           for = "15m";
           severity = "critical";
-          summary = "{{ $labels.device }} on {{ $labels.instance }} has no Clevis binding";
-          description = "The next reboot waits for a passphrase. `avc boot bind <node> <adv> {{ $labels.device }}`.";
-        })
-        # A slot whose Tang advertisement no pinned key signed: a node nobody rebound after a
-        # Tang rotation or reinstall. It unlocks only while Tang still has that key, so the
-        # reboot after `tang-keys rotate-finish` waits at the prompt. Same `for` as above,
-        # since a --replace rebind adds the new slot before it removes the old one.
-        (rule {
-          alert = "ClevisBoundToUnpinnedTang";
-          expr = "cluster_boot_clevis_unpinned_tokens > 0";
-          for = "15m";
-          severity = "critical";
-          summary = "{{ $labels.device }} on {{ $labels.instance }} has a Clevis slot bound to a Tang key that is not pinned";
-          description = "After a Tang rotation or reinstall, this node was not rebound. `cluster-boot-seal check` on the node, then `avc boot bind <node> <adv> --replace`, before `tang-keys rotate-finish`.";
+          summary = "{{ $labels.device }} on {{ $labels.instance }} has no TPM binding";
+          description = "The next reboot waits for a passphrase. `avc boot bind <node> --device {{ $labels.device }}`.";
         })
         (rule {
           alert = "CoreDumpsNotOff";
@@ -318,13 +307,6 @@ in
           severity = "critical";
           summary = "{{ $labels.instance }} runs without boot security (insecurePlaintextBoot)";
           description = "Its disks are plaintext and it has no Secure Boot, and it holds the fleet's shared keys (JuiceFS volume key, S3, restic, backup target) beside the age key that decrypts them: one pulled drive reads every client's files and backups, whatever runs on it. Install it encrypted.";
-        })
-        (rule {
-          alert = "TangVlanPresent";
-          expr = notOptedOut "cluster_tang_vlan_present == 1";
-          severity = "critical";
-          summary = "the Tang VLAN is up in stage 2 on {{ $labels.instance }}";
-          description = "Anything running on the node can reach Tang, which is half of the disk key. vlan-teardown should have removed it; find what brought it back.";
         })
         (rule {
           alert = "EspNotMounted";
@@ -388,15 +370,15 @@ in
           for = "1d";
           severity = "warning";
           summary = "{{ $labels.instance }} has waited a day for the canary to boot a new boot stack";
-          description = "A nixpkgs, kernel, Lanzaboote, clan or library bump is held back until the canary node reboots into it and unlocks by Clevis. `avc boot reboot <canary>`, and watch it. If the canary cannot be rebooted, list the closure in /run/cluster-upgrade.skip-canary on each node instead.";
+          description = "A nixpkgs, kernel, Lanzaboote, clan or library bump is held back until the canary node reboots into it and unlocks from the TPM. `avc boot reboot <canary>`, and watch it. If the canary cannot be rebooted, list the closure in /run/cluster-upgrade.skip-canary on each node instead.";
         })
         (rule {
           alert = "CanaryBootUnproven";
           expr = "cluster_deploy_canary_unproven == 1";
           for = "15m";
           severity = "warning";
-          summary = "{{ $labels.instance }}, the canary, booted without a clean Clevis unlock, so it vouches for nothing";
-          description = "Its boot stack is not published and the other nodes keep waiting. `journalctl -u cluster-deploy-canary-publish` names the reason; fix the unlock (UnlockTpmShareFailing) and reboot the canary again.";
+          summary = "{{ $labels.instance }}, the canary, booted without a clean TPM unlock, so it vouches for nothing";
+          description = "Its boot stack is not published and the other nodes keep waiting. `journalctl -u cluster-deploy-canary-publish` names the reason; fix the unlock (UnlockTpmFailing) and reboot the canary again.";
         })
       ];
     }
@@ -570,7 +552,7 @@ in
           for = "10m";
           severity = "warning";
           summary = "newest JuiceFS metadata dump is {{ $value | humanizeDuration }} old";
-          description = "A reinstalled juicefs-meta node restores from the newest dump; older means more orphaned chunks.";
+          description = "A reinstalled juicefs-meta node restores from the newest dump; older means more orphaned chunks. On a volume that has never written one, the age counts from when the bucket was first seen without it.";
         })
       ];
     }

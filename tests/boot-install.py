@@ -52,42 +52,15 @@ def audit_metric(name):
     return found.group(1) if found else None
 
 
-def vlan_gone(name):
-    """The VLAN went with the initrd: no link, no route to Tang, and the audit agrees."""
-    rc_link, link = target.execute(f"ip link show {TANG_VLAN} 2>&1")
-    rc_ping, ping = target.execute(f"ping -c 1 -W 2 {TANG_ADDRESS} 2>&1")
-    present = audit_metric("cluster_tang_vlan_present")
-    control(
-        name,
-        rc_link != 0 and rc_ping != 0 and present == "0",
-        f"link rc={rc_link} {link.strip()}; ping rc={rc_ping}; cluster_tang_vlan_present {present}",
-    )
-
-
-def unattended(disks, firmware):
-    """A boot nobody types into: both legs from Tang and the TPM, one key recovery each.
-    Returns whether it was that, and what happened."""
-    before = rec_count()
-    booted, took = boot_unattended(disks, firmware)
-    recovered = rec_count() - before
+def unattended(disks, firmware, unplugged=False):
+    """A boot nobody types into: both legs opened from their TPM slots. Returns whether it
+    was that, and what happened."""
+    booted, took = boot_unattended(disks, firmware, unplugged=unplugged)
     status = pool_status() if booted else ""
-    detail = f"stage 2: {booted} after {took:.0f}s, {recovered} key recoveries at Tang\n{status}"
+    opened = tpm_opened_legs() if booted else []
+    detail = f"stage 2: {booted} after {took:.0f}s, legs opened by the TPM: {opened}\n{status}"
     target.log(detail)
-    return booted and recovered == 2 and both_legs_online(status), detail
-
-
-def forged_adv(adv):
-    """The pinned key's public half in the payload, the attacker's key beside it, and a
-    signature by the attacker's key alone. Everything a thumbprint check reads is genuine:
-    only the signature says this advertisement is not Tang's."""
-    path = put_adv(adv, "/run/real-adv.jws")
-    target.succeed(
-        "jose jwk gen -i '{\"alg\":\"ES512\"}' -o /run/att.jwk",
-        "jose jwk pub -i /run/att.jwk -o /run/att.pub",
-        f"jose fmt -j- -g payload -y -o- < {path} | jq -c --slurpfile a /run/att.pub '.keys += $a' > /run/forged.json",
-        "jose jws sig -I /run/forged.json -k /run/att.jwk -o /run/forged.jws",
-    )
-    return target.succeed("cat /run/forged.jws").strip()
+    return booted and opened == sorted(LUKS_DEVICES) and both_legs_online(status), detail
 
 
 DB = "/sys/firmware/efi/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f"
@@ -117,14 +90,18 @@ def audit_all():
     return target.succeed("cat /var/lib/prometheus-node-exporter-text/boot_audit.prom")
 
 
-def what_the_next_boot_needs(adv):
+def what_the_next_boot_needs():
     """`avc boot reboot` reads the bindings and the identity secret as they are now, through the
     seal tool, and the audit exports both: a leg left unbound after a disk swap holds the next
     boot at the prompt, and a deleted secret halts it. Both must show before the reboot."""
     legs = sorted(LUKS_DEVICES.items())
+
+    def tokens_in(text):
+        return {n: audit_value(text, f'cluster_boot_tpm_tokens{{device="{d}"}}') for n, d in legs}
+
     rc, out = seal_tool("check")
     text = audit_all()
-    tokens = {n: audit_value(text, f'cluster_boot_clevis_tokens{{device="{d}"}}') for n, d in legs}
+    tokens = tokens_in(text)
     control(
         "seal-check-clean-after-unattended",
         rc == 0
@@ -136,67 +113,49 @@ def what_the_next_boot_needs(adv):
 
     # A leg with no binding, as after a disk replaced and never bound.
     name, device = legs[-1]
-    slot = target.succeed(f"clevis luks list -d {device} | cut -d: -f1").split()[0]
-    target.succeed(f"clevis luks unbind -f -d {device} -s {slot}")
+    target.succeed(f"systemd-cryptenroll --wipe-slot=tpm2 {device}")
     rc, out = seal_tool("check")
     text = audit_all()
     control(
         "seal-check-sees-unbound-leg",
-        rc == 1
-        and f"{device} has no Clevis binding" in out
-        and audit_value(text, f'cluster_boot_clevis_tokens{{device="{device}"}}') == "0",
+        rc == 1 and f"{device} has no TPM binding" in out and tokens_in(text)[name] == "0",
         f"rc={rc}\n{out}\n{text}",
     )
-    rc, out = bind(adv, "--device", device)
-    control("seal-check-rebound-leg", rc == 0 and set(clevis_tokens().values()) == {1}, f"rc={rc}\n{out}")
+    rc, out = bind("--device", device)
+    control("seal-check-rebound-leg", rc == 0 and set(tpm_tokens().values()) == {1}, f"rc={rc}\n{out}")
 
-    # A slot bound to a Tang key nobody pinned, beside the good one: what a node missed in a
-    # Tang rotation keeps once the old thumbprint is unpinned. Its TPM share opens and the
-    # last boot was clean, so only the advertisement in its header says it is stale. Bound
-    # with clevis itself, because cluster-boot-seal refuses this advertisement.
-    import json
-
-    foreign = put_adv(foreign_adv(), "/run/foreign-adv.jws")
-    pin = json.dumps(
-        {
-            "t": 2,
-            "pins": {
-                "tang": [{"url": f"http://{TANG_ADDRESS}:{TANG_PORT}", "adv": foreign}],
-                "tpm2": [{"pcr_bank": "sha256", "pcr_ids": "7"}],
-            },
-        }
-    )
-
-    def slots():
-        return set(target.succeed(f"clevis luks list -d {device} | cut -d: -f1").split())
-
-    before = slots()
+    # A slot that is there and does not open: sealed to a PCR 7 that is not this firmware's,
+    # as a binding made before a firmware update is after it. The header shows one TPM slot,
+    # like the good leg's, so only asking the TPM tells. Made with systemd-cryptenroll
+    # itself, since cluster-boot-seal seals to nothing but the PCR 7 it is run under.
+    stale = "11" * 32
     target.succeed(
-        f"printf %s {shlex.quote(PASSPHRASE)} | clevis luks bind -y -k - -d {device} sss {shlex.quote(pin)}",
+        f"systemd-cryptenroll --wipe-slot=tpm2 {device}",
+        f"printf %s {shlex.quote(PASSPHRASE)} | systemd-cryptenroll --unlock-key-file=/dev/stdin "
+        f"--tpm2-device=auto --tpm2-pcrs=7:sha256={stale} {device}",
         timeout=300,
     )
-    added = slots() - before
     rc, out = seal_tool("check")
     text = audit_all()
-    unpinned = {n: audit_value(text, f'cluster_boot_clevis_unpinned_tokens{{device="{d}"}}') for n, d in legs}
     control(
-        "seal-check-sees-unpinned-tang",
-        len(added) == 1
-        and rc == 4
-        and f"{device} token" in out
-        and "not pinned" in out
-        and unpinned == {n: ("1" if d == device else "0") for n, d in legs},
-        f"added={added} rc={rc} unpinned={unpinned}\n{out}\n{text}",
+        "seal-check-sees-slot-that-does-not-open",
+        rc == 1 and f"{device}: its TPM slot does not open" in out and tokens_in(text)[name] == "1",
+        f"rc={rc}\n{out}\n{text}",
     )
-    for s in added:
-        target.succeed(f"clevis luks unbind -f -d {device} -s {s}")
-    rc, out = seal_tool("check")
-    text = audit_all()
-    unpinned = {n: audit_value(text, f'cluster_boot_clevis_unpinned_tokens{{device="{d}"}}') for n, d in legs}
+    # Bound already, so a plain bind refuses and leaves it. --replace is what puts it right,
+    # and leaves one slot on each leg.
+    rc_plain, out_plain = bind("--device", device)
+    rc, out = bind("--replace")
+    rc_check, out_check = seal_tool("check")
     control(
-        "seal-check-clean-once-the-stale-slot-goes",
-        rc == 0 and set(unpinned.values()) == {"0"} and set(clevis_tokens().values()) == {1},
-        f"rc={rc} unpinned={unpinned}\n{out}",
+        "bind-replace-renews-a-stale-slot",
+        rc_plain != 0
+        and "already bound" in out_plain
+        and rc == 0
+        and rc_check == 0
+        and set(tpm_tokens().values()) == {1},
+        f"plain: rc={rc_plain} {out_plain.strip()}; replace: rc={rc} tokens={tpm_tokens()}\n{out}\n"
+        f"check: rc={rc_check}\n{out_check}",
     )
 
     # The identity secret gone: every generation would halt at its check.
@@ -255,59 +214,9 @@ def booted_entry_kept(disks, firmware):
     power_off()
 
 
-def askpass_one_recovery_per_device():
-    """Clevis recovers a device's key from Tang once, however often the device asks. On a boot,
-    a passphrase answered for one leg lands in the keyring, the other leg drops its question to
-    try it, and Clevis's reply to that question is lost; the leg then asks again. Here the same
-    loss, made certain: a question whose asker was killed keeps its ask file, and its socket
-    refuses, so every reply to it is lost. Then a live question for the same device. One key
-    recovery at Tang in all, and the live question gets the key."""
-    device = LUKS_DEVICES["crypt-a"]
-    ask = "/run/systemd/ask-password"
-    vlan_up_by_hand()
-    before = rec_count()
-    target.succeed(
-        f"systemd-run --unit=askpass-dead systemd-ask-password --no-tty --timeout=0 "
-        f"--id=cryptsetup:{device} askpass-dead"
-    )
-    dead = target.wait_until_succeeds(f"grep -lx 'Message=askpass-dead' {ask}/ask.*", timeout=30).strip()
-    socket = target.succeed(f"sed -n 's/^Socket=//p' {dead}").strip()
-    target.succeed("systemctl kill -s KILL askpass-dead")
-    target.wait_until_fails("systemctl is-active askpass-dead", timeout=30)
-    target.succeed(f"test -e {dead} && test -S {socket}")
-
-    target.succeed(f"systemd-run --unit=askpass-test {CLEVIS_ASKPASS} -l")
-    lost = "journalctl -u askpass-test -o cat --no-pager | grep -c 'with recovered passphrase' || true"
-    target.wait_until_succeeds(f"test $({lost}) -ge 3", timeout=120)
-    target.succeed(
-        "systemd-run --unit=askpass-live -p StandardOutput=file:/run/askpass-live.out "
-        f"systemd-ask-password --no-tty --timeout=60 --id=cryptsetup:{device} askpass-live"
-    )
-    target.wait_until_succeeds("test -s /run/askpass-live.out", timeout=60)
-    target.succeed(f"systemctl stop askpass-test; rm -f {dead} {socket}")
-    time.sleep(2)
-    recovered = rec_count() - before
-    journal = target.succeed("journalctl -u askpass-test -o cat --no-pager")
-    replies_lost = int(target.succeed(lost).strip())
-
-    slot = target.succeed(f"clevis luks list -d {device} | cut -d: -f1").split()[0]
-    real = target.succeed(
-        f"clevis luks pass -d {device} -s {slot} | tr -d '\\n' | sha256sum | cut -d' ' -f1"
-    ).strip()
-    answer = target.succeed("tr -d '\\n' < /run/askpass-live.out | sha256sum | cut -d' ' -f1").strip()
-    target.succeed("rm -f /run/askpass-live.out")
-    vlan_down_by_hand()
-    control(
-        "askpass-one-recovery-per-device",
-        recovered == 1 and replies_lost >= 3 and answer == real,
-        f"{recovered} key recoveries at Tang, {replies_lost} replies lost, "
-        f"the live question {'got' if answer == real else 'did not get'} the key\n{journal}",
-    )
-
-
-def report_clevis():
+def report_tpm():
     """What the node says about the boot nobody typed into, and what the Worker stored of it:
-    both legs answered by Clevis, under enforcing Secure Boot, nobody in the initrd."""
+    both legs opened by the TPM, under enforcing Secure Boot, nobody in the initrd."""
     metrics = report_metrics()
     bid = this_boot()
     event = delivered_boot_event(bid)
@@ -316,9 +225,10 @@ def report_clevis():
     digest = pcr7().lower()
     want = {
         "cluster_boot_unlock_passphrase": "0",
-        "cluster_boot_unlock_clevis_devices": str(len(LUKS_DEVICES)),
+        "cluster_boot_unlock_tpm_devices": str(len(LUKS_DEVICES)),
         "cluster_boot_unlock_expected_devices": str(len(LUKS_DEVICES)),
-        "cluster_unlock_tpm_share_ok": "1",
+        "cluster_unlock_tpm_ok": "1",
+        "cluster_boot_tpm_refusals": "0",
         "cluster_boot_initrd_ssh_logins": "0",
         "cluster_boot_secure_boot_enabled": "1",
         "cluster_boot_setup_mode": "0",
@@ -327,14 +237,14 @@ def report_clevis():
     }
     wrong = {k: metrics.get(k) for k, v in want.items() if metrics.get(k) != v}
     control(
-        "report-clevis",
+        "report-tpm",
         not wrong
         and "cluster_reboot_pending" not in metrics
         and event is not None
         and event["sender"] == "target"
         and event["node"] == "target"
-        and event["unlock"] == "clevis"
-        and event["clevis_devices"] == len(LUKS_DEVICES)
+        and event["unlock"] == "tpm"
+        and event["tpm_devices"] == len(LUKS_DEVICES)
         and event["initrd_ssh_logins"] == 0
         and event["secure_boot"] == 1
         and event["setup_mode"] == 0
@@ -346,8 +256,8 @@ def report_clevis():
 
 
 def main():
-    tang.start()
-    tang.wait_for_unit("multi-user.target")
+    peer.start()
+    peer.wait_for_unit("multi-user.target")
     provision(inspect=installed)
 
     disks = new_case()
@@ -372,19 +282,15 @@ def main():
     journal = target.succeed("journalctl -b -o cat | grep 'volume-identity:' || true")
     control("identity-ok-first-boot", "volume-identity: OK" in journal, journal)
     setup_pcr7 = pcr7()
-    # Every boot tears the VLAN down, bound or not. Checked here, on the first, so that
-    # nothing later stands in front of it; and again after an unattended boot below.
-    vlan_gone("tang-vlan-gone-in-stage2")
 
     for esp in ("/boot", "/boot-fallback"):
         ok, out = sbctl_verified(esp)
         control(f"sbctl-verify{esp.replace('/', '-')}", ok, out)
 
     # The Setup Mode PCR 7 is the same constant on every machine, so a binding made now
-    # would open for anyone who clears the keys. A good advertisement, and still refused.
-    adv = fetch_adv()
-    rc, out = bind(adv)
-    tokens = clevis_tokens()
+    # would open for anyone who clears the keys. The right passphrase, and still refused.
+    rc, out = bind()
+    tokens = tpm_tokens()
     control(
         "bind-refused-in-setup-mode",
         rc != 0 and "refusing: SecureBoot=0 SetupMode=1" in out and set(tokens.values()) == {0},
@@ -423,42 +329,38 @@ def main():
     target.log(f"PCR 7 authority events by data length (48 is a hash, more a certificate):\n{pcr7_authorities()}")
 
     # ── S6: bind ───────────────────────────────────────────────────────────
-    # The pinned key in the payload, and somebody else's signature.
-    rc, out = bind(forged_adv(adv))
-    tokens = clevis_tokens()
+    # The passphrase is what authorises a new slot: none, or the wrong one, binds nothing.
+    rc, out = bind(passphrase="")
+    tokens = tpm_tokens()
     control(
-        "bind-refused-forged-signature",
-        rc != 0 and "signature does not verify" in out and set(tokens.values()) == {0},
+        "bind-refused-without-passphrase",
+        rc == 2 and "no passphrase on stdin" in out and set(tokens.values()) == {0},
         f"rc={rc} tokens={tokens}\n{out}",
     )
-    # Signed, well formed, and by a key nobody pinned.
-    rc, out = bind(foreign_adv())
-    tokens = clevis_tokens()
+    rc, out = bind(passphrase=WRONG)
+    tokens = tpm_tokens()
     control(
-        "bind-refused-wrong-thumbprint",
-        rc != 0 and "not signed by a pinned key" in out and set(tokens.values()) == {0},
+        "bind-wrong-passphrase-binds-nothing",
+        rc != 0 and set(tokens.values()) == {0},
         f"rc={rc} tokens={tokens}\n{out}",
     )
-    # The Tang VLAN exists only in the initrd, so stage 2 can't reach Tang, and doesn't need
-    # to: the advertisement is what the operator delivers.
-    rc_ping, ping = target.execute(f"ping -c 1 -W 2 {TANG_ADDRESS} 2>&1")
-    rc, out = bind(adv)
-    tokens = clevis_tokens()
+    # One TPM slot on each leg, and the TPM opens both here, under the PCR 7 it sealed to.
+    rc, out = bind()
+    tokens = tpm_tokens()
+    rc_tpm, answer = tpm_answer()
     control(
-        "bind-no-route-to-tang",
-        rc_ping != 0 and rc == 0 and set(tokens.values()) == {1},
-        f"ping rc={rc_ping} ({ping.strip()}); bind rc={rc} tokens={tokens}\n{out}",
+        "bind",
+        rc == 0 and set(tokens.values()) == {1} and rc_tpm == 0,
+        f"bind rc={rc} tokens={tokens}\n{out}\nTPM rc={rc_tpm}: {answer.strip()[-300:]}",
     )
     # Bound twice is refused, and the slots stay as they were.
-    rc, out = bind(adv)
-    tokens = clevis_tokens()
+    rc, out = bind()
+    tokens = tpm_tokens()
     control(
         "bind-twice-refused",
         rc != 0 and "already bound" in out and set(tokens.values()) == {1},
         f"rc={rc} tokens={tokens}\n{out}",
     )
-    # Bound, and still in the typed boot: Clevis answering a device that asks more than once.
-    askpass_one_recovery_per_device()
 
     # ── a new generation, as a deploy installs one ─────────────────────────
     newgen = target.succeed(f"readlink -f {TOPLEVEL}/specialisation/newgen").strip()
@@ -488,27 +390,11 @@ def main():
     control("generation-2-keeps-the-same-pcr7", enforcing() and pcr7() == enforcing_pcr7, pcr7())
     target.wait_for_unit("multi-user.target")
 
-    report_clevis()
-
-    vlan_gone("tang-vlan-gone-after-unattended")
-
-    # WAN and trunk are two NICs: the operator's way in on one, Tang's VLAN on the other, each
-    # from its own .network, and Tang answered over the VLAN (above).
-    journal = target.succeed("journalctl -b -o cat --no-pager | grep -E 'Configuring with' || true")
-    wanted = {
-        WAN_INTERFACE: "30-wan.network",
-        TRUNK: "35-trunk.network",
-        TANG_VLAN: f"50-{TANG_VLAN}.network",
-    }
-    configured = {
-        link: re.search(rf"^{re.escape(link)}: Configuring with \S*/{re.escape(unit)}", journal, re.M) is not None
-        for link, unit in wanted.items()
-    }
-    control("two-nics", WAN_INTERFACE != TRUNK and all(configured.values()), f"{configured}\n{journal}")
+    report_tpm()
 
     failed = target.succeed("systemctl list-units --state=failed,auto-restart --no-legend --plain")
     control("unattended-no-failed-units", failed.strip() == "", failed)
-    what_the_next_boot_needs(adv)
+    what_the_next_boot_needs()
     power_off()
 
     # Nothing about an unattended boot wears out.
@@ -518,6 +404,16 @@ def main():
         results.append((ok and pcr7() == enforcing_pcr7, detail))
         power_off()
     control("repeat-boots", all(ok for ok, _ in results), "\n".join(d for _, d in results))
+
+    # The TPM is all an unattended boot asks: the same boot with the cable out from power-on.
+    ok, detail = unattended(disks, firmware, unplugged=True)
+    carrier = target.succeed(f"cat /sys/class/net/{WAN_INTERFACE}/carrier 2>&1 || true").strip() if ok else ""
+    control(
+        "unattended-with-no-network",
+        ok and carrier == "0" and pcr7() == enforcing_pcr7,
+        f"carrier on {WAN_INTERFACE}: {carrier!r}\n{detail}",
+    )
+    power_off()
 
     # A kernel update is a new signed entry with the same signer: PCR 7 doesn't move, so the
     # binding holds. The entry is selected through the unsigned loader.conf, as anyone can.

@@ -584,12 +584,12 @@ SSH_OPTS = (
 
 
 def ssh_ready():
-    tang.succeed(f"install -m 0600 {SSH_KEY} /root/id")
+    peer.succeed(f"install -m 0600 {SSH_KEY} /root/id")
 
 
 def initrd_ssh(command, timeout=60):
     """(rc, output) of a command run in the initrd over the WAN NIC, from the peer."""
-    return tang.execute(
+    return peer.execute(
         f"ssh -n {SSH_OPTS} root@{WAN_ADDRESS} {shlex.quote(command)} 2>&1",
         timeout=timeout,
     )
@@ -607,7 +607,7 @@ def wait_initrd_ssh(timeout=60):
 
 def answer_over_ssh(password):
     """What an operator does: run the agent on a terminal and type."""
-    return tang.execute(
+    return peer.execute(
         f"(sleep 2; printf '%s\\n' '{password}'; sleep 3) | timeout 30 ssh -tt {SSH_OPTS} "
         f"root@{WAN_ADDRESS} systemd-tty-ask-password-agent --query 2>&1",
         timeout=45,
@@ -640,133 +640,124 @@ def without_drive(letter):
     return restore
 
 
-# ── Clevis, Tang and the TPM ──────────────────────────────────────────────
-
-TPM_ONLY = "/var/lib/boot-test/tpm-only.jwe"
+# ── the TPM binding ───────────────────────────────────────────────────────
 
 
-def fetch_adv():
-    """What an operator does on the Tang host: its own advertisement, over loopback. Stage 2
-    of a node has no route to Tang, which is why the advertisement is delivered."""
-    return tang.succeed(f"curl -sf http://127.0.0.1:{TANG_PORT}/adv").strip()
-
-
-def foreign_adv():
-    """A well-formed advertisement signed by keys nobody pinned: tangd itself, run once over
-    stdin on a fresh key directory."""
-    out = tang.succeed(
-        "d=$(mktemp -d); "
-        f"{TANGD_KEYGEN} $d >/dev/null; "
-        f"printf 'GET /adv HTTP/1.1\\r\\nHost: tang\\r\\n\\r\\n' | {TANGD} $d 2>/dev/null"
-    )
-    return out.split("\r\n\r\n", 1)[1].strip()
-
-
-def put_adv(adv, path="/run/adv.jws"):
-    target.succeed(f"printf %s {shlex.quote(adv)} > {path}")
-    return path
-
-
-def bind(adv, *args):
+def bind(*args, passphrase=None):
     """(rc, output) of cluster-boot-seal bind, with the passphrase on stdin as `avc boot bind`
     sends it: no final newline."""
-    path = put_adv(adv)
     extra = " ".join(shlex.quote(a) for a in args)
+    typed = PASSPHRASE if passphrase is None else passphrase
     return target.execute(
-        f"printf %s {shlex.quote(PASSPHRASE)} | cluster-boot-seal bind --adv {path} {extra} 2>&1",
+        f"printf %s {shlex.quote(typed)} | cluster-boot-seal bind {extra} 2>&1",
         timeout=300,
     )
 
 
-def clevis_tokens(machine=None):
-    """Clevis tokens per leg, read from the LUKS headers."""
+def tpm_tokens(machine=None):
+    """TPM slots per leg, read from the LUKS headers."""
     machine = machine or target
     return {
         name: int(
             machine.succeed(
                 f"cryptsetup luksDump --dump-json-metadata {device} "
-                "| jq '[.tokens[] | select(.type == \"clevis\")] | length'"
+                "| jq '[.tokens[] | select(.type == \"systemd-tpm2\")] | length'"
             ).strip()
         )
         for name, device in sorted(LUKS_DEVICES.items())
     }
 
 
-def rec_count():
-    """Key recoveries Tang has answered, so far. tangd logs one line per request."""
-    return int(tang.succeed("journalctl -o cat --no-pager | grep -c 'POST /rec/.* => 200' || true").strip())
-
-
-def vlan_up_by_hand():
-    """Stage 2 has no route to Tang. The test alone puts one back, to ask Clevis for a key."""
-    target.succeed(
-        f"ip link add link {TRUNK} name {TANG_VLAN} type vlan id {VLAN_ID}",
-        f"ip addr add {TANG_NODE_ADDRESS}/{TANG_PREFIX} dev {TANG_VLAN}",
-        f"ip link set {TRUNK} up",
-        f"ip link set {TANG_VLAN} up",
-        f"timeout 30 sh -c 'until ping -c 1 -W 1 {TANG_ADDRESS} >/dev/null; do sleep 1; done'",
+def tpm_opens(device):
+    """The shell command that asks the TPM to open one LUKS header's slot and activates
+    nothing. cryptsetup finds systemd's token plugin only when told where it is."""
+    return (
+        f"LD_LIBRARY_PATH={TPM2_PLUGINS} cryptsetup open --test-passphrase --token-only "
+        f"--token-type systemd-tpm2 {device}"
     )
 
 
-def vlan_down_by_hand():
-    target.succeed(f"ip link del {TANG_VLAN}")
-
-
-def real_keys():
-    """sha256 of the key each leg's Clevis slot opens with, from the genuine system. What a
-    stolen JWE must decrypt to for an attack to count as reproduced."""
-    keys = {}
-    vlan_up_by_hand()
-    for name, device in sorted(LUKS_DEVICES.items()):
-        slot = target.succeed(f"clevis luks list -d {device} | cut -d: -f1").split()[0]
-        keys[name] = target.succeed(
-            f"clevis luks pass -d {device} -s {slot} | sha256sum | cut -d' ' -f1"
-        ).strip()
-    vlan_down_by_hand()
-    return keys
-
-
-def tpm_only_answer():
-    """(rc, output) of the TPM's own answer to a JWE sealed to PCR 7 alone. Tang plays no part,
-    so a refusal here is the TPM's."""
-    return target.execute(f"clevis decrypt < {TPM_ONLY} 2>&1")
+def tpm_answer():
+    """(rc, output) of asking the TPM for every leg's key from stage 2. rc is 0 only when it
+    gives all of them."""
+    asks = " && ".join(tpm_opens(device) for _, device in sorted(LUKS_DEVICES.items()))
+    return target.execute(f"( {asks} ) 2>&1")
 
 
 def bound_checkpoint(sealed, sealed_firmware):
-    """S6 of the install, from an enforcing checkpoint: one typed boot, the advertisement
-    delivered, both legs bound to Tang and PCR 7. Also leaves a JWE sealed to PCR 7 alone, so
-    that later cases can ask the TPM by itself. Returns frozen disks, their firmware, the real
-    keys, and PCR 7 as it was bound."""
+    """S6 of the install, from an enforcing checkpoint: one typed boot, and both legs bound to
+    the TPM at this PCR 7. Returns frozen disks, their firmware, and PCR 7 as it was bound."""
     disks = new_case(base=sealed)
     firmware = new_firmware(sealed_firmware)
     boot(disks, firmware=firmware)
     control("bound-boot", type_until_stage2(target, serial()), "no stage 2 to bind from")
     target.wait_for_unit("multi-user.target")
-    rc, out = bind(fetch_adv())
-    control("bound", rc == 0 and set(clevis_tokens().values()) == {1}, f"rc={rc}\n{out}")
-    target.succeed(
-        "mkdir -p /var/lib/boot-test",
-        f"echo tpm-canary | clevis encrypt tpm2 '{{\"pcr_bank\":\"sha256\",\"pcr_ids\":\"7\"}}' > {TPM_ONLY}",
-    )
-    rc, out = tpm_only_answer()
-    control("bound-tpm-only-opens-here", rc == 0 and "tpm-canary" in out, out)
-    keys = real_keys()
+    rc, out = bind()
+    control("bound", rc == 0 and set(tpm_tokens().values()) == {1}, f"rc={rc}\n{out}")
+    rc, out = tpm_answer()
+    control("bound-tpm-opens-here", rc == 0, out)
     bound_pcr7 = pcr7()
     power_off()
     time.sleep(2)
-    return freeze(disks), firmware, keys, bound_pcr7
+    return freeze(disks), firmware, bound_pcr7
 
 
-def boot_unattended(disks, firmware, timeout=120):
-    """Powers on and types nothing. Returns whether stage 2 came up, and how long it took."""
+def boot_unattended(disks, firmware, timeout=120, unplugged=False):
+    """Powers on and types nothing. Returns whether stage 2 came up, and how long it took.
+    `unplugged` takes the cable out at power-on, before the firmware has run."""
     started = boot(disks, firmware=firmware)
+    if unplugged:
+        target.block()
     booted = wait_stage2(target, timeout)
     return booted, time.monotonic() - started
 
 
-def stop_tang():
-    tang.succeed("systemctl stop tangd.socket")
+# What systemd-cryptsetup logs for a leg it opened from its TPM slot, and for a TPM that
+# would not unseal. The boot report reads the same two lines (modules/boot-report.py).
+TPM_OPENED = "activated with a LUKS token"
+TPM_REFUSED = "TPM policy does not match current system state"
 
 
-def start_tang():
-    tang.succeed("systemctl start tangd.socket")
+def leg_journal(name):
+    """What systemd-cryptsetup logged for one leg on this boot, its initrd included."""
+    return target.succeed(
+        "journalctl -b -o cat --no-pager "
+        f"-u \"$(systemd-escape --template=systemd-cryptsetup@.service {name})\""
+    )
+
+
+def tpm_opened_legs():
+    """The legs this boot opened from their TPM slots, by systemd-cryptsetup's own word."""
+    return sorted(name for name in LUKS_DEVICES if TPM_OPENED in leg_journal(name))
+
+
+# ── firmware that the binding was not made under ──────────────────────────
+
+# Who owns the extra db entry. Any GUID will do.
+OTHER_GUID = "6c5b8bb0-6c9f-4b55-9d7e-2b0a3e1f4c11"
+
+
+def vars_of(firmware):
+    return firmware / "vars.fd"
+
+
+def other_cert():
+    """A second signer the firmware could be made to trust: a stand-in for Microsoft-signed
+    software, which the enrolled db already trusts on real boards."""
+    work = WORK / "other"
+    if not work.exists():
+        work.mkdir(parents=True)
+        run(
+            OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            "-subj", "/CN=another signer", "-keyout", work / "other.key", "-out", work / "other.crt",
+        )
+    return work
+
+
+def refusing_firmware(firmware):
+    """A copy of this firmware that trusts one more signer. It is the same TPM and Secure
+    Boot still enforces, but PCR 7 is another value, so the TPM gives up nothing that was
+    bound under the original."""
+    changed = new_firmware(firmware)
+    run(VIRT_FW_VARS, "--inplace", vars_of(changed), "--add-db", OTHER_GUID, other_cert() / "other.crt")
+    return changed

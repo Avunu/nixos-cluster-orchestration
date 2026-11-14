@@ -64,11 +64,13 @@ HELD_ON_THE_NODE = {
 BOUND_TO_DATA = {
     "juicefs-rsa": (
         "the JuiceFS volume's key: its PEM is in the volume's metadata, encrypted with this passphrase, and every "
-        "mount after the next restart could not open it. Changing it means a new volume"
+        "mount after the next restart could not open it. Changing it means a new volume "
+        "(README, Recovery: 'A node left your control')"
     ),
     "restic": (
         "every app's restic repository password: a new one opens none of the existing repositories (rc 12). "
-        "Per repository, `restic key add` / `restic key remove` instead"
+        "Per repository, `restic key add` / `restic key remove` instead; after a lost node, new repositories "
+        "(README, Recovery: 'A node left your control')"
     ),
 }
 

@@ -1,9 +1,9 @@
 # What someone with the disks and the firmware console can do, against a node with its own
-# keys enrolled and Clevis bound: change the unsigned parts of the ESP, read everything on it,
-# change what the firmware trusts or clear the TPM, replace the disks with their own (keeping a
-# byte copy of the ESP and the public Clevis tokens), and reach the genuine initrd's emergency
-# shell. Appendix O in the design has the mechanics. Each case is a copy-on-write overlay of one
-# enrolled node, with copies of its firmware variables and TPM.
+# keys enrolled and both legs bound to its TPM: change the unsigned parts of the ESP, read
+# everything on it, change what the firmware trusts or clear the TPM, replace the disks with
+# their own (keeping a byte copy of the ESP and of each LUKS header), and reach the genuine
+# initrd's emergency shell. Appendix O in the design has the mechanics. Each case is a
+# copy-on-write overlay of one enrolled node, with copies of its firmware variables and TPM.
 {
   pkgs,
   lib,

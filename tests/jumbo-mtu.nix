@@ -622,7 +622,8 @@ pkgs.testers.runNixOSTest {
             print(f"initrd-sets-no-mtu: {detail}")
             # The positive control: the same reading finds stage 2's.
             control("initrd-sets-no-mtu-stage2-has-them", len(INITRD["stage2"]) >= 6, detail)
-            control("initrd-sets-no-mtu", INITRD["initrd"] == [] and len(INITRD["initrdNetworks"]) >= 3, detail)
+            # The initrd has networks to read: the WAN NIC, for the passphrase over SSH.
+            control("initrd-sets-no-mtu", INITRD["initrd"] == [] and len(INITRD["initrdNetworks"]) >= 1, detail)
 
         with subtest("mesh-mtu-too-big-fails-eval, and the mesh module's other refusals"):
             for name, cases in EVAL.items():

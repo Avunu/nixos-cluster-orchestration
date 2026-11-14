@@ -12,6 +12,7 @@ generation at the console, then `avc boot rollback`.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import tempfile
 import time
@@ -31,11 +32,9 @@ if TYPE_CHECKING:
 # Written by emergency-pcr-burn in the initrd; /run outlives switch-root.
 BURN_MARKER = "/run/cluster-boot/pcr7-burned"
 TEXTFILES = "/var/lib/prometheus-node-exporter-text"
-# `avc boot bind`'s advertisement. It is uploaded under ADV_PENDING and becomes ADV_ON_NODE
-# only once `cluster-boot-seal bind` has returned 0, so its presence says that a bind
-# succeeded this boot (/run clears at boot). `avc boot reboot` relies on that.
-ADV_ON_NODE = "/run/adv.jws"
-ADV_PENDING = "/run/adv.jws.pending"
+# `avc boot bind` writes this once `cluster-boot-seal bind` has returned 0, so its presence
+# says that a bind succeeded this boot (/run clears at boot). `avc boot reboot` relies on that.
+BOUND_MARKER = "/run/avc-boot-bound"
 # New at every boot, so a node that answers with the old one has not rebooted.
 BOOT_ID = "cat /proc/sys/kernel/random/boot_id"
 
@@ -68,8 +67,7 @@ def _changed_vars(root: Path) -> list[str]:
 
 PREFLIGHT_APPLY = (
     "c: { toplevel = c.system.build.toplevel.drvPath; disko = c.system.build.diskoScript.drvPath; "
-    "identity = c.cluster.boot.identity.hash; thumbprints = c.cluster.boot.tang.thumbprints; "
-    "url = c.cluster.boot.tang.url; }"
+    "identity = c.cluster.boot.identity.hash; }"
 )
 
 
@@ -108,7 +106,6 @@ def preflight(ctx: Ctx, node: str) -> None:
     ui.ok(f"{node} evaluates: every boot security assertion holds")
     ui.say(f"volume identity hash: {facts['identity']}")
     ui.say(f"initrd host key: {_fingerprint(facts['hostKeyPub'])}")
-    ui.say(f"Tang: {facts['url']}, thumbprints {', '.join(facts['thumbprints'])}")
     ui.say("Record these with the node. Never regenerate volume-identity or luks after install.")
 
 
@@ -207,8 +204,8 @@ def enroll(ctx: Ctx, node: str) -> None:
     ui.ok(f"enrolled. Reboot, unlock by hand once (`avc boot unlock {node}`), and check `avc boot status {node}`")
 
 
-def bind_command(replace: bool, device: str | None, adv: str = ADV_PENDING) -> str:
-    cmd = f"cluster-boot-seal bind --adv {adv}"
+def bind_command(replace: bool, device: str | None) -> str:
+    cmd = "cluster-boot-seal bind"
     if replace:
         cmd += " --replace"
     if device:
@@ -218,38 +215,29 @@ def bind_command(replace: bool, device: str | None, adv: str = ADV_PENDING) -> s
     return cmd
 
 
-def bind_script(replace: bool, device: str | None, pending: str = ADV_PENDING, marker: str = ADV_ON_NODE) -> str:
-    """The bind, then the marker: the advertisement moves to `marker` only if the bind
-    returned 0, and is removed otherwise. A failed bind (an advertisement nobody pinned, a
-    burned PCR 7, a missing identity) must not leave the marker that turns `avc boot
-    reboot`'s refusal of a short Clevis count into a note. Its exit status is the bind's,
-    or the move's if that fails. The passphrase is this script's stdin, and only the bind
-    reads it."""
-    bind = bind_command(replace, device, adv=pending)
-    return (
-        f"rc=0; {bind} || rc=$?; "
-        f'if [ "$rc" = 0 ]; then mv -f {pending} {marker} || rc=$?; fi; '
-        f'if [ "$rc" != 0 ]; then rm -f {pending}; fi; exit "$rc"'
-    )
+def bind_script(replace: bool, device: str | None, marker: str = BOUND_MARKER) -> str:
+    """The bind, then the marker: `marker` is written only if the bind returned 0. A failed
+    bind (Setup Mode, a burned PCR 7, a missing identity) must not leave the marker that
+    turns `avc boot reboot`'s refusal of a short TPM count into a note. Its exit status is
+    the bind's, or the marker's if writing it fails. The passphrase is this script's stdin,
+    and only the bind reads it."""
+    bind = bind_command(replace, device)
+    return f'rc=0; {bind} || rc=$?; if [ "$rc" = 0 ]; then touch {shlex.quote(marker)} || rc=$?; fi; exit "$rc"'
 
 
 @action(
     "boot",
     "bind",
-    "Bind Clevis to Tang and PCR 7 (enforcing Secure Boot only)",
+    "Bind each LUKS leg to the TPM, sealed to PCR 7 (enforcing Secure Boot only)",
     Arg("node", "Node", choices=_nodes),
-    Arg("adv", "Tang advertisement file (curl http://127.0.0.1:<port>/adv on the Tang host)"),
-    Arg("replace", "Replace the existing binding", flag=True),
-    Arg("device", "Only this leg, e.g. after a disk replacement", optional=True),
+    Arg("replace", "Replace the existing TPM binding", flag=True),
+    Arg("device", "Only this leg, e.g. after a disk replacement", option=True),
 )
-def bind(ctx: Ctx, node: str, adv: str, replace: bool = False, device: str | None = None) -> None:
+def bind(ctx: Ctx, node: str, replace: bool = False, device: str | None = None) -> None:
     command = bind_script(replace, device)
-    advertisement = Path(adv).expanduser().read_text()
-    n = ctx.node(node)
-    n.pipe(f"install -m 0600 /dev/stdin {ADV_PENDING}", advertisement)
     # On stdin, from clan's store to the node, and nowhere in between that prints.
     passphrase = clanvars.get_value(ctx.root, node, "luks/passphrase")
-    p = n.pipe(command, passphrase, check=False, timeout=600)
+    p = ctx.node(node).pipe(command, passphrase, check=False, timeout=600)
     ui.out(p.stdout)
     if p.returncode != 0:
         raise AvcError(f"bind refused or failed ({p.returncode}): {(p.stderr or '').strip()}")
@@ -260,7 +248,7 @@ def bind(ctx: Ctx, node: str, adv: str, replace: bool = False, device: str | Non
 
 # What the next boot depends on, read now, while it can still be fixed: the boot contract,
 # the ESPs, holds, the bindings as they are on disk (`cluster-boot-seal check`: every leg
-# that is there has a Clevis slot whose TPM share opens), and the identity secret the
+# that is there has a TPM slot that opens now), and the identity secret the
 # initrd will look for. The last boot report says how the previous unlock went, which
 # says nothing about a leg bound or replaced since, or a secret deleted since. And which
 # closure the default entry is: after a rollback it is still the one rolled back from.
@@ -272,7 +260,7 @@ for e in /boot /boot-fallback; do
   if mountpoint -q "$e"; then echo "esp $e $(df --output=avail -B1 "$e" | tail -n 1 | tr -d ' ')"; else echo "esp $e unmounted"; fi
 done
 test -e {BURN_MARKER} && echo burned=yes || echo burned=no
-test -e {ADV_ON_NODE} && echo bound_this_boot=yes || echo bound_this_boot=no
+test -e {BOUND_MARKER} && echo bound_this_boot=yes || echo bound_this_boot=no
 for h in {HOLD_DIR}/*; do [ -e "$h" ] && echo "hold $(basename "$h")"; done
 if out=$(cluster-boot-seal check 2>&1); then rc=0; else rc=$?; fi
 echo "seal_check=$rc"
@@ -332,17 +320,11 @@ def reboot_verdict(text: str) -> tuple[list[str], list[str]]:
     failed = "; ".join(line.removeprefix("seal: ") for line in lines if line.startswith("seal: FAILED"))
     if seal == "1":
         refusals.append(
-            f"a leg has no Clevis binding, or the TPM refuses its share ({failed or 'cluster-boot-seal check'}): "
+            f"a leg has no TPM binding, or its TPM slot does not open ({failed or 'cluster-boot-seal check'}): "
             "the next boot would wait at the prompt. Rebind first (`avc boot bind`, with --device for one leg)"
         )
     elif seal == "3" and not burned:
         refusals.append("cluster-boot-seal check says PCR 7 was burned, and the burn marker is gone: can't tell")
-    elif seal == "4":
-        refusals.append(
-            f"a Clevis slot is bound to a Tang key that is no longer pinned ({failed or 'cluster-boot-seal check'}): "
-            "after a Tang rotation or reinstall it waits at the prompt once that key is gone. Rebind first "
-            "(`avc boot bind <node> <adv> --replace`)"
-        )
     elif seal not in ("0", "3"):
         refusals.append(f"cluster-boot-seal check could not run (rc={seal}): nothing says this node unlocks unattended")
     if _field(lines, "identity_check=") != "0":
@@ -352,24 +334,23 @@ def reboot_verdict(text: str) -> tuple[list[str], list[str]]:
             "boot. Restore it first (README, Recovery: 'Identity secret damaged')"
         )
     m = _metrics(text)
-    clevis, expected = m.get("cluster_boot_unlock_clevis_devices"), m.get("cluster_boot_unlock_expected_devices")
-    # `avc boot bind` leaves its advertisement in /run only when the bind succeeded, so it is
-    # there only if this boot was bound. Then the last unlock predates the binding: it was typed (install S5, or the
-    # recovery that needed the bind), and only this reboot can prove the new binding. The
-    # seal check above has already refused a leg that is unbound or whose TPM share fails.
+    tpm, expected = m.get("cluster_boot_unlock_tpm_devices"), m.get("cluster_boot_unlock_expected_devices")
+    # `avc boot bind` leaves its marker in /run only when the bind succeeded, so it is there
+    # only if this boot was bound. Then the last unlock predates the binding: it was typed
+    # (install S5, or the recovery that needed the bind), and only this reboot can prove the
+    # new binding. The seal check above has already refused a leg that is unbound or whose
+    # TPM slot does not open.
     bound_this_boot = "bound_this_boot=yes" in lines
-    if clevis is None or expected is None:
+    if tpm is None or expected is None:
         notes.append("no boot report on this node yet, so the last unlock's health is unknown")
-    elif clevis != expected and not burned and bound_this_boot:
+    elif tpm != expected and not burned and bound_this_boot:
         notes.append(
-            f"the last boot unlocked {clevis} of {expected} devices through Clevis, before this boot's "
+            f"the last boot unlocked {tpm} of {expected} devices from the TPM, before this boot's "
             "`avc boot bind`: this reboot is what proves the new binding"
         )
-    elif clevis != expected and not burned:
-        refusals.append(f"the last boot unlocked {clevis} of {expected} devices through Clevis: fix the binding first")
-    notes.append(
-        "Tang's own health comes from the off-host heartbeat, not from here. Only a real reboot proves this node's path to Tang."
-    )
+    elif tpm != expected and not burned:
+        refusals.append(f"the last boot unlocked {tpm} of {expected} devices from the TPM: fix the binding first")
+    notes.append("These checks ran on the booted system. Only a real reboot proves the initrd unlocks from the TPM.")
     return refusals, notes
 
 

@@ -11,8 +11,8 @@
 // State is one KV key: { lastSeen, alertedAt } (epoch ms).
 //
 // It is also where the nodes' audit trail goes (POST /event, below): boot reports,
-// SSH logins, deploys, Nomad ACL changes, canary hits, and the Tang host's key
-// recoveries, into an R2 bucket nothing here can read back.
+// SSH logins, deploys, Nomad ACL changes and canary hits, into an R2 bucket nothing
+// here can read back.
 
 export const SILENT_AFTER_MS = 20 * 60 * 1000;
 export const REPEAT_MS = 6 * 60 * 60 * 1000;
@@ -105,7 +105,7 @@ const ID = /^[A-Za-z0-9._:@=\/+-]{1,128}$/;
 const NUM = (v) => Number.isInteger(v);
 const SCHEMAS = {
   boot: {
-    node: ID, boot_id: ID, unlock: /^(clevis|passphrase|mixed)$/, clevis_devices: NUM, expected_devices: NUM,
+    node: ID, boot_id: ID, unlock: /^(tpm|passphrase|mixed)$/, tpm_devices: NUM, expected_devices: NUM,
     initrd_ssh_logins: NUM, secure_boot: NUM, setup_mode: NUM, pcr7: /^[0-9a-f]{0,64}$/, generation: NUM,
     toplevel: ID, initrd_ms: NUM, at: NUM,
   },
@@ -116,11 +116,8 @@ const SCHEMAS = {
   ssh_login: { node: ID, user: ID, from: ID, key: ID, at: NUM },
   nomad_acl: { node: ID, topic: /^(ACLToken|ACLPolicy|ACLRole)$/, type: ID, accessor: ID, name: ID, at: NUM },
   canary: { node: ID, path_class: /^(s3|esp|swap|raw|tmp|journal|coredump)$/, hits: NUM, at: NUM },
-  tang_rec: { ip: ID, kid: ID, status: NUM, at: NUM },
-  tang_probe: {},
 };
 export const MAX_BODY = 2048;
-export const REC_GRACE_MS = 15 * 60 * 1000;
 
 // Own properties only: a kind or a field named "constructor" or "__proto__" must not
 // reach Object.prototype's.
@@ -148,86 +145,31 @@ function auditKey(ev, now) {
   return `audit/${d.slice(0, 10)}/${d}-${ev.kind}-${crypto.randomUUID()}.json`;
 }
 
-// Unplanned /rec: Tang answered, and no boot report from that client's node
-// followed. Either someone is trying a rescue boot on the real hardware, or the
-// node did not get as far as reporting: both want a human.
-async function onEvent(env, ev, sender, now) {
+// A boot report is the node's own account of its unlock. Nothing off the node sees the
+// unlock, so a clean report is a NOTICE to read and not proof; anything short of every
+// leg opening from its TPM slot under Secure Boot fires.
+async function onEvent(env, ev) {
+  if (ev.kind !== "boot") return;
   const name = env.CLUSTER_NAME ?? "cluster";
-  if (ev.kind === "tang_rec") {
-    const node = JSON.parse(env.TANG_CLIENTS || "{}")[ev.ip] ?? ev.ip;
-    // Status 0: the Tang host's notifier saw a POST in tangd's log that it could not
-    // read (modules/tang-server.nix fails closed), so a release can't be ruled out.
-    const unread = ev.status === 0;
-    if (ev.status !== 200 && !(await env.WATCHDOG.get(`recrefused/${node}`))) {
-      await sendEmail(env, `[FIRING] ${name}: Tang ${unread ? "logged a POST it could not read" : "refused /rec"} from ${node}`,
-        (unread
-          ? `tangd logged a POST from ${ev.ip} that the Tang host could not parse. Treat it as a possible key release, and read tangd's journal on the Tang host.`
-          : `POST /rec/${ev.kid} from ${ev.ip} => ${ev.status}. A retired or unknown key was requested.`) + "\n\n-- cluster-watchdog");
-      await env.WATCHDOG.put(`recrefused/${node}`, "1", { expirationTtl: 3600 });
-    }
-    // Only a release is waiting for a boot: a refused /rec gave nothing away, and
-    // counting it would send "Tang released ... no boot followed" for a retired key and
-    // blame the TPM share on a passphrase boot whose real cause was that key.
-    // Keep the FIRST: clevis-luks-askpass retries about once a second while it
-    // cannot finish, and a refreshed timestamp would never reach the grace period.
-    if ((ev.status === 200 || unread) && !(await env.WATCHDOG.get(`rec/${node}`))) {
-      await env.WATCHDOG.put(`rec/${node}`, JSON.stringify({ first: now, ip: ev.ip }), { expirationTtl: 86400 });
-    }
-    return;
+  const lines = [
+    `unlock=${ev.unlock}  devices=${ev.tpm_devices}/${ev.expected_devices}  initrd_ssh=${ev.initrd_ssh_logins}`,
+    `secure_boot=${ev.secure_boot}  setup_mode=${ev.setup_mode}  pcr7=${ev.pcr7}`,
+    `generation=${ev.generation}  ${ev.toplevel}`,
+  ];
+  if (ev.unlock !== "tpm") {
+    lines.push("Not every leg opened from its TPM slot: look at PCR 7 and the TPM binding (cluster-boot-seal check on the node).");
   }
-  if (ev.kind === "boot") {
-    const rec = await env.WATCHDOG.get(`rec/${ev.node}`);
-    await env.WATCHDOG.delete(`rec/${ev.node}`);
-    const noRec = !rec;
-    const lines = [`unlock=${ev.unlock}  devices=${ev.clevis_devices}/${ev.expected_devices}  initrd_ssh=${ev.initrd_ssh_logins}`,
-      `secure_boot=${ev.secure_boot}  setup_mode=${ev.setup_mode}  pcr7=${ev.pcr7}`, `generation=${ev.generation}  ${ev.toplevel}`];
-    // The node's own claim, and Tang's independent view of the same boot.
-    if (ev.unlock === "clevis" && noRec) lines.push("WARNING: node says clevis, but Tang saw no /rec for it.");
-    if (ev.unlock !== "clevis" && !noRec) lines.push("Tang was asked, so the Tang share was available: look at the TPM share and PCR 7.");
-    if (ev.initrd_ssh_logins > 0) lines.push("Someone logged in to the initrd over SSH during this boot.");
-    const bad = ev.unlock !== "clevis" || ev.secure_boot !== 1 || ev.setup_mode !== 0 || (ev.unlock === "clevis" && noRec);
-    await sendEmail(env, `[${bad ? "FIRING" : "NOTICE"}] ${name}: ${ev.node} booted (${ev.unlock})`, lines.join("\n") + "\n\n-- cluster-watchdog");
-  }
+  if (ev.initrd_ssh_logins > 0) lines.push("Someone logged in to the initrd over SSH during this boot.");
+  lines.push("This is the node's own report; nothing off the node confirms it.");
+  const bad = ev.unlock !== "tpm" || ev.secure_boot !== 1 || ev.setup_mode !== 0;
+  await sendEmail(env, `[${bad ? "FIRING" : "NOTICE"}] ${name}: ${ev.node} booted (${ev.unlock})`, lines.join("\n") + "\n\n-- cluster-watchdog");
 }
 
 // Stored first: the trail holds the event even if the email after it fails. A sender
 // that sees the failure sends again, so a retried event can be in the trail twice.
 export async function event(env, ev, sender, now) {
   await env.AUDIT.put(auditKey(ev, now), JSON.stringify({ ...ev, sender, received: now }));
-  await onEvent(env, ev, sender, now);
-  if (ev.kind === "tang_probe") await env.WATCHDOG.put("tang_probe", JSON.stringify({ lastSeen: now }));
-}
-
-export async function checkPendingRec(env, now) {
-  const fired = [];
-  const list = await env.WATCHDOG.list({ prefix: "rec/" });
-  for (const { name } of list.keys) {
-    const raw = await env.WATCHDOG.get(name);
-    if (!raw) continue;
-    const rec = JSON.parse(raw);
-    if (now - rec.first < REC_GRACE_MS) continue;
-    const node = name.slice(4);
-    await sendEmail(env, `[FIRING] ${env.CLUSTER_NAME ?? "cluster"}: Tang released to ${node}, no boot followed`,
-      `Tang answered /rec from ${rec.ip}, and ${minutes(now - rec.first)} minutes later ${node} has not reported a boot.\n` +
-        "Check the KVM console. If nobody rebooted it, treat this as an attempt on the disk key.\n\n-- cluster-watchdog");
-    await env.WATCHDOG.delete(name);
-    fired.push(node);
-  }
-  return fired;
-}
-
-// The Tang host's self-probe (design D5) posts tang_probe; silence is the alert.
-export async function checkTangProbe(env, now) {
-  const raw = await env.WATCHDOG.get("tang_probe");
-  if (!raw) return "unarmed";
-  const st = JSON.parse(raw);
-  const silent = now - st.lastSeen;
-  if (silent < SILENT_AFTER_MS) return "ok";
-  if (st.alertedAt && now - st.alertedAt < REPEAT_MS) return "already-alerted";
-  await sendEmail(env, `[FIRING] ${env.CLUSTER_NAME ?? "cluster"}: Tang self-probe silent`,
-    `No verified /adv from the Tang host for ${minutes(silent)} minutes. The next reboot of any node will need the passphrase.\n\n-- cluster-watchdog`);
-  await env.WATCHDOG.put("tang_probe", JSON.stringify({ ...st, alertedAt: now }));
-  return "alerted";
+  await onEvent(env, ev);
 }
 
 function auditAuth(request, env) {
@@ -258,8 +200,8 @@ async function handleEvent(request, env) {
   if (!Array.isArray(who.kinds) || !who.kinds.includes(ev.kind)) {
     return new Response("kind not allowed for sender", { status: 403 });
   }
-  // A node may not speak for another node.
-  if (own(ev, "node") && who.sender !== ev.node) return new Response("wrong node", { status: 403 });
+  // Every kind names its node, and a node may not speak for another node.
+  if (who.sender !== ev.node) return new Response("wrong node", { status: 403 });
   await event(env, ev, who.sender, Date.now());
   return new Response(null, { status: 204 });
 }
@@ -278,18 +220,8 @@ export default {
     return new Response(null, { status: 204 });
   },
 
-  // Each check runs even when one before it threw (an email that failed), so one
-  // broken path cannot silence the others; the invocation still fails afterwards.
+  // An email that failed throws, so the invocation shows as failed.
   async scheduled(controller, env) {
-    const now = controller.scheduledTime ?? Date.now();
-    const errors = [];
-    for (const run of [check, checkPendingRec, checkTangProbe]) {
-      try {
-        await run(env, now);
-      } catch (e) {
-        errors.push(e);
-      }
-    }
-    if (errors.length) throw new AggregateError(errors, errors.map((e) => e.message).join("; "));
+    await check(env, controller.scheduledTime ?? Date.now());
   },
 };
