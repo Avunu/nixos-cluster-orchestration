@@ -44,7 +44,7 @@
 #
 # `fence-stops-nothing-on-empty` and `fence-failsafe-on-5xx` need nodes that are not the
 # leader and containers Nomad placed, so they are in tests/cluster.nix, with
-# `management-absent-from-deployed-secrets` (the voters); `management-absent-from-workers`
+# `any-server-registers` (the voters); `management-absent-from-workers`
 # needs a client-only worker, and is in tests/control-plane-failure.nix.
 #
 # And first of all, once the cluster is up, raw_exec's lockdown: what a stolen
@@ -822,7 +822,10 @@ pkgs.testers.runNixOSTest {
             detail = (f"from the VLAN with a route: ports {via_vlan} ping={pinged} exporter={exporter};"
                       f" from a container on br-app: {from_ctr} (expected open: {granted}); node1 itself: {local}")
             print(f"weak-host-route-refused: {detail}")
-            control("weak-host-route-refused-node-reaches", all(local.values()), detail)
+            # But for app state's: nothing listens on it here, where cluster.state is off
+            # (tests/lib/cluster-harness.nix). It is still asked for from outside, above.
+            control("weak-host-route-refused-node-reaches",
+                    all(v for p, v in local.items() if p != ${toString net.statePort}), detail)
             control("weak-host-route-refused",
                     not any(via_vlan.values()) and not pinged and not exporter
                     and all(v == (p in granted) for p, v in from_ctr.items()),
@@ -1023,7 +1026,7 @@ pkgs.testers.runNixOSTest {
 
         with subtest("scoped-tokens: each role does its job, and is refused one thing outside it"):
             node1.wait_for_unit("nomad-acl-init.service")
-            for role in ("fence", "node-meta", "registrar", "autoscaler", "avc"):
+            for role in ("fence", "node-meta", "registrar", "avc"):
                 node1.wait_until_succeeds(f"test -s {TOKENS}/{role}", timeout=180)
             node1.wait_for_unit("nomad-bootstrap.service")
             job = json.dumps({"Job": nomad_api(node1, CTRL, f"/v1/job/{A_JOB}?namespace={NS}")})
@@ -1037,7 +1040,6 @@ pkgs.testers.runNixOSTest {
                 "fence": ("fence", [("GET", f"/v1/allocations?namespace={NS}", None), ("GET", "/v1/agent/self", None)], jobs),
                 "node-meta": ("node-meta", [nodes], jobs),
                 "registrar": ("registrar", [jobs, ("GET", f"/v1/job/{A_JOB}?namespace={NS}", None), plan], nodes),
-                "autoscaler": ("autoscaler", [jobs, nodes, operator], plan),
                 "avc": ("operator-read", [jobs, ("GET", f"/v1/job/{A_JOB}?namespace={NS}", None), nodes, operator], plan),
             }
             results: dict = {}

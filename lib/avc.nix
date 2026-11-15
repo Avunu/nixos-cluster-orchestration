@@ -18,6 +18,11 @@
 }:
 let
   python = clan-cli.pythonRuntime;
+  cloudTofu = pkgs.opentofu.withPlugins (ps: [
+    ps.ovh_ovh
+    ps.cloudflare_cloudflare
+    ps.hashicorp_random
+  ]);
 in
 python.pkgs.buildPythonApplication {
   pname = "avc";
@@ -67,6 +72,10 @@ python.pkgs.buildPythonApplication {
         openssh
         nix
       ])
+      # `avc cloud` (tools/avc/avc/flows/cloud.py): OpenTofu with the providers the
+      # generated configuration names (lib/cloud.nix), from the store, so `tofu init`
+      # downloads nothing.
+      ++ [ cloudTofu ]
     ))
     "--set-default"
     "CLAN_PROVIDED_PACKAGES"

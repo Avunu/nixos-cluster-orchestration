@@ -8,12 +8,12 @@ from avc.context import Ctx
 from avc.core.index import parse_index
 
 INDEX = {
-    "leader": "node1",
+    "reference": "node1",
     "flakeUrl": "github:example/cluster",
     "nodes": {
         "node1": {
             "fqdn": "node1.example.com",
-            "tags": ["nomad-leader"],
+            "tags": ["nomad-server"],
             "deployHost": "192.0.2.1",
             "nomad": {
                 "addr": "https://10.10.0.1:4646",
@@ -31,9 +31,9 @@ INDEX = {
         }
     },
     "apps": {
-        "demo-erp": {"kind": "frappe", "homeNode": "node1", "job": "app-demo-erp", "tunnel": "t1", "hostnames": ["erp.example.com"], "generators": ["demo-erp", "demo-erp-cf"]},
-        "demo-idm": {"kind": "freeipa", "homeNode": "node1", "job": "app-demo-idm", "tunnel": "t2", "hostnames": [], "generators": ["demo-idm", "demo-idm-authelia"]},
-        "blog": {"kind": "wordpress", "homeNode": "node1", "job": "app-blog", "tunnel": "t3", "hostnames": [], "generators": ["wp-blog", "wp-blog-api"]},
+        "demo-erp": {"kind": "frappe", "job": "app-demo-erp", "tunnel": "t1", "hostnames": ["erp.example.com"], "generators": ["demo-erp", "demo-erp-cf"]},
+        "demo-idm": {"kind": "freeipa", "job": "app-demo-idm", "tunnel": "t2", "hostnames": [], "generators": ["demo-idm", "demo-idm-authelia"]},
+        "blog": {"kind": "wordpress", "job": "app-blog", "tunnel": "t3", "hostnames": [], "generators": ["wp-blog", "wp-blog-api"]},
     },
 }
 

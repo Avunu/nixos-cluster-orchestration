@@ -60,7 +60,6 @@
 let
   pki = clusterLib.nomadPki;
   isServer = clusterLib.net.hasTag "nomad-server" node;
-  isLeader = clusterLib.net.hasTag "nomad-leader" node;
   loginRoles = pki.loginRoles node;
 in
 {
@@ -80,9 +79,50 @@ in
       files.provision-token.deploy = false;
     };
 
+    # ── what `avc cloud` holds (lib/cloud.nix) ───────────────────────────────
+    # The OVH API's three values, for an application of the operator's own
+    # (https://<endpoint>/createToken): what makes buckets, users and their S3 keys in
+    # the Public Cloud project. Operator secrets like the token above: on no node.
+    # Cloudflare's side of `avc cloud` uses that token, `cloudflare/provision-token`.
+    cloud-ovh = lib.mkIf ((topology.cloud.ovh or null) != null) {
+      share = true;
+      prompts.application-key = {
+        description = "OVH API application key (avc cloud)";
+        persist = true;
+      };
+      prompts.application-secret = {
+        description = "OVH API application secret";
+        type = "hidden";
+        persist = true;
+      };
+      prompts.consumer-key = {
+        description = "OVH API consumer key, with GET, POST, PUT and DELETE on /cloud/project/<project>/*";
+        type = "hidden";
+        persist = true;
+      };
+      files.application-key.deploy = false;
+      files.application-secret.deploy = false;
+      files.consumer-key.deploy = false;
+    };
+    # What OpenTofu's state (cloud/terraform.tfstate in the site's repository) is
+    # encrypted with: it holds every key pair and tunnel secret the providers issued.
+    # Bound to that file: a new passphrase reads none of it.
+    cloud-state = lib.mkIf ((topology.cloud or { }) != { }) {
+      share = true;
+      files.passphrase.deploy = false;
+      runtimeInputs = [
+        pkgs.coreutils
+        pkgs.openssl
+      ];
+      script = ''
+        openssl rand -hex 32 | tr -d '\n' > "$out/passphrase"
+      '';
+    };
+
     # ── S3 object storage ─────────────────────────────────────────────────
     # Issued by the provider, so it cannot be generated — prompted once and stored.
-    # Consumed by JuiceFS (both halves) and by the backup provider.
+    # Consumed by JuiceFS (both halves). `avc cloud apply` writes it where the
+    # topology has `cloud.ovh`.
     ovh-s3 = {
       share = true;
       prompts."access-key" = {
@@ -241,12 +281,12 @@ in
     # Must be a UUID — Nomad validates the format of an operator-supplied
     # bootstrap token and rejects anything else.
     #
-    # It is the management token, so it is declared ONLY on the `nomad-leader` node,
-    # and there only `nomad-acl-init` reads it (modules/nomad-acl.nix). Everything
+    # It is the management token, so it is declared on the Nomad servers and on no
+    # worker, and there only `nomad-acl-init` reads it (modules/nomad-acl.nix). Everything
     # else logs in for a scoped token (`nomad-login` below). Kept rather than deleted
     # after bootstrap: root on any server can mint a new one through
     # <data_dir>/server/acl-bootstrap-reset anyway, and policy changes need it.
-    nomad-acl = lib.mkIf isLeader {
+    nomad-acl = lib.mkIf isServer {
       share = true;
       files.token = { };
       runtimeInputs = [
@@ -281,7 +321,7 @@ in
     };
 
     # One JWT per role this machine logs in as (lib/nomad-pki.nix loginRoles), and
-    # only those: a worker holds no `registrar` and no `autoscaler`. Per machine, so
+    # only those: a worker holds no `registrar`. Per machine, so
     # each names its node, and a stolen one is that node's roles only.
     nomad-login = {
       dependencies = [ "nomad-jwt" ];
@@ -335,6 +375,21 @@ in
     # the Worker's AUDIT_TOKENS updated too (`avc audit tokens`), or that node's events
     # wait in its spool, refused with 401, until it is.
     audit = lib.mkIf ((topology.alerting.auditUrl or null) != null) {
+      files.token = { };
+      runtimeInputs = [
+        pkgs.openssl
+        pkgs.coreutils
+      ];
+      script = ''openssl rand -hex 32 | tr -d '\n' > "$out/token"'';
+    };
+
+    # ── The pipeline's agent (modules/ci-agent.nix) ─────────────────────────
+    # Per machine, like the audit trail's: the cluster-ci Worker answers a token with
+    # that node's previews and their tunnel secrets, so a stolen one speaks for one
+    # node. Declared only when the topology names a Worker. Regenerating it needs the
+    # Worker's AGENT_TOKENS updated too (`avc ci tokens`), or the node's agent is
+    # refused with 401 until it is.
+    ci = lib.mkIf ((topology.ci.url or null) != null) {
       files.token = { };
       runtimeInputs = [
         pkgs.openssl

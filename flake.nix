@@ -77,11 +77,9 @@
         meshControl = ./modules/mesh-control.nix;
         storageEtcd = ./modules/storage-etcd.nix;
         storageJuicefs = ./modules/storage-juicefs.nix;
-        dbPostgres = ./modules/db-postgres.nix;
-        dbMariadb = ./modules/db-mariadb.nix;
-        # clusterApps.<app>.archive: the host's half of the database archive.
-        dbArchive = ./modules/db-archive.nix;
         monitoring = ./modules/monitoring.nix;
+        # Prometheus, Alertmanager and Loki, on every node (it imports the other two).
+        monitoringServer = ./modules/monitoring-server.nix;
         logging = ./modules/logging.nix;
         vars = ./modules/vars.nix;
         pullDeploy = ./modules/pull-deploy.nix;
@@ -92,6 +90,8 @@
         apps = ./modules/apps.nix;
         freeipa = ./modules/kinds/freeipa.nix;
         grafana = ./modules/kinds/grafana.nix;
+        # The cluster's binary cache, and every node's use of it.
+        attic = ./modules/kinds/attic.nix;
         odoo = ./modules/kinds/odoo.nix;
         frappe = ./modules/kinds/frappe.nix;
         # wpdb declares `wordpressDatabases`, which the wordpress kind fills
@@ -99,8 +99,10 @@
         wpdb = ./modules/kinds/wpdb.nix;
         wordpress = ./modules/kinds/wordpress.nix;
         nomadBootstrap = ./modules/nomad-bootstrap.nix;
+        # Job registration, on every Nomad server.
+        nomadRegister = ./modules/nomad-register.nix;
         # Namespaces, policies, and every node's scoped-token logins; the ACL bootstrap
-        # on the nomad-leader node.
+        # on the Nomad servers.
         nomadAcl = ./modules/nomad-acl.nix;
         # The off-host audit trail (SSH logins, deploys, Nomad ACL changes) and each
         # boot's report on how it unlocked.
@@ -109,6 +111,12 @@
         # The weekly look for the canary where client data must not be in plaintext.
         canaryScan = ./modules/canary-scan.nix;
         backup = ./modules/backup.nix;
+        # An app's local state as a dataset of its own, replicated to every node, so
+        # that Nomad can run the app on any of them.
+        appState = ./modules/app-state.nix;
+        # Deploys the moment the site's branch moves, and a preview per pull request:
+        # the node's half of workers/cluster-ci.
+        ciAgent = ./modules/ci-agent.nix;
         nixpkgsOverlays = ./modules/nixpkgs-overlays.nix;
       };
       nixosModules = clusterModuleSet;
@@ -129,6 +137,15 @@
       mkOpsIndex =
         { clan, topology }:
         import ./lib/ops-index.nix {
+          inherit lib topology clusterLib;
+          inherit (clan.config) nixosConfigurations;
+        };
+
+      # What the site needs from its providers, as an OpenTofu configuration
+      # (lib/cloud.nix), and where each thing they hand back goes. `avc cloud` runs it.
+      mkCloud =
+        { clan, topology }:
+        import ./lib/cloud.nix {
           inherit lib topology clusterLib;
           inherit (clan.config) nixosConfigurations;
         };
@@ -165,7 +182,7 @@
               }
               // args
             );
-          # Nomad + nomad-autoscaler are BSL-licensed (unfree); allow them.
+          # Nomad is BSL-licensed (unfree); allow it.
           pkgs = import nixpkgs {
             inherit system;
             config.allowUnfree = true;
@@ -330,7 +347,6 @@
               # Replaces colmena (deploy) and the old per-file secret scripts.
               clan-cli
               pkgs.nomad
-              pkgs.nomad-autoscaler
               pkgs.juicefs
               pkgs.jq
               pkgs.hcl2json
@@ -410,6 +426,35 @@
               ''
           );
 
+          # The pipeline's Worker: what a webhook and a node's report make of each other
+          # (node --test, no dependencies).
+          checks.cluster-ci = detach (
+            _:
+            pkgs.runCommand "cluster-ci-tests"
+              {
+                nativeBuildInputs = [ pkgs.nodejs_22 ];
+              }
+              ''
+                cp -r ${./workers/cluster-ci} w && cd w
+                node --test test/*.test.js
+                touch $out
+              ''
+          );
+
+          # The pipeline's agent, as a process, against a stand-in Worker and stand-in
+          # nix, zfs, juicefs and systemd: what it asks of them, in which order.
+          checks.ci-agent = detach (
+            _:
+            pkgs.runCommand "ci-agent-tests"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+              }
+              ''
+                python3 ${./tests/ci-agent.py} ${./modules/ci-agent.py}
+                touch $out
+              ''
+          );
+
           # An alert travels Prometheus → Alertmanager → bridge → (stub) Cloudflare.
           checks.alerting = detach (
             _:
@@ -443,38 +488,65 @@
             }
           );
 
-          # The database archiver against an S3 server in a VM: what reaches storage is
-          # encrypted and confirmed there, and what it refuses to do.
-          checks.db-archive = detach (
+          # The fixture's OpenTofu configuration (lib/cloud.nix) against the providers' own
+          # schemas, with the OpenTofu and the providers avc runs: every resource type and
+          # argument exists, and it says what the fixture's topology and apps call for.
+          checks.cloud = detach (
             _:
-            import ./tests/db-archive.nix {
-              inherit pkgs;
-              lib = nixpkgs.lib;
-            }
+            let
+              cloud = mkCloud {
+                clan = fixtureCluster;
+                topology = fixtureTopology;
+              };
+              tofu = pkgs.opentofu.withPlugins (ps: [
+                ps.ovh_ovh
+                ps.cloudflare_cloudflare
+                ps.hashicorp_random
+              ]);
+            in
+            pkgs.runCommand "cloud-config-check"
+              {
+                nativeBuildInputs = [
+                  tofu
+                  pkgs.jq
+                ];
+                config = builtins.toJSON cloud.config;
+                writeback = builtins.toJSON cloud.writeback;
+                passAsFile = [
+                  "config"
+                  "writeback"
+                ];
+              }
+              ''
+                mkdir work && cd work
+                cp "$configPath" main.tf.json
+                export HOME=$PWD TF_IN_AUTOMATION=1
+                tofu init -input=false -backend=false >/dev/null
+                tofu validate -no-color
+                want() { jq -e "$1" main.tf.json >/dev/null || { echo "missing: $2" >&2; exit 1; }; }
+                want '.resource.ovh_cloud_project_storage.juicefs.name == "${fixtureTopology.objectStorage.juicefsBucket}"' "the JuiceFS bucket"
+                want '.resource.ovh_cloud_project_storage.juicefs.lifecycle.prevent_destroy' "a bucket that cannot be destroyed by a plan"
+                want '.resource.ovh_cloud_project_storage.state_backup.versioning.status == "enabled"' "a versioned state backup bucket"
+                want '.resource.ovh_cloud_project_user_s3_policy.state_backup.policy | fromjson | .Statement[0].Action | index("s3:DeleteObjectVersion") | not' "a user that cannot delete a version"
+                want '.resource.ovh_cloud_project_user_s3_policy.juicefs.policy | fromjson | .Statement[0].Resource | all(test("fixture-juicefs|${fixtureTopology.objectStorage.juicefsBucket}"))' "a policy for its own bucket only"
+                want '.resource.cloudflare_zero_trust_tunnel_cloudflared."demo_odoo".config_src == "local"' "a locally configured tunnel per app"
+                want '[.import[].to] | index("cloudflare_zero_trust_tunnel_cloudflared.demo_odoo")' "an import of the tunnel the app already names"
+                want '.resource.cloudflare_dns_record | to_entries | all(.value.type == "CNAME" and .value.proxied)' "proxied CNAMEs"
+                want '.resource.cloudflare_zero_trust_tunnel_cloudflared_route."demo_idm".network | endswith("/32")' "FreeIPA's private route"
+                want '.resource.cloudflare_r2_bucket_lock.audit.rules[0].condition.max_age_seconds == 31536000' "the audit bucket's lock"
+                jq -e '.vars."s3_juicefs_secret_key" == "ovh-s3/secret-key" and .vars."s3_state_backup_access_key" == "backup-state-target/access-key" and (.tunnels."demo-odoo".known)' "$writebackPath" >/dev/null \
+                  || { echo "the write-back map is wrong: $(cat "$writebackPath")" >&2; exit 1; }
+                touch $out
+              ''
           );
 
-          # The same for PostgreSQL: WAL handed over by PostgreSQL itself, a bounded queue
-          # of it when storage is away, and the base backup that closes a gap.
-          checks.db-archive-pg = detach (
+          # An app's local state following it between three nodes with real ZFS: a
+          # move that loses nothing, a dead holder, its return, and what is refused.
+          checks.app-state = detach (
             _:
-            import ./tests/db-archive-pg.nix {
+            import ./tests/app-state.nix {
               inherit pkgs;
               lib = nixpkgs.lib;
-            }
-          );
-
-          # What `clusterApps.<app>.archive` gives a container, and what it refuses.
-          checks.db-archive-wiring = detach (
-            _:
-            import ./tests/db-archive-wiring.nix {
-              inherit pkgs;
-              lib = nixpkgs.lib;
-              topology = fixtureTopology;
-              clusterLib = import ./lib { inherit (nixpkgs) lib; };
-              clanCoreModule = clan-core.nixosModules.clanCore;
-              appContainerModule = ./modules/app-container.nix;
-              overlayNetworkModule = ./modules/overlay-network.nix;
-              dbArchiveModule = ./modules/db-archive.nix;
             }
           );
 
@@ -538,6 +610,17 @@
                 fixtureCluster
                 fixtureTopology
                 ;
+            }
+          );
+
+          # The binary cache: placed by Nomad, filled by a push, read back by
+          # substitution, read-only from outside, and never needed (tests/attic.nix).
+          checks.attic = detach (
+            _:
+            import ./tests/attic.nix {
+              inherit pkgs lib;
+              mkClan = mkFixtureCluster;
+              topology = fixtureTopology;
             }
           );
 
@@ -1801,220 +1884,6 @@
                   };
               }
             );
-            # The database archiver (tests/db-archive.nix). `cluster.dbArchive.mutate` edits
-            # the shared library's text and the engine's, so an edit cannot be asserted
-            # against either alone: one that changes nothing leaves its control true, and
-            # the mutant fails as unproven.
-            #
-            # A data directory without its marker adopts an archive that already holds data.
-            db-archive-adopts-existing-archive = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "marker-missing-over-data-refused";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''if [ -n "$entries" ]; then'' ]
-                    [ ''if [ -n "$entries" ] && false; then'' ];
-              }
-            );
-            # Storage that did not answer counts as an empty archive.
-            db-archive-unlisted-is-empty = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "unlisted-archive-is-not-empty";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''out=$(walg 30 "" 1 st ls 2>/dev/null) || return 1'' ]
-                    [ ''out=$(walg 30 "" 1 st ls 2>/dev/null) || return 0'' ];
-              }
-            );
-            # WAL-G's cache is left as found: one that names the log being written uploads nothing.
-            db-archive-keeps-walg-cache = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "walg-cache-is-not-trusted";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings [ ''write_walg_cache "$have" ||'' ] [ "true ||" ];
-              }
-            );
-            # The same, and WAL-G's exit status is taken as proof of an upload.
-            db-archive-trusts-exit-status = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "recorded-push-is-in-storage";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [
-                      ''write_walg_cache "$have" ||''
-                      ''if ! in_storage "$gen" "$closed"; then''
-                    ]
-                    [
-                      "true ||"
-                      ''if ! in_storage "$gen" "$closed" && false; then''
-                    ];
-              }
-            );
-            # An empty or short archive key is passed on to WAL-G.
-            db-archive-empty-key = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "no-key-no-upload";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [
-                      ''[ -n "$v" ] ||''
-                      ''[ "''${#key}" -eq 64 ] ||''
-                    ]
-                    [
-                      "true ||"
-                      "true ||"
-                    ];
-              }
-            );
-            # Binary logs numbered again from the start are appended to the generation.
-            db-archive-appends-renumbered-logs = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "renumbered-logs-refused";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''if [ "$current" -le "$have_n" ]; then'' ]
-                    [ ''if [ "$current" -le "$have_n" ] && false; then'' ];
-              }
-            );
-            # An earlier generation is deleted while a restore can still reach into it.
-            db-archive-drops-inside-window = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "generation-inside-the-window-is-kept";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''[ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]'' ]
-                    [ "true" ];
-              }
-            );
-            # A generation later than this data directory's, another node's, is deleted from here.
-            db-archive-drops-later-generation = detach (
-              _:
-              import ./tests/db-archive.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "later-generation-is-not-dropped";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
-              }
-            );
-            # The PostgreSQL archiver (tests/db-archive-pg.nix), edited the same way.
-            #
-            # A data directory without its marker adopts an archive that already holds data.
-            db-archive-pg-adopts-existing-archive = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-marker-missing-over-data-refused";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''if [ -n "$entries" ]; then'' ]
-                    [ ''if [ -n "$entries" ] && false; then'' ];
-              }
-            );
-            # Storage that did not answer counts as an empty archive.
-            db-archive-pg-unlisted-is-empty = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-unlisted-archive-is-not-empty";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ "repo-ls --output=json 2>/dev/null) || return 1" ]
-                    [ "repo-ls --output=json 2>/dev/null) || return 0" ];
-              }
-            );
-            # The repository is not encrypted.
-            db-archive-pg-no-cipher = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-storage-is-encrypted";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [
-                      "repo1-cipher-type=aes-256-cbc"
-                      ''printf 'repo1-cipher-pass=%s\n' "$key"''
-                    ]
-                    [
-                      "repo1-cipher-type=none"
-                      ":"
-                    ];
-              }
-            );
-            # WAL that cannot be archived is kept without limit.
-            db-archive-pg-unbounded-queue = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-wal-queue-is-bounded";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''if [ "$((waiting * size))" -gt'' ]
-                    [ ''if false && [ "$((waiting * size))" -gt'' ];
-              }
-            );
-            # A gap in the archive waits for the next base backup that is due anyway.
-            db-archive-pg-ignores-gap = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-gap-forces-base-backup";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''! has_gap && [ "$((now - before))"'' ]
-                    [ ''[ "$((now - before))"'' ];
-              }
-            );
-            # An earlier generation is deleted while a restore can still reach into it.
-            db-archive-pg-drops-inside-window = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-generation-inside-the-window-is-kept";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings
-                    [ ''[ "$(($(date +%s) - $1))" -ge "$DBA_WINDOW" ]'' ]
-                    [ "true" ];
-              }
-            );
-            # A generation later than this data directory's, another node's, is deleted from here.
-            db-archive-pg-drops-later-generation = detach (
-              _:
-              import ./tests/db-archive-pg.nix {
-                inherit pkgs;
-                lib = nixpkgs.lib;
-                mutant = "pg-later-generation-is-not-dropped";
-                extraModule.cluster.dbArchive.mutate =
-                  builtins.replaceStrings [ ''if [ "$n" -ge "$cur" ]; then'' ] [ "if false; then" ];
-              }
-            );
           };
 
           # Every check and mutant above is detached, so `nix flake check` holds one at a time,
@@ -2048,7 +1917,7 @@
       flake = {
         # The consumer interface (mkCluster, mkOpsIndex) and the pure helpers.
         lib = clusterLib // {
-          inherit mkCluster mkOpsIndex;
+          inherit mkCluster mkOpsIndex mkCloud;
         };
         inherit nixosModules;
 
@@ -2067,6 +1936,10 @@
         inherit (fixtureCluster.config) nixosConfigurations clanInternals;
 
         opsIndex = mkOpsIndex {
+          clan = fixtureCluster;
+          topology = fixtureTopology;
+        };
+        cloud = mkCloud {
           clan = fixtureCluster;
           topology = fixtureTopology;
         };

@@ -1,22 +1,28 @@
-# modules/nomad-bootstrap-leader.nix — declarative job registration (singleton).
+# modules/nomad-register.nix — declarative job registration, on every Nomad server.
 #
 # Waits for Nomad raft leadership, then `nomad job run` every rendered
-# system.build.nomadJobs.*. Idempotent — Nomad diffs and no-ops unchanged jobs.
+# system.build.nomadJobs.*. Idempotent: Nomad diffs and no-ops unchanged jobs.
 # The unit's ExecStart references the store-hashed jobs dir, so any deploy that
 # changes a jobspec re-triggers it and only changed jobs re-register.
 #
-# Assigned to the ONE node tagged `nomad-leader` via inventory.instances in
-# flake.nix. Registration is a singleton not because two nodes would corrupt
-# anything (job submission is idempotent) but because N nodes racing to submit
-# the same N jobs on every deploy is pointless churn against the raft leader.
+# Every server does it, so that no one node has to be up, or deployed, for a job to
+# be registered: the first server to switch to a generation registers its jobs and
+# the others find nothing to change. What that costs is a submit per job per server
+# per deploy, each a no-op at the raft leader.
+#
+# A server registers a generation's jobs ONCE, when it switches to it. Servers are
+# not always on the same generation (one not deployed yet, one held back by a failed
+# deploy), and a server that registered at every boot would put its old jobspecs back
+# over a newer server's each time it restarted. After the first time it registers only
+# a job the cluster no longer has, or has dead: the repair a boot-time registration
+# used to be.
 #
 # It registers as the `registrar` role: submit, read and list jobs in the `apps`
 # namespace, nothing else. The ACL bootstrap and everything the scoped tokens rest
 # on (namespaces, policies, the JWT auth method) is nomad-acl-init's, in
 # modules/nomad-acl.nix, which is the only reader of the management token.
 #
-# The counterpart fencing reconciler runs on every node — see
-# modules/nomad-bootstrap.nix.
+# The counterpart fencing reconciler runs on every node: modules/nomad-bootstrap.nix.
 {
   config,
   lib,
@@ -42,7 +48,9 @@ let
     }) config.system.build.nomadJobs
   );
 
-  managedApps = builtins.attrNames config.clusterApps;
+  managedApps = builtins.attrNames config.cluster.nomadApps;
+  isServer = net.hasTag "nomad-server" node;
+  stamp = "/var/lib/nomad-bootstrap/registered";
 
   registerScript = pkgs.writeShellScript "nomad-register-jobs" ''
     set -euo pipefail
@@ -53,6 +61,7 @@ let
         # The leadership wait below pipes into grep; without it every check
         # failed and each deploy sat out the full five-minute wait.
         pkgs.gnugrep
+        pkgs.jq
       ]
     }
     export NOMAD_ADDR=${nomadAddr}
@@ -73,15 +82,44 @@ let
       sleep 5
     done
     NOMAD_TOKEN=$(cat ${token}); export NOMAD_TOKEN
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+
+    # Has this server registered this generation's jobs before? Then it registers
+    # only what the cluster has lost (the header says why).
+    again=0
+    [ "$(cat ${stamp} 2>/dev/null || true)" = "${jobsDir}" ] && again=1
 
     # Each jobspec names its namespace (`apps`, lib/mk-app-container.nix).
     for f in ${jobsDir}/*.json; do
-      echo "registering $f"
+      job=$(jq -r '.Job.ID' "$f")
+      if [ "$again" = 1 ]; then
+        code=$(curl -sS --max-time 15 ${tls.curlArgs} -o "$work/job" -w '%{http_code}' \
+          -H "X-Nomad-Token: $NOMAD_TOKEN" \
+          "${nomadAddr}/v1/job/$job?namespace=${clusterLib.nomad.appsNamespace}") || code=000
+        case "$code" in
+          200)
+            if [ "$(jq -r '.Status // empty' "$work/job")" != dead ]; then
+              continue
+            fi
+            echo "$job is dead: registering it again"
+            ;;
+          404) echo "$job is not registered: registering it" ;;
+          *)
+            echo "nomad-bootstrap: $job: HTTP $code" >&2
+            exit 1
+            ;;
+        esac
+      else
+        echo "registering $f"
+      fi
       ${nomad} job run -detach -json "$f"
     done
+    printf '%s' "${jobsDir}" > ${stamp}.tmp
+    mv ${stamp}.tmp ${stamp}
   '';
 in
-lib.mkIf (managedApps != [ ]) {
+lib.mkIf (isServer && managedApps != [ ]) {
   systemd.services.nomad-bootstrap = {
     description = "Register rendered Nomad jobs (declarative convergence)";
     # Registration must not race the JuiceFS placement flag. A jobspec with
@@ -108,6 +146,7 @@ lib.mkIf (managedApps != [ ]) {
       Type = "oneshot";
       RemainAfterExit = true;
       ExecStart = "${registerScript}";
+      StateDirectory = "nomad-bootstrap";
       # A token that expired between refreshes, or a leader that came up late: try
       # again rather than leave the jobs unregistered until the next deploy.
       Restart = "on-failure";

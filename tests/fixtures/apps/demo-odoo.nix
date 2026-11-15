@@ -1,7 +1,6 @@
 # demo-odoo — the odoo kind, over a stub package.
 { pkgs, ... }:
 {
-  homeNode = "node1";
   odoo = {
     package = import ../stubs/odoo.nix { inherit pkgs; };
     hostname = "odoo.example.com";

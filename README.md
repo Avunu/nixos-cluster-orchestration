@@ -18,9 +18,9 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 - **clan-core is the fleet substrate.** It owns the machine registry, role assignment, the secret lifecycle (`vars`) and bare-metal install. It has no analogue for the orchestration below, which this library owns. The clan inventory is a mechanical projection of the topology.
 - **Bootstrap is push, steady state is pull.** `clan machines install` installs a node (through `avc boot install`, see [Installing a node](#installing-a-node)). After that, every node rebuilds itself from your flake on a timer (`modules/pull-deploy.nix`), so deploying means pushing a commit.
 - **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the TPM releases the disk key only to that signed boot. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
-- **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it.
+- **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it. No entry names a node: Nomad places every app, and an app's data is where Nomad puts it ([Where an app runs](#where-an-app-runs)).
 - **Ingress is a tunnel per app, over a unix socket.** Each container runs its own `cloudflared` against a unix socket. See [Ingress](#ingress).
-- **Storage has two tiers.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories. JuiceFS over S3 (`modules/storage-juicefs.nix`) holds shared state that follows an app between nodes. The volume is encrypted, and every mount refuses one that is not.
+- **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds shared files, the same on every node. The volume is encrypted, and every mount refuses one that is not.
 - **Secrets are `clan vars`** on clan's plain `age` backend. Values are generated offline, committed encrypted, and decrypted on the host at activation. Containers never hold a key: the plaintext is bind-mounted in.
 - **Cluster roles are tags, not positions.** Singleton services (the JuiceFS metadata engine, the Nomad job registrar, Prometheus) are assigned by `tags` through `modules/cluster-roles.nix`.
 - **The private network is not trusted.** Nomad speaks mTLS with a gossip key on the control VLAN. Everything else between nodes (etcd, Loki, Prometheus and its exporters, Vector, the JuiceFS metadata database) listens only on a WireGuard mesh, `wg-ctrl`, over that VLAN. See [The control plane](#the-control-plane).
@@ -29,11 +29,35 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 
 1. Every node has every app pre-built in its `/nix/store`. Nothing ships a root filesystem around the network.
 2. Each app's Nomad job is one `raw_exec` task in the `apps` namespace, a wrapper that runs `nixos-container start <name>`, blocks while the unit is active, and stops it cleanly on `SIGTERM`. The task runs as the unprivileged `nomad-apps` user (uid 4096) with no network, and a polkit rule lets that user start and stop the declared containers and nothing else. "Task alive" and "container running" are the same thing by construction.
-3. `nomad-bootstrap.service`, on the node tagged `nomad-leader`, registers every rendered job after raft leadership, with the scoped `registrar` token. An unchanged job is a no-op.
+3. `nomad-bootstrap.service`, on every Nomad server, registers every rendered job after raft leadership, with the scoped `registrar` token. An unchanged job is a no-op, so the first server to switch to a generation registers its jobs and the others change nothing. A server registers a generation once: restarted on the same generation, it registers only a job the cluster no longer has or has dead, so a server still on an older generation does not put its jobspecs back at each boot.
 4. `nomad-fence` runs on every node every 30 seconds and stops any managed container Nomad no longer claims. If the local API is unreachable or answers with an error, it does nothing rather than guess.
-5. Moving an app is a clean stop on one node and a cold start on another. Its tunnel travels with it and its socket path does not change, so nothing moves on the Cloudflare side.
+5. Moving an app is a clean stop on one node and a cold start on another, with its local state handed over in between. Its tunnel travels with it and its socket path does not change, so nothing moves on the Cloudflare side.
 6. A deploy reaches a running container by reload, not restart. Only the guest units whose definition changed restart. What a reload cannot apply (bind mounts, network interfaces, capabilities) needs `nomad job restart app-<name>`.
 7. One app's failure is not the node's. A guest that fails its reload is reported (`cluster_app_deploy_degraded`, alert `AppDeployDegraded`) instead of failing the host's switch and every other app's deploy.
+
+### Where an app runs
+
+Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and two things only narrow the choice. An app with files on JuiceFS needs a node whose mount is ready. And `wpdb` runs on the node whose app subnet its `address` is in, because an address does not move between subnets. `nomad.constraints` takes anything else in Nomad's own terms.
+
+An app with local state (a database directory, FreeIPA's data) runs as one allocation, and its state goes where it goes:
+
+- **A dataset per app.** `<pool>/state/apps/<app>`, mounted at `/state/clients/<app>` on the node running the app and kept unmounted and read-only on every other node.
+- **Replicated every minute.** The node running the app snapshots the dataset if anything was written (`cluster.state.intervalSeconds`, 60), and every other node pulls what it lacks, incrementally, over the mesh. Each node thins its own copy by its own clock: every snapshot for four hours, then one an hour for a day, then one a day for a week (`cluster.state.keep`). A replica never drops history because the running node did, so that node, taken over, cannot erase what the others hold; asked to, a replica sets its copy aside like an orphan.
+- **A move loses nothing.** When Nomad starts the app on another node while the first is reachable (a drain, a job restart that lands elsewhere), the new node stops it on the old one, takes a last snapshot of the stopped database, receives it, and starts.
+- **A node's death loses at most the interval.** Nomad marks the node down and starts the app on another, from the newest snapshot any surviving node holds. The new node first waits until the dead one, if it is only cut off, has stopped its own copy: a node that cannot reach a Nomad server stops its stateful apps 60 seconds after its last heartbeat (Nomad's `disconnect.stop_on_client_after`). An unplanned failover therefore takes about three minutes, and what the dead node wrote after its last replicated snapshot is not in the app any more.
+- **Those writes are kept, on the node that made them.** When it returns, its copy is renamed to `<pool>/state/orphans/<app>-<time>`, whole, and it receives the app's new history as a replica. `StateOrphaned` fires. Nothing deletes an orphan: mount it, take what is needed, and remove it yourself.
+
+```sh
+cluster-state status                      # per app: which node runs it, each replica's age, orphans
+cluster-state orphans                     # copies set aside on this node
+zfs set mountpoint=/mnt/orphan <orphan> && zfs mount <orphan>   # read one
+cluster-state drop-orphan <orphan> --yes  # delete it
+cluster-state init <app>                  # a new app's empty dataset, when a node cannot be asked
+```
+
+A new app's first start makes its dataset, once every node has answered that none holds one. With a node silent, the start is refused instead of beginning an empty database beside one that may exist; `cluster-state init <app>` says it is new.
+
+What this does not do. Replication is asynchronous, so a failover is to a slightly earlier database, never to the same one. Every node holds a copy of every app's local state, so the pool is sized for all of them, not for a share. Nomad places an app when it starts and does not move a running one to even out load: `nomad node drain` and `nomad job restart` are how load is moved by hand. And the fence above relies on the cut-off node's Nomad agent running: a node whose agent is dead while its containers live, and which no peer can reach on the mesh, would keep writing to a copy that is then orphaned.
 
 ### Ingress
 
@@ -71,11 +95,11 @@ Bridged frames do not traverse the host's IP hooks, so each container firewalls 
 
 ```nix
 # apps/<name>.nix
-network.hostAccess = [ 3100 ];                             # TCP ports on the metrics node's mesh address
+network.hostAccess = [ 3100 ];                             # TCP ports on the mesh address of the node it runs on
 network.peerAccess = [ { app = "wpdb"; port = 3306; } ];   # another app, one TCP port
 ```
 
-- `hostAccess` is for Loki and Prometheus on the `metrics` node. The app must be pinned there (`homeNode` carrying the `metrics` tag) and its name must be at most 12 characters, because its identity is nspawn's veth `vb-<name>`. Both are asserted.
+- `hostAccess` is for Loki and Prometheus, which every node runs: the app reaches them on the node Nomad put it on. Its name must be at most 12 characters, because its identity is nspawn's veth `vb-<name>` (asserted).
 - `peerAccess` reaches another app on the same node over the bridge, or on any other node over the app VLAN, on one TCP port, and nothing comes back but replies. Both ends get an extra `br-app` veth named `vp-<iid>`, so any name length works (D23 under [Defaults awaiting a decision](#defaults-awaiting-a-decision)).
 - Identity is the bridge port a frame arrives on, never the address: a container holds `CAP_NET_ADMIN` and can take any address and MAC it likes.
 - A container's IPv4 egress excludes RFC 1918, CGNAT, link-local and every node's public address. An S3 endpoint on a private address would need a rule of its own.
@@ -87,7 +111,7 @@ Refused traffic is logged, rate-limited, with the prefixes `container-to-host-dr
 ### The control plane
 
 - **Nomad** listens on the control VLAN with mutual TLS (`nomad-ca`, `nomad-tls`) and a gossip key (`nomad-gossip`, servers only), and verifies server names. ACLs are on. Apps run in the `apps` namespace; `default` can run nothing.
-- **Every machine logs in with scoped tokens.** Each node holds pre-signed JWTs (`nomad-login`, signed offline by `nomad-jwt`) for its roles: `fence`, `node-meta` and `avc` everywhere, `registrar` on the `nomad-leader` node, `autoscaler` on the `metrics` node. `nomad-login@<role>` exchanges them for tokens in `/run/nomad-tokens/<role>`. The management token (`nomad-acl`) is only on the `nomad-leader` node, read only by `nomad-acl-init`. **Every voter still holds every ACL token, management included, in its raft state**, and root on a server can always mint one.
+- **Every machine logs in with scoped tokens.** Each node holds pre-signed JWTs (`nomad-login`, signed offline by `nomad-jwt`) for its roles: `fence`, `node-meta` and `avc` everywhere, `registrar` on the Nomad servers. `nomad-login@<role>` exchanges them for tokens in `/run/nomad-tokens/<role>`. The management token (`nomad-acl`) is on the Nomad servers and on no worker, read only by `nomad-acl-init` and the audit trail's ACL stream. **Every voter still holds every ACL token, management included, in its raft state**, and root on a server can always mint one.
 - **Everything else is on the WireGuard mesh**, `wg-ctrl`, one key per machine (`wg-ctrl`), each node at `<mesh.subnet base>.<index>`. A machine on the VLAN without a key reaches only Nomad's port and the mesh's UDP port. The mesh authenticates the machine, not the process: any process on a node can use it (D1, accepted). SSH no longer answers on the VLANs.
 - **etcd** is created once, from the tags, with three or more members (see the tag table).
 - **Jumbo frames.** The VLANs take `vlans.<v>.mtu` (9000 in the template) and the mesh 80 bytes less. A private network that doesn't really carry 9000 is a silent blackhole, so every node probes every peer at full size (`VrackJumboBroken`), and the [real hardware checklist](#real-hardware-checklist) tests it before any data. With the trunk at 1500 and a VLAN asking for 9000, networkd does not create the VLAN at all.
@@ -183,9 +207,9 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | A swapped volume | A per-node secret on the encrypted root whose hash is compiled into the signed initrd. The initrd checks it before it mounts anything from the pool, and halts on a mismatch, so a forged disk with copied identifiers gets nothing. |
 | The emergency shell | Protected by a hashed password, and entering it first extends PCR 7 with a burn, so the TPM refuses the disk key for the rest of that boot. |
 | The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount and the metadata node refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
-| Logs | Loki keeps its store on the `metrics` node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
+| Logs | Each node's Loki keeps its store on that node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
 | Backups | restic, with each app's repository at a salted hash of its name. |
-| The database archive | Encrypted inside the app's container before it leaves, with a key of the app's own, at a salted hash of its name. There is no unencrypted mode: no key, no upload. See [The database archive](#the-database-archive). |
+| The state backup | Restic, like the nightly backup and under the same password, at a salted hash of the app's name that is not the nightly repository's. See [Backups and restore](#backups-and-restore). |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
 
 Unattended unlock needs no person and no network, and never stands in a person's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
@@ -210,8 +234,8 @@ Kept outside any repository, off the cluster, and away from the laptop that hold
 - the offline age identity, whose public key is in `recipients`;
 - a dated `git bundle` of the private repository (`git bundle create site-<date>.bundle --all`);
 - direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB);
-- `<app>-db-archive/key` for each app that [archives its database](#the-database-archive): losing it loses that archive;
-- `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target` and `backup.repoSalt`.
+- `cloud-state/passphrase`, with `cloud`: without it OpenTofu's state is unreadable, and what it made has to be imported again by hand;
+- `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}` and `backup-state-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target`, `backup.state.target` and `backup.repoSalt`.
 
 With the bundle and the offline identity, `clan vars get` gives back every other secret: `git clone site-<date>.bundle site`, then in it `AGE_KEYFILE=<offline identity> clan vars get <node> luks/passphrase`. To let a new operator in, add their public key to `recipients`, commit, and run `clan vars fix <machine>` for each machine with the offline identity; a key not yet in `recipients` reads nothing. With the JuiceFS key, the S3 pair and the bucket alone, the volume's metadata can be rebuilt anywhere (see [Restore without a node](#restore-without-a-node)).
 
@@ -432,16 +456,15 @@ What the node held, and what replaces it:
 
 | On the node | How it is replaced |
 | --- | --- |
-| Client data: the local state of the apps homed there and, through its mount, every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
+| Client data: every app's local state, since each node holds a copy of each app's ([Where an app runs](#where-an-app-runs)), and through its mount every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
 | The machine's age key (`/etc/secret-vars/key.txt`), which decrypts that machine's vars at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
 | `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
-| `ovh-s3`, `backup-target` | New pairs from the provider, `avc secrets rotate ovh-s3` and `avc secrets rotate backup-target`, then delete the old pairs at the provider. |
+| `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
-| `nomad-gossip` on a server, `nomad-acl` on the leader, the alerting tokens on the `metrics` node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
+| `nomad-gossip` on a server, `nomad-acl` on a server, the alerting tokens on every node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
 | `juicefs-pg` | By hand, in a window: every mount and the metadata role change together. |
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
 | `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
-| `<app>-db-archive` and `<app>-db-archive-s3`, for each app that archives its database | A new S3 pair per app from the provider, `avc secrets rotate <app>-db-archive-s3`, then delete the old pairs. The archive key is bound to data: a new key and a new generation, by "Keys" in [The database archive](#the-database-archive). What was archived under the old key counts as read. |
 | `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
 
 The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
@@ -450,12 +473,12 @@ The order: the GitHub token and the S3 pairs first, because they are what reache
 
 **A new JuiceFS volume.** A volume's key can't be changed, so this is a deliberate loss of the storage tier: a new, empty volume in a new bucket, and every app back from its backup.
 
-1. `cluster-backup` on each app's home node, and look at the result (`cluster-backup-list <app>`). These snapshots are what comes back.
+1. `cluster-backup` on a node, for each app running there (`avc app backup <app>` finds the node), and look at the result (`cluster-backup-list <app>`). These snapshots are what comes back.
 2. Hold every node (`avc deploy hold <node>`), and stop the apps (`nomad job stop app-<name>`) and then `juicefs-mount` on every node.
 3. Create a new, empty bucket. In one commit: its name in `objectStorage.juicefsBucket`, and a new key from `clan vars generate <node> --generator juicefs-rsa --regenerate`. Merge it.
 4. On the `juicefs-meta` node, empty the metadata database (as `postgres`: `dropdb juicefs`, then `createdb -O juicefs juicefs`). This is the step that makes the volume new. With the old metadata still there, `juicefs-format` finds a volume it knows and keeps it, old bucket and old key.
 5. Release the `juicefs-meta` node first (`avc deploy release <node>`). `juicefs-format` finds no metadata and an empty bucket, which is a first bring-up: it formats an encrypted volume with the new key. Then release the others.
-6. With each app's container running on the new volume, `cluster-restore <app> --yes` on its home node.
+6. With each app's container running on the new volume, `cluster-restore <app> --yes` on the node it is running on (`avc app restore <app>`).
 7. When every app has been checked, delete the old bucket. Until then the old volume can be read from the kit ([Restore without a node](#restore-without-a-node)).
 
 **New restic repositories**, after the restores above, which read the old ones. `restic key add` and `restic key remove` change a repository's password but not its master key, and the old password has already given that away. In one commit: a new `backup.repoSalt`, and a new password from `clan vars generate <node> --generator restic --regenerate`. A repository's path is a hash of the salt and the app's name, so every app moves to a new, empty repository, and the first backup creates it under the new password. Run `cluster-backup` for every app at once, and check each. The old repositories stay where they were, readable with the old password, until you delete them.
@@ -468,7 +491,7 @@ Two limits. A new key protects what is written from then on: whoever copied the 
 
 Before a machine goes back to the provider or is retired, while it is still yours. Done in this order, nothing in [A node left your control](#a-node-left-your-control) is needed afterwards.
 
-1. Move its work away. For each app homed there: a last `cluster-backup <app>`, a new `homeNode`, and `cluster-restore <app> --yes` on that node ([Backups and restore](#backups-and-restore)). Its role tags go to another node first.
+1. Move its work away: `nomad node drain -enable -yes <node>`. Each app stops there and starts on another node with its state, losing nothing ([Where an app runs](#where-an-app-runs)); `cluster-state status` shows when none is left. `wpdb`, which its address ties to one node, needs a new `address` in another node's subnet first. Its role tags go to another node first.
 2. **Wipe both LUKS headers**, on the running node, before any step that can fail or be interrupted:
 
    ```sh
@@ -492,7 +515,7 @@ All nodes gone, or a rebuild from scratch, in this order:
 1. The private repository from the offline kit: `git clone site-<date>.bundle site`, `AGE_KEYFILE=<offline identity>`, a new operator key added to `recipients`, and `clan vars fix <machine>` for each machine.
 2. The first node installed and sealed, S0 to S8.
 3. The JuiceFS metadata restored from the bucket with the PEM and its passphrase: the reinstalled `juicefs-meta` node does it by itself from a recent dump ([below](#when-the-juicefs-metadata-node-is-reinstalled)), or by hand ([Restore without a node](#restore-without-a-node)).
-4. Nomad bootstraps itself on the first voter, and the leader registers every job.
+4. Nomad bootstraps itself on the first voter, which registers every job.
 5. `cluster-restore <app> --yes` per app.
 
 `checks.jfs-encrypted`'s `total-loss-escrow-only` proves step 3 from the kit alone, and `checks.boot-install` the mechanism of step 2; the whole chain has not been rehearsed on real machines.
@@ -556,7 +579,7 @@ Accepted, and written here so they are accepted knowingly.
 - **The app VLAN is not authenticated.** An attacker on it who spoofs a container's source address can reach a port an app declared on another node: for traffic arriving from the VLAN, the rule checks the source subnet and port, not identity.
 - **Metadata leaks:** the bucket shows object sizes and timing; restic's key files show host names and times; metrics and alert emails carry app and host names to Cloudflare; PostgreSQL's WAL, the JuiceFS cache and backup staging hold plaintext on the encrypted disk until the next run.
 - **`juicefs config --secret-key` puts the S3 secret on a command line** on the metadata node for the seconds of its storage test, after a restore, a rotation or a lost state file. JuiceFS 1.4.1 has no other way.
-- **Loki's history is lost with the `metrics` node.** Backing it up would keep client-bearing logs past their retention.
+- **Logs are kept on the nodes only.** Every node's Loki holds the whole cluster's lines, so they survive any node but not all of them. Backing them up would keep client-bearing logs past their retention.
 - **`freeipa` keeps every capability** (`additionalCapabilities = [ "all" ]`), so a compromise of that container is host root whatever the firewall does.
 - **Cloudflare sees traffic at the tunnel edge,** and the alert emails' text.
 - **Lanzaboote is pinned to a commit,** not a release.
@@ -580,11 +603,14 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.flakeUrl` | What nodes rebuild from, as `github:owner/repo`. Also how `avc` finds the deploy remote. |
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
-| `objectStorage` | `{ endpoint; region; juicefsBucket; dbArchiveBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. `dbArchiveBucket` is only for apps with `archive.enable`, and must be a bucket of its own ([The database archive](#the-database-archive)). Loki does not use it: its store is the `metrics` node's own encrypted disk (`/var/lib/loki`), so its history stays with that node. |
+| `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
+| `cloud` | Optional: what `avc cloud` makes at the providers ([Providers](#providers)). `cloud.ovh` is `{ endpoint; project; region; noncurrentDays; }`: the API endpoint (`ovh-us`, `ovh-eu`, `ovh-ca`), the Public Cloud project's id, the region its buckets are made in, and how long a hidden object version is kept (30). `cloud.cloudflare` is `{ accountId; zones; auditBucket; auditLockDays; }`: `zones` maps a zone's name to its id (`zones."example.com" = "<zone id>"`), and only hostnames in one of them get a DNS record; `auditBucket` is the audit trail's R2 bucket, locked for `auditLockDays` (365). Leave a provider out and nothing of its is touched. |
+| `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: each node's store is its own encrypted disk (`/var/lib/loki`). |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
 | `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it: a new salt moves every app to a new, empty repository, which is wanted only in [A node left your control](#a-node-left-your-control). |
-| `backup.target` | `{ type; ... }`, where `type` is `s3`, `rest`, `b2` or `local` (`lib/backup-target.nix`), with `endpoint`, `bucket` and `region` for S3. Keep it away from the object storage it protects. |
+| `backup.target` | `{ type; ... }`, where `type` is `s3`, `rest`, `b2` or `local` (`lib/backup-target.nix`), with `endpoint`, `bucket` and `region` for S3. The nightly backup's: the long history. Keep it away from the object storage it protects, and from the nodes. |
+| `backup.state` | Optional: `{ target; schedule; retention; staleHours; }`, a second, frequent backup of each app's local state to a second target, which must not be `backup.target` ([Backups and restore](#backups-and-restore)). `target` is `{ type; endpoint; bucket; region; }` as above, with credentials from `backup-state-target`; `schedule` is `hourly` unless set; `retention` is `{ hourly = 48; daily = 14; }`; `staleHours` (4) is when `StateBackupStale` fires. |
 | `backup.{schedule,maintenance,verify}` | systemd `OnCalendar`, in the node's clock (UTC). |
 | `backup.retention` | `{ daily; weekly; monthly; }`. |
 | `backup.uploadLimitKiB` | restic upload limit. `0` means unlimited. |
@@ -593,7 +619,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `insecureSingleMemberEtcd` | Test fixtures only: `"<reason>"` lets exactly one node carry `etcd`. Such an etcd can never grow (see the tag table below). Leave it out of a real site. |
 | `nodes.<name>` | One per machine. See below. |
 
-The attribute key under `nodes` is the machine name everywhere: the clan machine, the `--flake .#<key>` target, an app's `homeNode`. It must equal `hostName`.
+The attribute key under `nodes` is the machine name everywhere: the clan machine, the `--flake .#<key>` target, the name Nomad knows the node by. It must equal `hostName`.
 
 | Node field | Meaning |
 | --- | --- |
@@ -620,12 +646,9 @@ What an unlock depends on (the node's `initrdNicModules`, `wanInterface`, `publi
 | Tag | What it does |
 | --- | --- |
 | `worker` | Runs application containers (Nomad client). |
-| `nomad-server` | Votes in the Nomad raft. `bootstrap_expect` is asserted to be the number of nodes with this tag. Holds the gossip key and every ACL token in raft state. |
+| `nomad-server` | Votes in the Nomad raft. `bootstrap_expect` is asserted to be the number of nodes with this tag. Holds the gossip key, the management token, and every ACL token in raft state. Registers the rendered jobspecs and applies the ACL policies; every server does, so none of them has to be up for either. |
 | `etcd` | Votes in the etcd raft. |
-| `nomad-leader` | Registers rendered jobspecs, and holds the management token. Singleton. |
 | `juicefs-meta` | Hosts the JuiceFS metadata PostgreSQL. Singleton: two would mean two metadata engines over one bucket. |
-| `metrics` | Hosts Prometheus, Loki, Alertmanager and the Nomad autoscaler. Singleton. Moving the tag starts an empty Loki. |
-| `backup` | Owns backing up shared state. Local state is backed up on an app's `homeNode`. |
 
 Quorum size is derived from the tags, so a placeholder listed as a voter makes Nomad and etcd wait for a machine that does not exist. Add `nomad-server` and `etcd` in the same commit that fills in a node's real addressing. A cluster with fewer than three voters has no HA.
 
@@ -645,7 +668,6 @@ An app is one file in `appsDir`, named after the app. It is a function of `{ inp
 # apps/shop.nix
 { inputs, ... }:
 {
-  homeNode = "node1";
   odoo = {
     package = inputs.my-odoo-project.packages.x86_64-linux.default;
     hostname = "shop.example.com";
@@ -661,13 +683,14 @@ An app is one file in `appsDir`, named after the app. It is a function of `{ inp
 | `odoo` | `package`, `hostname`, `workers`, `maxCronThreads`, `serverWideModules` | Odoo and nginx on a socket, local PostgreSQL, the filestore on JuiceFS, an admin password var. |
 | `frappe` | `package`, `site`, `webThreads`, `settings` | A bench, local MariaDB and Redis, the site directory on JuiceFS, its secrets. |
 | `freeipa` | `hostname`, `domain`, `realm`, `privateIp4`, `image`, `authelia` | The upstream FreeIPA image under podman, a private address reachable only over WARP, optional Authelia as an OIDC provider, nightly upgrades. |
-| `grafana` | `hostname`, `loginName`, `adminGroup`, `editorGroup`, with `oidc.idp` | Grafana on the metrics node, signed in through an identity provider's Authelia, reaching Loki and Prometheus through `network.hostAccess`. |
-| `wpdb` | `address`, `port`, `clientHosts`, `bufferPoolSize` | The one MariaDB every WordPress site shares, with databases and grants per site. |
+| `grafana` | `hostname`, `loginName`, `adminGroup`, `editorGroup`, with `oidc.idp` | Grafana on whichever node Nomad picks, signed in through an identity provider's Authelia, reaching Loki and Prometheus through `network.hostAccess`. |
+| `attic` | `bucket`, `public`, `hostname`, `retentionDays`, `cache`, `hostOctet` | The cluster's binary cache ([The binary cache](#the-binary-cache)): an Attic server on whichever node Nomad picks, its NARs in a bucket of its own, its index in the app's dataset, and on every node the substituter, the push after each switch, and the proxy that finds it. One per cluster. |
+| `wpdb` | `address`, `port`, `clientHosts`, `bufferPoolSize` | The one MariaDB every WordPress site shares, with databases and grants per site. Runs on the node whose app subnet holds `address`. |
 | `wordpress` | The `wordpress` section, usually written by a tool as JSON | One file, two containers: `<name>` (read-only public face) and `<name>-admin` (writable admin face), each reaching `wpdb` through `network.peerAccess`. |
 
 The payload modules come from [wordpress-nix](https://github.com/Avunu/wordpress), [frappe-nix](https://github.com/Avunu/frappe-nix) and [odoo-nix](https://github.com/Avunu/odoo-nix). Your project flake supplies the `package`. To pin its payload module to the library's, use `inputs.odoo-nix.follows = "cluster/odoo-nix"`.
 
-Beside the kind, every generic `clusterApps` option stays available (`modules/app-container.nix`): `homeNode`, `tunnel.id`, `resources`, `startTimeout`, `network` ([Container networking](#container-networking)), `module` for extra guest config, and so on. `oidc = { idp = "<a FreeIPA app>"; }` makes any app a client of that provider's Authelia. `enable = false;` keeps a file without deploying it.
+Beside the kind, every generic `clusterApps` option stays available (`modules/app-container.nix`): `tunnel.id`, `resources`, `startTimeout`, `network` ([Container networking](#container-networking)), `module` for extra guest config, and so on. `oidc = { idp = "<a FreeIPA app>"; }` makes any app a client of that provider's Authelia. `enable = false;` keeps a file without deploying it.
 
 ### Adding an app
 
@@ -716,24 +739,30 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `ovh-s3/{access-key,secret-key}` | JuiceFS on all nodes. The volume keeps its own copy in its settings, which every mount reads; the metadata node puts a new pair there when the vars change, and running mounts pick it up | Prompt, from your S3 provider |
 | `juicefs-rsa/{rsa.pem,rsa-passphrase}` | The JuiceFS volume's encryption key. Never regenerate it: the volume's data can't be read without it, and `avc` refuses to rotate it | Generated |
 | `juicefs-pg/password` | The JuiceFS metadata engine. Manual: every mount and the metadata role change together | Generated |
-| `nomad-acl/token` | Nomad's management token: the ACL bootstrap and `nomad-acl-init`, on the `nomad-leader` node only | Generated |
+| `nomad-acl/token` | Nomad's management token: the ACL bootstrap and `nomad-acl-init`, on the Nomad servers only | Generated |
 | `nomad-jwt/{signing.key,signing.pub}` | Signs each machine's login JWTs; the key never leaves the operator's machine | Generated |
-| `nomad-login/jwt-<role>` | Each machine's scoped Nomad logins (`fence`, `node-meta`, `avc`, plus `registrar` and `autoscaler` where those run), per machine | Generated, signed by `nomad-jwt` |
+| `nomad-login/jwt-<role>` | Each machine's scoped Nomad logins (`fence`, `node-meta`, `avc`, plus `registrar` where jobs are registered), per machine | Generated, signed by `nomad-jwt` |
 | `nomad-gossip/gossip.hcl` | Nomad's serf encryption key, servers only | Generated |
 | `nomad-ca/{ca.key,ca.crt}` | Nomad's CA; the key never leaves the operator's machine | Generated |
 | `nomad-tls/{agent,cli}.{key,crt}` | Each machine's Nomad certificates (per machine) | Generated, signed by `nomad-ca` |
 | `wg-ctrl/{private,public}` | Each machine's mesh key (per machine); every peer reads the public half | Generated |
 | `audit/token` | Each machine's token for the audit trail (per machine), listed in the Worker's `AUDIT_TOKENS` | Generated |
+| `ci/token` | Each machine's token for the cluster-ci Worker (per machine), listed in the Worker's `AGENT_TOKENS`. Only with `ci.url` | Generated |
 | `canary/value` | The string the [canary scan](#canary-scan) plants and looks for | Generated |
 | `github-token/{nix.conf,netrc}` | Pull loop access to private flakes | Prompt, a fine-grained PAT with read access to contents |
-| `restic/password` | Every app's backup repository. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
+| `restic/password` | Every app's backup repositories, nightly and state. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
 | `backup-target/{access-key,secret-key}` | The backup target | Prompt |
+| `backup-state-target/{access-key,secret-key}` | The state backup's target, only with `backup.state` | Prompt |
+| `cache-s3/{access-key,secret-key}` | The binary cache's bucket, only with an `attic` app. In the cache's container, on the node it runs on | `avc cloud apply`, or prompt |
+| `cache-token/rs256.pem` | What the cache checks every token with, and what makes them. In the cache's container. Regenerating it revokes every token: regenerate `cache-push` with it | Generated |
+| `cache-push/token` | Every node's token for the cache: pull and push on the one cache, nothing else. Made from `cache-token`, good for ten years | Generated |
+| `cache-signing/{secret,public}` | The key the cache signs with. The secret half in the cache's container; the public half is not a secret, is in the repository, and is what every node's `nix.conf` trusts. A new one orphans nothing: the cache signs again as paths are fetched | Generated |
 | `alerting/cf-email-token` | Alert emails | Prompt, a Cloudflare token with Email Sending only |
 | `alerting-watchdog/token` | The dead-man heartbeat | Generated |
-| `cloudflare/provision-token` | The operator's own Cloudflare token for site provisioning; never deployed to a node | Prompt |
+| `cloudflare/provision-token` | The operator's own Cloudflare token, for site provisioning and for `avc cloud`; never deployed to a node | Prompt |
+| `cloud-ovh/{application-key,application-secret,consumer-key}` | The operator's OVH API application, for `avc cloud`, only with `cloud.ovh`; never deployed to a node | Prompt |
+| `cloud-state/passphrase` | What `cloud/terraform.tfstate` is encrypted with, only with `cloud`; never deployed to a node. Never regenerate it: a new one reads none of the state | Generated |
 | `<app>-cf/cloudflared` | Each app's tunnel | Prompt, from `cloudflared tunnel create` |
-| `<app>-db-archive/key` | The key an app's [database archive](#the-database-archive) is encrypted with, only for apps with `archive.enable`. Never regenerate it: a new one reads nothing archived so far | Generated |
-| `<app>-db-archive-s3/{access-key,secret-key}` | The same apps' access to the archive bucket, held inside the app's container | Prompt, a key of the app's own that reaches the archive bucket and nothing else |
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
 
@@ -750,9 +779,10 @@ Rotation notes:
 
 - **`nomad-gossip`:** Nomad copies the key into `<data_dir>/server/serf.keyring` on first start, so a new `gossip.hcl` changes nothing on a running server. Rotate with `nomad operator gossip keyring` (install, use, remove), then regenerate the var to match.
 - **`nomad-ca`:** regenerating reissues every machine's certificates: a hard cut, every node at once. `security.nomadTlsRotation` reissues the agent certificates alone. `NomadTlsCertExpiring` and `NomadTlsCaExpiring` warn first.
-- **`nomad-jwt`:** regenerating reissues every node's logins, and the leader's `nomad-acl-init` updates the auth method on its next switch. Manual in the policy.
+- **`nomad-jwt`:** regenerating reissues every node's logins, and each server's `nomad-acl-init` updates the auth method on its next switch. Manual in the policy.
 - **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots, and its mesh services retry.
 - **`audit`:** a new token must reach the Worker (`avc audit tokens | wrangler secret put AUDIT_TOKENS`), or that node's events are refused (`AuditEventRejected`).
+- **`ci`:** a new token must reach the Worker (`avc ci tokens | wrangler secret put AGENT_TOKENS`), or that node's agent is refused: it then deploys on the timer alone, and its previews stand still.
 - **`canary`:** harmless to regenerate; the next scan plants the new value.
 
 ### Deploying
@@ -789,9 +819,145 @@ The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (
 
 Bump `clan-core` alone, as one reviewable commit. It tracks clan's unstable channel, and `checks.clan-coexist` is what catches an upstream change to host configuration. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
 
+### Previews and continuous deployment
+
+A GitHub App closes the two gaps the pull loop leaves: the wait between a merge and the nodes' next tick, and having nowhere to look at a pull request before it merges. Its endpoint is a Cloudflare Worker, [`workers/cluster-ci`](workers/cluster-ci), because a node accepts nothing inbound. Every node runs an agent (`modules/ci-agent.nix`, on once `ci.url` is set) that asks the Worker what to do, with a token of its own, and the Worker holds each request until it has an answer.
+
+**A merge deploys at once.** Three pushes matter, and GitHub tells the Worker of each:
+
+1. A push to a branch one of your flake inputs follows (a project's `main`). The Worker reads your site's `flake.lock`, finds the inputs that follow that branch, and starts the site's `flake-update.yml` for those inputs alone. Updating a lock takes Nix, so the workflow does it, on a branch, as a pull request with auto-merge: the [merge gate](templates/cluster/README.md) still decides.
+2. The merge of that pull request, or of any other, into the branch `deploy.flakeUrl` names. The Worker answers every node's held request, and each starts `cluster-upgrade.service`: the same tick as the timer's, with every gate above.
+3. Nothing else. The timer stays, so a push the Worker never heard of deploys within `deploy.pullInterval` as before.
+
+**A pull request gets a container.** `preview.slots` on an app declares that many more containers, `<app>-pv1` to `<app>-pvN`, of the same kind with the same parameters:
+
+```nix
+# apps/shop.nix
+preview = {
+  slots = 2;                       # branches previewed at once
+  input = "my-odoo-project";       # the flake input its package comes from
+  repo = "OWNER/my-odoo-project";  # whose pull requests get previews
+};
+```
+
+A slot is dormant like every container, and everything the host decides about one (mounts, memory limit, addresses, firewall) is fixed at evaluation and merged like the rest of the site. What a pull request supplies is what runs inside. When one opens on a branch of `repo`, and at each push to it:
+
+1. The Worker makes the branch a tunnel and a hostname of its own, `<branch>-<app>.<PREVIEW_DOMAIN>`, and gives the preview to the node with the fewest previews. Every node can take one, since each holds a copy of the app's data.
+2. The agent builds your site's flake with `input` at the pull request's commit, for one free slot's container.
+3. The first time, it gives the slot a copy of production: a ZFS clone of the node's copy of the app's dataset, at its newest snapshot (the app's own of the last minute, or a replica's), so the database comes up as after a power cut, and a `juicefs clone` of the app's files. Neither copies a block until one side writes, so the size of the database does not matter.
+4. It starts the container on that closure. The kind's own units migrate the copy before the app starts, exactly as a deploy migrates production. A later push keeps the copy and migrates it again.
+5. It asks the hostname for the kind's health path, and the Worker writes the result as one comment on the pull request, edited in place, and as the commit status `preview/<app>`, which a branch ruleset can require.
+
+One preview per app and branch, whatever the number of pull requests on the branch. It goes when the last of them closes or the branch is deleted: container stopped, clone destroyed, files removed, then tunnel and DNS record deleted. `/preview reset` in a comment on the pull request, from someone with write access, starts again from a fresh copy. With every slot taken, a new branch waits and says so.
+
+**What a preview is trusted with.** A copy of the app's data and the app's own secrets, running code that has not been reviewed. So:
+
+- **Forks get nothing.** Only a pull request from a branch of the repository itself is previewed, which takes write access to push. That is in the Worker's code, not its configuration.
+- **A copy does not act as production.** An `odoo` slot runs Odoo's `neutralize` on its copy before anything else, which turns off its mail servers, scheduled actions and payment providers, and does not start if that fails (Odoo 16 and later). A `frappe` slot sets `mute_emails` and `pause_scheduler`, and is not given the app's `cloud-storage` settings: the bucket is production's, so a preview's attachments are missing rather than writable.
+- **The preview's own sign-in is all that guards it.** It is production's data at a hostname anyone can ask for. Put the preview zone behind Cloudflare Access.
+- **Use a zone that serves nothing else** for `PREVIEW_DOMAIN`: unreviewed code at a subdomain of a production zone can set cookies for it.
+- **A slot is not backed up**, is no Nomad job, and stays on the node that seeded it, where its clone is. Its logs are with every app's, under its slot's name. A build's last lines and the names of failed units go to the pull request; a guest's log never does, since it is a copy of production speaking.
+
+Setting it up, once per site:
+
+1. Create a GitHub App from [`workers/cluster-ci/app-manifest.json`](workers/cluster-ci/app-manifest.json) (repository permissions: contents read, pull requests write, commit statuses write, actions write; events: pull request, push, delete, issue comment). Install it on the site's repository and on each project's.
+2. Fill in `wrangler.toml` (`PREVIEW_DOMAIN`, `CF_ACCOUNT_ID`, `CF_ZONE_ID`, `GITHUB_APP_ID`), then:
+   ```sh
+   cd workers/cluster-ci
+   wrangler deploy
+   wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem
+   wrangler secret put GITHUB_WEBHOOK_SECRET
+   wrangler secret put CF_API_TOKEN          # Cloudflare Tunnel: Edit, and DNS: Edit on the preview zone
+   ```
+   Point the App's webhook at the Worker's `/webhook/github`.
+3. Set `ci.url` in `topology.nix`, run `clan vars generate` for each node's `ci/token`, ship it, and give the Worker the tokens: `avc ci tokens | wrangler secret put AGENT_TOKENS`.
+4. Add `preview` to an app and ship it. The slots exist once the nodes have deployed.
+
+The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previews` by `state`. No alert rule reads them yet.
+
+**What is proven.** `checks.cluster-ci` runs the Worker's decisions (which webhook makes, moves, resets or removes a preview, what a node's report does to the pull request, which push deploys and which updates a lock) with GitHub and Cloudflare stood in for. `checks.ci-agent` runs the agent as a process against a stand-in Worker and stand-in `nix`, `zfs`, `juicefs` and `systemd`, and holds it to what it asks of them and in which order. A slot's container and its host evaluate on the fixture cluster. Nothing here has met GitHub, Cloudflare or a node: no slot has been started, no clone taken, no copy migrated. The first preview on a real site is that test.
+
+### Providers
+
+What the site needs from OVH and Cloudflare is made by [OpenTofu](https://opentofu.org), from a configuration nobody writes: `lib/cloud.nix` derives it from the topology and the apps, as the flake's `cloud` output. `avc cloud` runs it on your machine. No node holds a provider's API credentials or runs OpenTofu.
+
+```sh
+avc cloud plan                 # what would change; nothing done
+avc cloud apply                # done, written back, and shipped as a pull request
+avc cloud apply --destroy <address>[,<address>]
+avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and credentials
+```
+
+| Provider | What is made | From |
+| --- | --- | --- |
+| OVH | A bucket, a user of its own, that user's S3 key pair, and a policy that reaches that bucket and no other | `objectStorage.juicefsBucket`; `backup.state.target.bucket` when it is on the same endpoint |
+| OVH | The same for the binary cache's bucket, unversioned | an app of kind `attic`, its `attic.bucket` |
+| OVH | Versioning on the state backup's bucket, and hidden versions expired after `noncurrentDays` | `backup.state.target.bucket` |
+| Cloudflare | A tunnel per app, locally configured | every app with a hostname |
+| Cloudflare | A proxied CNAME per hostname, to the app's tunnel | hostnames in a zone of `cloud.cloudflare.zones` |
+| Cloudflare | The private route to a FreeIPA server's address | `freeipa.privateIp4` |
+| Cloudflare | The audit trail's R2 bucket, with a lock rule | `cloud.cloudflare.auditBucket` |
+
+No user may delete an object version, so on the versioned bucket a node that is taken over can hide backups and not destroy them.
+
+**What comes back goes where the site reads it.** An S3 key pair into its var (`ovh-s3`, `backup-state-target`, `cache-s3`), written only when it differs. A new tunnel's id into `apps/<app>.json`, which merges with the app's `.nix`, and its credentials file into the app's `<app>-cf/cloudflared`. So a new app with a hostname needs no `cloudflared tunnel create` and no `tunnel.id`: `avc cloud apply` makes the tunnel and writes both. The apply ends in the same pull request every change does.
+
+**A tunnel made by hand is adopted.** An app that already has a `tunnel.id` gets an import of it, and its secret and its name stay as they are. A DNS record made by hand is not known to the topology by any id: delete it first, or `avc cloud tofu "import cloudflare_dns_record.<name> <zone id>/<record id>"`. A bucket made by hand likewise (`import ovh_cloud_project_storage.juicefs <project>/<region>/<name>`); its old user and key are then yours to remove once the new pair is deployed.
+
+**Nothing is destroyed by accident.** Buckets and tunnels carry `prevent_destroy`, so a plan that would delete one fails in OpenTofu. Anything else a plan would delete or replace, `avc cloud apply` refuses until each address is named with `--destroy`. A replaced key pair is one a node is using: name it, apply, and let the ship reach the nodes.
+
+**The state** is `cloud/terraform.tfstate` in your repository, committed with each apply. It holds every key the providers issued, so OpenTofu encrypts it (and every saved plan) with `cloud-state/passphrase`, enforced: without the passphrase it refuses to read the state, and it never writes one in the clear. Put the passphrase in the [offline kit](#the-offline-kit). Two operators applying at once would each commit a state; the pull request of the second conflicts, which is the lock.
+
+To turn it on: `cloud` in the topology; `clan vars generate` for `cloud-state`, and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
+
+Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket (the site provisioner's), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
+
+### The binary cache
+
+One app of kind `attic` gives the cluster a binary cache, an [Attic](https://github.com/zhaofengli/attic) server:
+
+```nix
+# apps/cache.nix
+{
+  attic.bucket = "example-cluster-cache";
+}
+```
+
+Then `avc cloud apply` (the bucket and its key), `clan vars generate <node>` (`cache-token`, `cache-signing`, `cache-push`), and ship. The nodes ask the cache once `cache-signing/public` is in the repository, which generating the vars puts there.
+
+- **What goes in.** Each node pushes the closure of the system it runs after every switch and once a day (`cluster-cache-push`), and that closure holds every app container the node was built with. The CI agent pushes each preview it builds. Attic leaves out what cache.nixos.org already signed, so the bucket holds what the cluster built and nothing else. With pull-deploy the canary node builds first and pushes; the others fetch.
+- **What comes out.** Every node has the cache as a substituter at its own loopback (port 8732). HAProxy there passes the request over the mesh (port 8733) to whichever node has the container, found by health check. The container takes a fixed address in the app subnet of the node it starts on (`attic.hostOctet`, 9), so no node has to be told where it went.
+- **It is never needed.** A push that fails is the `CachePushStale` alert, and fails nothing. With the cache on no node the loopback port refuses connections, Nix leaves the substituter alone for a minute at a time and builds. That is also how a new cluster's first deploy goes, and the cache's own.
+- **Who may write.** Reading needs no token. Writing needs `cache-push/token`, which every node holds and which can push and pull on this one cache and nothing else.
+- **Retention.** A path nobody pushed or fetched for `attic.retentionDays` (90) is dropped, and chunks no path uses are deleted from the bucket, every twelve hours. What a node runs is pushed daily, so it stays.
+- **What is not backed up.** The bucket. The index (a SQLite file) is the app's local state, replicated and snapshotted like any app's; lose both and the nodes fill a new cache as they deploy.
+
+**`attic.public = true` serves it to anyone**, at `attic.hostname` on the app's tunnel, read-only: an nginx in the container passes `GET` and `HEAD` and refuses Attic's API, so nothing is pushed or configured from outside whatever token is presented. It is off by default, because of what it gives away:
+
+- **Every store path the cluster built**, to anyone who knows or can compute its name. That includes each node's whole system closure: the rendered configuration of every service and every app, which is your private repository's `apps/` and topology in built form (hostnames, addresses, firewall rules, job specifications, package versions).
+- **Your apps' own code**, as built packages, if the projects are private.
+- **Not the secrets.** They are clan vars, decrypted on the node into `/run/secrets` and never part of a store path. That holds for what this library writes; a value you put in an app's `module` as a string is in the store, and so in the cache.
+
+Attic does not list a cache's contents, and a store path's name starts with a hash of everything it was built from, so a path is fetched by someone who has its name: from a deployed system's closure, or by evaluating the same flake. Treat that as slowing a reader down, not stopping one. If other people should have the apps' packages and not your cluster's configuration, a public cache is the wrong tool as it stands: it pushes whole system closures.
+
 ### Backups and restore
 
-Each app is backed up on its `homeNode` into its own restic repository, `<target>/apps/<sha256 of repoSalt and the app's name>`. The two are joined with nothing between them, so from a machine that isn't a node, `printf %s "$salt$app" | sha256sum` gives the directory name. `cluster-backup-list <app>` prints it on a node, and is the only map from hash to app. A snapshot holds a logical database dump, taken inside the container with its own tools, and the app's JuiceFS paths, so a restore brings back a database and the files it refers to together. `backup.localSnapshot = true` adds an app's local state, read from a ZFS snapshot, for apps no dump covers.
+There are two backups, to two places, on two schedules.
+
+**The nightly one** is the long history, and goes to `backup.target`: somewhere that is neither the nodes nor their provider. Each app is backed up, by whichever node is running it when the timer fires, into its own restic repository, `<target>/apps/<sha256 of repoSalt and the app's name>`. The two are joined with nothing between them, so from a machine that isn't a node, `printf %s "$salt$app" | sha256sum` gives the directory name. `cluster-backup-list <app>` prints it on a node, and is the only map from hash to app. A snapshot holds a logical database dump, taken inside the container with its own tools, and the app's JuiceFS paths, so a restore brings back a database and the files it refers to together. `backup.localSnapshot = true` adds an app's local state, read from a ZFS snapshot, for apps no dump covers.
+
+**The state backup** is the recent past off the nodes, and exists once the topology has `backup.state`, with a target of its own: the nodes' own object storage is the natural one, since an hourly upload wants to be near and the nightly copy is the one that is far. Every hour (`backup.state.schedule`), each app's local state, as its newest replicated snapshot has it, goes into a second repository of the app's, `<state target>/state/<another hash>`: the database's directory itself, crash-consistent, which a database recovers from as from a power cut. One node does it per app, a replica, so reading a whole database costs the running app nothing. 48 hourly and 14 daily snapshots are kept (`backup.state.retention`). It is a physical copy: it restores to the same database version, and not the app's JuiceFS files, which are in object storage already.
+
+```sh
+cluster-state-backup [<app>]               # now; does nothing on a node that is not the one to
+cluster-state-backup-list <app>            # its snapshots, dated as the data is
+cluster-state-restore <app>                # print the plan
+cluster-state-restore <app> --snapshot <id> --yes   # the app stopped first: nomad job stop app-<name>
+```
+
+A state restore replaces the whole dataset on the node it runs on, after a ZFS snapshot of what was there, and every other node receives the result; then `nomad job start app-<name>`. Which to reach for: a node died, nothing, the app has moved already. A mistake in the last day, a replicated snapshot on any node (`zfs list -t snapshot <pool>/state/apps/<app>`, and `zfs clone` to read one). The nodes are gone, or the mistake is older: the state backup for the last two weeks to the hour, the nightly one beyond that or across a database version.
+
+The nightly backup's commands:
 
 ```sh
 cluster-backup [<app>]                     # back up now
@@ -803,7 +969,7 @@ cluster-restore <app> --db-only --yes      # or --files-only
 cluster-restore <app> --to-scratch /var/tmp/r
 ```
 
-A weekly rehearsal restores each app's backup to prove it works. If you lose a node, set the app's `homeNode` to a survivor, ship it (`avc deploy ship`), and run `cluster-restore <app> --yes` there. Keep your age key somewhere other than your laptop, because backups can't be decrypted without it.
+A weekly rehearsal restores each app's backup to prove it works. If you lose a node, its apps start on the others by themselves, from their replicated state ([Where an app runs](#where-an-app-runs)); the backup is for losing more than that, or for going further back. `cluster-restore` runs on the node the app is running on, or on any node while it runs on none. Keep your age key somewhere other than your laptop, because backups can't be decrypted without it.
 
 The staging, verify and restore directories (`/var/lib/cluster-backup/{staging,verify,restore}`) hold plaintext dumps until the next run, on the node's encrypted root.
 
@@ -829,53 +995,17 @@ juicefs mount -d sqlite3://meta.db /mnt/rescue --read-only
 
 Without the passphrase, with the wrong one, or with the wrong PEM, the load or the mount fails rather than reading garbage. For the backups: `restic -r <target>/apps/<hash> snapshots` with `restic/password` and the target's credentials.
 
-### The database archive
-
-A nightly backup can be a day old. `archive.enable = true` in an app's entry also archives its database continuously to object storage: a base backup and every change since, encrypted inside the app's container before it leaves. MariaDB is archived with WAL-G: a timer closes the binary log and ships it every `archive.flushSeconds` (60 by default), if anything was written. PostgreSQL is archived with pgBackRest: PostgreSQL hands over each WAL segment as it closes one, which it does at least every `flushSeconds` while there are changes. A clean stop of the database ships the last of them. A base backup is taken when the newest is older than `archive.baseIntervalHours` (24), and `archive.retainBaseBackups` (8) are kept per generation, with the changes since the oldest.
-
-**How far back it reaches.** To any moment since the oldest base backup kept: one interval less than the number kept, so seven days as set. Both are per app, in its `archive` entry. The archive is for the recent past, to the second; the restic backups above are the long history, to the night. Each base backup is a whole copy of the database, compressed, so eight of them cost about eight times that plus a week of changes, per app. A base backup past the count is removed by the archiver when its successor is in storage, with the changes from before the oldest kept. A shorter interval would shorten what a restore has to replay, at a base backup that often; nothing has timed a restore yet, so the interval is a day.
-
-**It is an archive, and nothing restores from it yet.** No command or timer in the library brings a database back from it, after a mistake or after a node is lost, so the restic backups above remain the copy that is rehearsed. `checks.db-archive` and `checks.db-archive-pg` prove that the archive is written, encrypted and complete through the failures they stage, and that a base backup comes back through the tool itself with the key and not with another.
-
-To turn it on for an app:
-
-1. Create a bucket for archives and nothing else, and name it in `objectStorage.dbArchiveBucket`. Evaluation refuses the JuiceFS volume's bucket and the backup target's, because every archived app's container holds an S3 key to this one.
-2. At the provider, make a key pair for the app that reaches this bucket and nothing else, and only the app's own path in it if the provider can scope a key that far. `clan vars generate <node>` asks for it (`<app>-db-archive-s3`) and makes the archive key (`<app>-db-archive`).
-3. Ship it, then restart the app once: `nomad job restart app-<name>`. The credentials are bind mounts, which a running container does not gain on a deploy, and PostgreSQL reads `archive_mode` only when it starts.
-4. Put `<app>-db-archive/key` in the [offline kit](#the-offline-kit).
-
-PostgreSQL needs an `https` endpoint, since pgBackRest speaks to S3 over TLS only.
-
-**Where it goes.** `<dbArchiveBucket>/db/<hash>/gen-<N>/`, where the hash is of `backup.repoSalt` and the app's name, so the provider does not read app names off the listing: `printf %s "db-archive:$salt$app" | sha256sum`.
-
-**Generations.** N is the generation of the data directory, kept in a marker file inside it (`db-archive.generation`), so the two are lost together. A data directory without a marker starts generation 1 only on an archive that was listed and found empty. On an archive that holds data, or one that could not be listed, the archiver refuses and uploads nothing (`cluster_db_archive_refused 1`): a second history appended to a generation would leave a restore that replays both. It refuses the same way when MariaDB's binary logs are numbered again from the start. The database keeps running; only its archive stops. If the data directory in front of you is the one to keep archiving, say so, in the container:
-
-```sh
-nixos-container run <app> -- db-archive status                     # generation, path, metrics, base backups
-nixos-container run <app> -- db-archive next-generation            # says which generation it would start
-nixos-container run <app> -- db-archive next-generation --yes      # starts it, with a base backup of its own
-nixos-container run <app> -- db-archive push                       # ship now
-nixos-container run <app> -- db-archive base --force               # a base backup now
-nixos-container run <app> -- db-archive generations                # each generation, its last write, and whether it can go
-nixos-container run <app> -- db-archive drop-generation <N>        # says what it would delete
-nixos-container run <app> -- db-archive drop-generation <N> --yes  # deletes it
-```
-
-`db-archive wal-g <arguments>` (MariaDB) and `db-archive pgbackrest <arguments>` (PostgreSQL) run the tool itself with the generation's settings.
-
-An earlier generation stays as it was, and is the only archive of its days, so it is kept for as long as a restore reaches back, counted from its last write. After that `drop-generation` deletes it, and nothing deletes one unasked: `cluster_db_archive_droppable_generations` counts the ones waiting, as of the last base backup. The command refuses the data directory's own generation, a later one (another node's, written since this one was current), one still inside that time, and one that storage did not list. No flag overrides it; deleting sooner is done at the provider. It needs no archive key, so it also removes a generation written under an earlier one.
-
-**What the archive does not hold.** Writes newer than the last shipment are only on the node's disks: up to `flushSeconds` of them, and everything written while storage is unreachable. MariaDB keeps its binary logs for three days, and an outage longer than that leaves a hole that the next base backup closes. PostgreSQL keeps WAL it could not ship up to `cluster.dbArchive.postgres.queueMaxMiB` (4096, set in the app's `module`). Beyond that it lets the oldest segment go rather than fill the disk and stop the database, records it in `db-archive.gap` in the data directory, and takes a base backup as soon as storage takes segments again. The changes in between are in no archive. A stop while storage is away is still a stop, with the last log left on the node: in the check, PostgreSQL takes 54 seconds over it, of the 90 a container is given.
-
-**Watching it.** Each archived app's node exports five metrics with an `app` label: `cluster_db_archive_last_ok_timestamp_seconds` (the last time everything written was found in storage, which stands still during an outage, a refusal or a gap), `cluster_db_archive_last_base_timestamp_seconds`, `cluster_db_archive_generation`, `cluster_db_archive_refused` and `cluster_db_archive_droppable_generations`. No alert rule reads them yet, so a stalled archive shows in a query and not in an email.
-
-**Keys.** The archive key is bound to data, like `restic/password`: `secrets/policy.toml` marks it never, and a new value reads nothing archived so far. If it has to change, as after [a node left your control](#a-node-left-your-control), change it by starting a generation under the new one: `clan vars generate <node> --generator <app>-db-archive --regenerate`, ship it, `nomad job restart app-<name>`, and at once `db-archive next-generation --yes` in its container. Do not leave out the last step, or one generation holds data under two keys. The earlier generations open with the old key only, so it stays in the kit until they are dropped. They are kept as long as any other: they are the only archive of those days, and deleting them takes nothing back from whoever read them. The one case for deleting sooner, at the provider, is a machine kept by whoever can also read the bucket without its S3 key. Each of those steps is what a check proves by itself; the sequence has not been rehearsed.
-
-The S3 key is inside the container, so a compromised app can delete or overwrite its own archive, and with a key that reaches the whole bucket, the other apps' archives too. It cannot read theirs. The key has to be allowed to delete objects, because the archiver removes old base backups with it. As for the backup target, a bucket with versioning and a key that cannot delete object versions leaves such an app able to hide objects but not to destroy history. With versioning, give the bucket a rule that expires noncurrent versions after the time above, or nothing deleted ever leaves it. Never a rule that expires current objects by age: both tools write files once that every later restore reads. Neither versioning nor such a rule is set or checked by the library, and no check runs against a versioned bucket.
-
 ### Monitoring and alerting
 
-Every node runs node_exporter, `smartctl_exporter`, a JuiceFS write probe, the boot report and audit, the canary scan and a jumbo-frame probe of every peer, and ships its journal and every container's journal to Loki through Vector over the mesh. The node tagged `metrics` adds Prometheus, Loki, Alertmanager and blackbox probes of every app's public hostname.
+Every node runs node_exporter, `smartctl_exporter`, a JuiceFS write probe, the boot report and audit, the canary scan and a jumbo-frame probe of every peer, and ships its journal and every container's journal through Vector over the mesh. Every node also runs the whole of monitoring: a Prometheus that scrapes every node, a Loki that every node ships to, an Alertmanager, and blackbox probes of every app's public hostname.
+
+No node is the monitoring node, and nothing about monitoring is placed or elected: it does not depend on the scheduler it watches.
+
+- **One alert is one email.** Each Prometheus evaluates the same rules and tells its own Alertmanager; the Alertmanagers gossip on the mesh (port 9094) about what has been sent.
+- **Every node has every log line.** Each node's Vector feeds its own Loki from the journal, and every other node's through a 512 MiB buffer on disk. A node down for longer than its peers' buffers hold has a gap in its own copy when it returns; the other copies are whole.
+- **Grafana asks the node it is on,** wherever Nomad puts it, so a graph may show a gap for the time that node was down which another node's history does not have.
+- **The weekly report is sent once,** by the node whose address sorts first among those its Prometheus sees up.
+- **What it costs:** the stack once per node, in memory and in disk (each Loki has its 50 GB dataset).
 
 ```
 Prometheus (lib/alert-rules.nix) -> Alertmanager -> alert-email-bridge
@@ -886,7 +1016,7 @@ Setup, once:
 
 1. Onboard the sender's domain (`alerting.from`) to Cloudflare Email Sending, including SPF and DKIM.
 2. Create an API token with the Email Sending permission only, and run `clan vars set <node> alerting/cf-email-token`.
-3. After the deploy, run `cluster-alert-test` on the metrics node. It fires a real alert through the whole path, which resolves by itself after 5 minutes.
+3. After the deploy, run `cluster-alert-test` on any node. It fires a real alert through the whole path, which resolves by itself after 5 minutes.
 
 A weekly report emails each app's last backup, rehearsal and repository check. It is a positive signal: if it stops arriving, that tells you something.
 
@@ -935,7 +1065,7 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `AppLogCritical` | warning | An app logged at critical level or above. |
 | `AppErrorBurst` | warning | An app logged over 100 errors in 10 minutes. |
 | `AppMigrationFailed` | warning | A database migration failed. |
-| `BackupStale` | critical | No successful backup recently. |
+| `BackupStale` | critical | No successful backup recently, on any node. |
 | `BackupPartial` | warning | The last backup could not read some files. |
 | `BackupVerifyStale` | warning | Backups not proven restorable recently. |
 | `BackupCheckStale` | warning | A repository not pruned or checked recently. |
@@ -951,6 +1081,14 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `FreeIPARestartPending` | warning | A deployed FreeIPA change has not been applied for a day. |
 | `FreeIPAHealthStale` | warning | The FreeIPA health check has not run. |
 | `FreeIPAHealthNeverRan` | warning | The FreeIPA health check has never reported. |
+| `StateBackupStale` | warning | An app's state has not reached the state backup target for 4 hours (`backup.state.staleHours`). |
+| `StateBackupNeverRan` | warning | An app's state has never reached the state backup target. |
+| `StateReplicaLagging` | warning | A node's copy of an app's local state is over 10 minutes behind the running one. |
+| `StateReplicationStale` | warning | A node has not snapshotted or pulled app state for 15 minutes. |
+| `StateReplicationFailing` | warning | Replicating some app's state fails on a node. |
+| `StateOrphaned` | warning | A node holds a copy of app state set aside after a failover, with writes no other node has. |
+| `CacheDown` | warning | The binary cache answers no node. Deploys build what they would have fetched. |
+| `CachePushStale` | warning | A node has pushed nothing to the binary cache for three days. |
 | `LokiDown` | warning | Loki is down: logs are queueing on every node. |
 | `LogShipperDown` | warning | A node's log shipper is down. |
 | `LogShippingFailing` | warning | A node has been failing to push logs. |
@@ -964,7 +1102,7 @@ Alerting runs on the cluster, so it can't report the cluster's own death. `worke
 cd workers/cluster-watchdog
 wrangler kv namespace create WATCHDOG          # put the printed id in wrangler.toml
 wrangler r2 bucket create <bucket_name in wrangler.toml>   # the audit trail; add a bucket lock rule
-clan vars get <metrics node> alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
+clan vars get <node> alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
 wrangler secret put CF_EMAIL_TOKEN             # the Email-Sending-only token
 avc audit tokens | wrangler secret put AUDIT_TOKENS
 wrangler deploy
@@ -974,7 +1112,7 @@ Then set `alerting.heartbeatUrl` to its `/heartbeat` URL and `alerting.auditUrl`
 
 #### Audit trail
 
-Each node sends events to the Worker's `/event`, with its own `audit/token`, from a spool on the node that survives outages: `boot` (the boot report: unlock method, devices, initrd SSH logins, Secure Boot, PCR 7, generation), `deploy` (each tick's result), `ssh_login`, `nomad_acl` (token and policy changes, from the leader) and `canary` (a hit). The Worker accepts only the fields each kind's schema names, each required, from a token allowed that kind, and stores each event in the R2 bucket before it emails: it can append, never read or delete. It emails each boot: `[NOTICE]` when the report says every leg unlocked from the TPM under enforcing Secure Boot, `[FIRING]` otherwise. The report is the node's own account, so a clean one is a notice to read, not proof.
+Each node sends events to the Worker's `/event`, with its own `audit/token`, from a spool on the node that survives outages: `boot` (the boot report: unlock method, devices, initrd SSH logins, Secure Boot, PCR 7, generation), `deploy` (each tick's result), `ssh_login`, `nomad_acl` (token and policy changes, from every Nomad server: each sends what its own event stream showed, so one change is in the trail once per server, under each one's name, and no one server can keep it out) and `canary` (a hit). The Worker accepts only the fields each kind's schema names, each required, from a token allowed that kind, and stores each event in the R2 bucket before it emails: it can append, never read or delete. It emails each boot: `[NOTICE]` when the report says every leg unlocked from the TPM under enforcing Secure Boot, `[FIRING]` otherwise. The report is the node's own account, so a clean one is a notice to read, not proof.
 
 Lock the R2 bucket against deletion with a bucket lock rule, so a stolen Cloudflare token cannot rewrite history either. How long to keep events is the site's decision ([Defaults awaiting a decision](#defaults-awaiting-a-decision)); until a rule says otherwise, they are kept. The sender is strict about TLS: a private CA in front of the Worker needs proper CA extensions.
 
@@ -984,7 +1122,7 @@ A weekly scan plants the `canary` value in a file on the JuiceFS volume (`/mnt/j
 
 ### Logs
 
-Grafana queries Loki with labels `node`, `app`, `site`, `service` and `level`. The payload flakes supply the application fields. A label contract is pinned at build time: `modules/logging.nix` runs its VRL program over sample entries with `vector vrl`, and a program that stops emitting a label fails the system's build. Loki's store is on the `metrics` node's own encrypted disk, in its own dataset (`rpool/loki`, 50 GB quota): moving the `metrics` tag starts an empty Loki.
+Grafana queries Loki with labels `node`, `app`, `site`, `service` and `level`. The payload flakes supply the application fields. A label contract is pinned at build time: `modules/logging.nix` runs its VRL program over sample entries with `vector vrl`, and a program that stops emitting a label fails the system's build. Each node's Loki has its store on that node's own encrypted disk, in its own dataset (`rpool/loki`, 50 GB quota).
 
 ## Upgrading a running cluster
 
@@ -993,12 +1131,18 @@ This version is written for fresh installs. A cluster running an earlier version
 - **Disk encryption needs a reinstall.** A running plaintext node can only stay as it is with `insecurePlaintextBoot` (and the site's `insecureFleetKeysOnPlaintextDisk`), or be reinstalled through [Installing a node](#installing-a-node).
 - **The first deploy of this code waits on every node.** The running closures have no boot contract, so the contract gate refuses until `/run/cluster-upgrade.approve` lists the new closure, node by node. And they have no boot stack, so every node but the canary also waits until the canary has rebooted into it.
 - **Nomad TLS and the gossip key.** Rolled out node by node by the pull loop, servers with and without the key can't gossip, and plaintext and TLS RPC can't talk. All servers must switch together.
-- **Scoped tokens.** The leader's `nomad-acl-init` has to run before any other node's logins succeed; until then those retry every 10 seconds, and a non-leader's deploy may report an activation failure once and then recover.
+- **Scoped tokens.** One server's `nomad-acl-init` has to run before any other node's logins succeed; until then those retry every 10 seconds, and a non-leader's deploy may report an activation failure once and then recover.
 - **The mesh.** etcd's peer addresses move from the control VLAN to the mesh, and etcd reads its member list only on a new data directory, so an existing member keeps advertising its old addresses: an in-place move needs `etcdctl member update` per member, or a fresh etcd. Not tested. SSH over the VLANs stops.
 - **JuiceFS encryption.** A volume formatted before is plaintext, and every mount and the metadata node now refuse it (exit 3). Moving to an encrypted volume is a migration (a new volume, copy, cut over), not a switch.
-- **Loki's dataset.** A node installed before has no `rpool/loki`, and disko creates datasets only at install. Create it first on the `metrics` node: `zfs create -o mountpoint=legacy -o quota=50G -o com.sun:auto-snapshot=false rpool/loki`. Required mounts are in the boot contract, so the closure waits for approval anyway; create the dataset before approving. The old Loki bucket is no longer used.
+- **Loki's dataset.** A node installed before has no `rpool/loki`, and disko creates datasets only at install. Create it first, on every node: `zfs create -o mountpoint=legacy -o quota=50G -o com.sun:auto-snapshot=false rpool/loki`. Required mounts are in the boot contract, so the closure waits for approval anyway; create the dataset before approving. The old Loki bucket is no longer used.
 - **Hashed backup paths.** Apps with repositories at `apps/<app>` get new, empty ones at the hashed path; the old ones stay untouched. Deploy before the first backup, or `restic copy` each app across.
 - **Every container restarts once.** Each job now runs as `nomad-apps` with a new wrapper, so each allocation is replaced. Containers with `peerAccess` get a new veth, which a reload cannot apply: `nomad job restart app-<name>`. Containers' WAN MACs become fixed (`02:76:77:<node index>:<iid>`); if your provider pins MACs per port or address, check before rollout.
+- **The `nomad-leader` tag is gone.** Remove it from the node that had it (evaluation warns while it is there). Every `nomad-server` node now holds `nomad-acl` and a `registrar` login: `clan vars generate` for each server that did not have them, and add `nomad_acl` to those servers' kinds in the watchdog Worker's `AUDIT_TOKENS` (`avc audit tokens` prints the new value), or the Worker refuses their ACL events and they stay in the spool.
+- **`homeNode` is gone, and local state moves into datasets.** Remove `homeNode` from every app (evaluation refuses it). An app's database is then a plain directory on the node it was pinned to, and the app has to start there once more: that start copies the directory into `<pool>/state/apps/<app>` (as long as the copy takes, inside `startTimeout`) and keeps the original as `/state/clients/.<app>.before-datasets`, to remove by hand. Started on any other node first, it refuses and Nomad tries again elsewhere, so an app may take a few attempts to land. To choose instead of waiting: `nomad node eligibility -disable` the other nodes, `nomad job restart app-<name>`, and enable them again. Each other node then receives a whole copy, which needs the disk. `/state` must be ZFS, as the installer makes it. Not rehearsed on a site with data.
+- **The scheduler algorithm.** New clusters spread apps over nodes. One bootstrapped before keeps Nomad's packing until told, once, on a server: `nomad operator scheduler set-config -scheduler-algorithm=spread`.
+- **The `backup` tag does nothing now.** Each app is backed up by the node running it. Leave the tag or remove it.
+- **The database archive is gone.** `archive.*` on an app, `objectStorage.dbArchiveBucket` and the `<app>-db-archive*` vars no longer exist: remove them, and the archive bucket and its keys at the provider when its last week is no longer wanted. What replaces it is replication between the nodes and, off them, `backup.state`.
+- **The `metrics` tag does nothing now, and the autoscaler is gone.** Every node runs Prometheus, Loki and Alertmanager. The node that had the tag keeps its history; the others start empty and fill from then on, and each needs `rpool/loki` (above). Remove the tag or leave it. The Nomad autoscaler ran on that node and never acted, since no job carries a scaling policy; its `autoscaler` login role went with it, so `clan vars generate` reissues each node's `nomad-login`.
 
 ## Testing
 
@@ -1025,7 +1169,9 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 
 | Check | What it proves |
 | --- | --- |
-| `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets and audit flows. |
+| `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets, audit and pipeline flows. |
+| `cluster-ci` | The pipeline's Worker: a pull request becomes one preview per app and branch with its own tunnel and hostname, a fork gets nothing, a node's report reaches the pull request only for the commit it is about, a preview's tunnel is deleted only after its node let go of it, and which push deploys and which updates the site's lock. |
+| `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
 | `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
 | `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
 | `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that `clan vars generate` can read every generator of a new site. Evaluation only. |
@@ -1053,13 +1199,13 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `alerting` | An alert travels Prometheus, Alertmanager and the bridge to a stub of the Cloudflare API, in a VM. |
 | `cluster-watchdog` | The dead-man's logic, and the audit Worker's schemas, tokens and emails. |
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |
+| `cloud` | The fixture's OpenTofu configuration validated against the OVH and Cloudflare providers' own schemas, with the OpenTofu `avc` runs: a bucket, user, key pair and one-bucket policy per bucket, none able to delete a version; a tunnel per app, adopted where the app names one; proxied CNAMEs, FreeIPA's private route, the locked audit bucket; and where each output is written back. No provider is contacted. |
 | `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM. |
-| `db-archive` | The database archiver for MariaDB against an S3 server, in a VM: generation 1 by the timer alone; what reaches storage is encrypted, and comes back with its key and not with another; a push is recorded only once its log is listed in storage; no key, no upload; renumbered logs, an archive that already holds data and one that could not be listed are refused; base backups and retention, with the binary logs from before the oldest base backup kept; an earlier generation kept for as long as a restore reaches back and then deleted when asked, and never a later one or the data directory's own; an outage, and a stop with and without storage. |
-| `db-archive-pg` | The same for PostgreSQL, where PostgreSQL hands over each WAL segment itself: every stored object is ciphertext; nothing is uploaded while the archiver refuses; WAL that cannot be shipped is kept up to its limit and dropped beyond it, and the gap holds the freshness metric still until a base backup closes it; a restored base backup carries no marker; earlier generations kept and dropped by the same rule. |
-| `db-archive-wiring` | What `archive.enable` gives an app's container and what it refuses to evaluate: the bucket and salted path, the per-app generators, read-only credential mounts, each engine's settings, eight daily base backups unless the app says otherwise, and no bucket shared with JuiceFS or the backups. Evaluation only. |
+| `attic` | The binary cache on the fixture node, placed by Nomad: made with the site's signing key and unchanged by a second run; reached at the node's loopback through the mesh port; a pushed path deleted and substituted back, which takes the trusted signature; no configuring or pushing without a token, no configuring with a node's; the public face serving reads and refusing every write and the API; and with the cache stopped, a refused port, a build that goes ahead, a push that fails nothing, and a probe that says down. The fixture keeps NARs in a directory: S3 is not exercised. |
+| `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
 | `cluster-single` | `node1`'s real machine module boots and walks the whole cold start, twice: secrets, networking, the mesh, etcd, encrypted JuiceFS on S3, Nomad with TLS and scoped tokens, every app's job, monitoring, the audit producers. Jobs register but aren't placed. About 5 GB of RAM. |
-| `cluster` | Three voters form quorums, share one JuiceFS volume, and run probe containers with cross-node reachability, pinning and fencing. About 9 GB of RAM. |
+| `cluster` | Three voters form quorums, share one JuiceFS volume, and run probe containers with cross-node reachability, an app held to one node by a constraint, and fencing. About 9 GB of RAM. |
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 
@@ -1084,8 +1230,7 @@ Each of these is built with a default and is easy to reverse. They are choices f
 | Choice | Default | To reverse |
 | --- | --- | --- |
 | The initrd emergency shell (D3) | Kept, behind a hashed random password, with a PCR 7 burn before it starts. The only way in if the initrd's network fails. | No shell at all: `emergencyAccess = false` in `modules/boot-security-core.nix` and its assertion in `modules/boot-security.nix`. SSH recovery still works. |
-| The Nomad management token (D6) | Kept on the `nomad-leader` node, read only by `nomad-acl-init`. Deleting it adds little: root on a server can mint one. | Delete it after `nomad-acl-init` and make policy changes through `acl-bootstrap-reset`. |
-| The Nomad autoscaler (D11) | Runs on the `metrics` node with a scoped token, and does nothing until a job has a scaling policy. | Remove the service and the `autoscaler` login role. |
+| The Nomad management token (D6) | Kept on every Nomad server, read only by `nomad-acl-init` and the audit trail's ACL stream. Keeping it to one server, or deleting it, adds little: every server has working management tokens in its raft state, and root on one can mint another. | Delete it after `nomad-acl-init` and make policy changes through `acl-bootstrap-reset`. |
 | Deploy judgement calls (D15) | Three activation attempts per closure; no automatic live rollback; contract changes approved per closure on the node; boot counting off; `RebootPendingTooLong` after 14 days; attended reboots, one node at a time. | `MAX=3` in `lib/cluster-upgrade.nix`; an approved digest in the private repository instead of per-node approval; Lanzaboote's boot counting. |
 | Hashed restic paths (D17) | `apps/<sha256(salt + app)>`, so app names don't reach the backup provider. | Delete the `cluster.backup.repoPathFor` line and the salt assertion in `modules/backup.nix`. |
 | CI merge gate and canary (D22) | Public CI on a self-hosted KVM runner; the site's merges gated on `boot-install` and `boot-fallback` at its own lock; one canary node required on any site of more than one node. Every new boot stack holds the other nodes' deploys until the canary reboots. | `deploy.withoutCanary = "<reason>"`; per closure, `/run/cluster-upgrade.skip-canary`. |
@@ -1106,10 +1251,13 @@ These are accepted deliberately.
 3. **Request body cap.** Cloudflare's limit (100 MB on Free and Pro) applies to everything proxied, tunnel included.
 4. **Config changes bounce the connector.** A container restart drops its tunnel briefly.
 5. **`br-wan` puts containers on the public L2 segment.** Their inbound filtering is the container's own firewall, with the host pinning each port's MAC and addresses.
-6. **Restores are from nightly backups, not point-in-time.** Local ZFS snapshots narrow that to 15 minutes, but only for losses on the node itself. [The database archive](#the-database-archive) holds every change of an app that turns it on, and nothing here restores from it yet.
+6. **No restore is to the second.** An app's state can be had back to the minute for the last four hours and to the hour for the last day, from any node's snapshots ([Where an app runs](#where-an-app-runs)); from off the nodes, to the hour with `backup.state` and to the night without. The continuous database archive an earlier version had is gone: it was the only thing here that reached a second, nothing restored from it, and replication took over what it was for.
 7. **The JuiceFS metadata engine is a single point of failure.** If the `juicefs-meta` node dies, every node's `/mnt/jfs` is stranded until it returns.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
-9. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
+9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation.
+10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
+11. **State replication has run in VMs only.** `checks.app-state` proves the moves, the failover and the orphan with real ZFS on three VMs, with a stand-in for the container; no check yet has Nomad itself move a stateful app, and nothing has timed a large database's first replica or a failover on real disks. `wpdb` cannot move at all, and FreeIPA's move is the generic one, untried with a real FreeIPA.
+12. **`avc cloud` has met no provider.** Its configuration is validated against the providers' published schemas and its state encryption against OpenTofu itself, but no plan has been made against a real OVH or Cloudflare account. Unverified there: that OVH's policy language keeps `s3:DeleteObjectVersion` from a user that has `s3:DeleteObject`, the import ids, and the `ovh-us` endpoint's coverage of each resource. Read the first plan before applying it.
 
 ## License
 

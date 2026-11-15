@@ -65,7 +65,6 @@ let
 
         clusterApps.probe = {
           tier = "monolith";
-          homeNode = "node1";
           module = stubApp;
           secrets.token = {
             generator = "probe";

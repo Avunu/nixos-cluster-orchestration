@@ -64,15 +64,18 @@
     # withoutCanary = "<reason>";
   };
 
+  # The cluster-ci Worker, a GitHub App's endpoint (README.md in the library, "Previews
+  # and continuous deployment"). With it set, every node deploys the moment this
+  # repository's branch moves, and an app with `preview.slots` gets a container per
+  # pull request of its project.
+  # ci.url = "https://cluster-ci.example.workers.dev";
+
   # S3-compatible storage for JuiceFS. Credentials: `clan vars`. Loki keeps its logs
-  # on the metrics node's own encrypted disk, not here.
+  # on each node's own encrypted disk, not here.
   objectStorage = {
     endpoint = "https://s3.example.net";
     region = "region-1";
     juicefsBucket = "my-cluster-juicefs";
-    # Only for apps with `archive.enable`: a bucket of its own, since each such
-    # app's container holds an S3 key to it.
-    # dbArchiveBucket = "my-cluster-db-archive";
   };
 
   logging.retention = "720h";
@@ -108,6 +111,20 @@
       monthly = 12;
     };
     uploadLimitKiB = 0;
+    # A second, frequent backup to a second place: each app's local state (its
+    # database directory), from a replica, with credentials of its own
+    # (`backup-state-target`). The nightly backup above is the long history and can
+    # be far away; this one wants to be near the nodes. Leave it out for none.
+    # state = {
+    #   target = {
+    #     type = "s3";
+    #     endpoint = "https://s3.example.net";
+    #     bucket = "my-cluster-state-backups";
+    #     region = "region-1";
+    #   };
+    #   schedule = "hourly";
+    #   retention = { hourly = 48; daily = 14; };
+    # };
   };
 
   # The key is the machine name everywhere, and must equal hostName. One node
@@ -118,6 +135,29 @@
   # Nomad grows from one voter safely; etcd tagged a node at a time would split or
   # never form, and modules/storage-etcd.nix refuses any count but 0 or an odd
   # number from 3.
+  # What `avc cloud` provisions at the providers, from the rest of this file and the
+  # apps (the library's lib/cloud.nix). Leave a provider out and nothing of its is
+  # touched. The credentials are vars no node holds: `cloud-ovh`, `cloud-cloudflare`.
+  # cloud = {
+  #   ovh = {
+  #     # The API's name for where the account is: ovh-us, ovh-eu or ovh-ca.
+  #     endpoint = "ovh-us";
+  #     # The Public Cloud project's id, and the region its buckets are made in.
+  #     project = "00000000000000000000000000000000";
+  #     region = "US-EAST-VA";
+  #     # How long a deleted or overwritten object stays recoverable in a versioned bucket.
+  #     noncurrentDays = 30;
+  #   };
+  #   cloudflare = {
+  #     accountId = "00000000000000000000000000000000";
+  #     # Zones whose records are made here, by zone id. A hostname in none of them is left alone.
+  #     zones."example.com" = "00000000000000000000000000000000";
+  #     # The audit trail's R2 bucket (workers/cluster-watchdog), locked for this long.
+  #     auditBucket = "my-cluster-audit";
+  #     auditLockDays = 365;
+  #   };
+  # };
+
   nodes = {
     node1 = {
       index = 1;
@@ -133,10 +173,7 @@
       tags = [
         "worker"
         "nomad-server"
-        "nomad-leader"
         "juicefs-meta"
-        "metrics"
-        "backup"
       ];
       hostId = "00000000"; # ZFS: head -c4 /dev/urandom | od -A none -t x4
 

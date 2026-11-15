@@ -23,7 +23,7 @@ def test_nomad_cmd_presents_the_nodes_client_certificate(index):
 def test_nomad_cmd_uses_the_scoped_avc_token_in_the_apps_namespace(index):
     """Every app's job is in `apps`, and `default` runs nothing, so a bare `nomad job
     status` must look there. The token is the node's own `avc` login, never the
-    management token (which only the nomad-leader node holds)."""
+    management token (which only the Nomad servers hold)."""
     info = index.nodes["node1"]
     cmd = Node("node1", info).nomad_cmd("job status")
     words = shlex.split(cmd.replace('"$(cat ', "").replace(')"', ""))

@@ -6,6 +6,15 @@
   # lib/mk-app-container.nix asserts each app's nomad.killTimeoutSeconds fits.
   maxKillTimeoutSeconds = 600;
 
+  # A node that cannot reach a server stops its stateful apps this long after its
+  # last heartbeat (disconnect.stop_on_client_after, lib/mk-app-container.nix): by
+  # then the servers have placed them elsewhere, on a copy of their state, and two
+  # copies must not both be written to. The node taking an app over waits this long,
+  # and the app's kill timeout, before it starts it (modules/app-state.nix). Shorter
+  # fails over sooner, and stops every stateful app in the cluster when the servers
+  # are away for that long, as for a blip on the control VLAN.
+  stopOnClientAfterSeconds = 60;
+
   # Every app's job lives here (lib/mk-app-container.nix), and it is the only
   # namespace that may run raw_exec (modules/nomad-acl.nix). Every scoped token is
   # granted it by name, and the fence and every CLI on a node query it by name: a

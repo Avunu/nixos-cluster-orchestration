@@ -3,7 +3,7 @@
 # machine modules, as tests/cluster.nix boots them, with the fixture catalogue and
 # four probe apps besides:
 #
-#   gprobe        network.hostAccess = [ Loki, Prometheus ], pinned to node1 (a
+#   gprobe        network.hostAccess = [ Loki, Prometheus ], held to node1 by the test (a
 #                 metrics node). Its identity is nspawn's veth vb-gprobe.
 #   a-long-named-wordpress-site
 #                 27 characters, network.peerAccess to dbprobe on 3306: the shape of a
@@ -214,10 +214,20 @@ let
     }
     // extra;
 
+  # Nomad's own way to say where: what a test that needs an app on one node uses.
+  onNode = name: [
+    {
+      LTarget = "\${node.unique.name}";
+      Operand = "=";
+      RTarget = name;
+    }
+  ];
+
   ciApps = {
     clusterApps = {
       gprobe = probe "gprobe" [ 8080 ] {
-        homeNode = "node1";
+        # Any node would do, each having Loki and Prometheus; the script looks on node1.
+        nomad.constraints = onNode "node1";
         network.hostAccess = [
           net.lokiPort
           net.prometheusPort
@@ -234,7 +244,7 @@ let
       dbprobe = probe "dbprobe" [
         3306
         3307
-      ] { homeNode = "node1"; };
+      ] { nomad.constraints = onNode "node1"; };
       plain = probe "plain" [
         3306
         8080
@@ -274,16 +284,22 @@ let
       ];
     };
   failed = sys: map (a: a.message) (lib.filter (a: !a.assertion) sys.config.assertions);
-  hostAccessApp = name: homeNode: {
+  hostAccessApp = name: {
     ${name} = {
       module = { };
-      inherit homeNode;
       network.hostAccess = [ net.lokiPort ];
     };
   };
-  tooLong = failed (evalNode (hostAccessApp "grafana-thirteen" "node1"));
-  twelve = failed (evalNode (hostAccessApp "twelve-chars" "node1"));
-  offMetrics = failed (evalNode (hostAccessApp "gr-node2" "node2"));
+  tooLong = failed (evalNode (hostAccessApp "grafana-thirteen"));
+  twelve = failed (evalNode (hostAccessApp "twelve-chars"));
+  # Where a job may run, as its rendered constraints say: the node names it is held to.
+  heldTo =
+    sys: app:
+    map (k: k.RTarget) (
+      lib.filter (k: (k.LTarget or "") == "\${node.unique.name}") (
+        lib.head sys.config.system.build.nomadJobSpecs.${app}.Job.TaskGroups
+      ).Constraints
+    );
 
   # The real kinds, as the fixture catalogue declares them, on this test's node1.
   c1 = machines.node1.config;
@@ -299,13 +315,11 @@ let
       refused = lib.any (m: lib.hasInfix "network.hostAccess" m) twelve;
       messages = twelve;
     };
-    offMetrics = {
-      refused = lib.any (m: lib.hasInfix "must be a node tagged `metrics`" m) offMetrics;
-      messages = offMetrics;
-    };
+    # A hostAccess app is held to no node: every node has what it reaches.
+    onMetrics = heldTo (evalNode (hostAccessApp "twelve-chars")) "twelve-chars";
     kinds = {
       grafanaHostAccess = c1.clusterApps.demo-grafana.network.hostAccess;
-      grafanaHome = c1.clusterApps.demo-grafana.homeNode;
+      grafanaHome = heldTo machines.node1 "demo-grafana";
       grafanaUrls = map (d: d.url) grafanaDs;
       meshUrls = [
         "http://${net.meshIp testTopology n1}:${toString net.lokiPort}"
@@ -502,11 +516,11 @@ pkgs.testers.runNixOSTest {
                   f" 12 characters: {EVAL['twelve']['messages']}")
             control("name-too-long-assertion", ev["refused"] and EVAL["twelve"]["messages"] == [],
                     f"16 characters: {ev['messages']}; 12 characters: {EVAL['twelve']['messages']}")
-            control("hostaccess-off-metrics-refused", EVAL["offMetrics"]["refused"], f"{EVAL['offMetrics']['messages']}")
+            control("hostaccess-held-to-no-node", EVAL["onMetrics"] == [], f"{EVAL['onMetrics']}")
             k = EVAL["kinds"]
             print(f"real kinds: {k}")
             control("real-kinds-declare-their-flows",
-                    k["grafanaHostAccess"] == [LOKI, PROM] and k["grafanaHome"] == "node1"
+                    k["grafanaHostAccess"] == [LOKI, PROM] and k["grafanaHome"] == []
                     and sorted(k["grafanaUrls"]) == sorted(k["meshUrls"])
                     and k["sitePeers"] == [[{"app": "demo-wpdb", "port": k["wpdbPort"]}]] * 2
                     and k["siteBridge"] is None and k["wantVeth"] in k["siteVeth"],

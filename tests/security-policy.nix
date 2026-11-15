@@ -901,28 +901,23 @@ let
             detail = (fixtureNode "node1").config.cluster.deploy.bootContract;
           }
 
-          # Loki's store is on every node, and only the metrics node's Loki applies its
-          # retention: the others age out what a former Loki left, at the same retention.
+          # Loki's store is on every node, and so is Loki, whose compactor applies the
+          # retention to it. The sweep that ages out a store no Loki tends is for a node
+          # where Loki is off, which none is.
           {
-            name = "a node without Loki ages out a retired Loki store at the log retention";
+            name = "every node's Loki applies the log retention to its own store, and none needs the sweep";
             ok =
               let
                 hasLoki = n: (fixtureNode n).config.services.loki.enable;
                 sweep = n: (fixtureNode n).config.systemd.services.loki-retired-store or null;
-                withLoki = lib.filter hasLoki fixtureNodes;
-                without = lib.filter (n: !hasLoki n) fixtureNodes;
               in
               fixtureTopology.logging.retention == "720h"
-              && withLoki != [ ]
-              && without != [ ]
-              && lib.all (n: sweep n == null || !(sweep n).enable) withLoki
+              && lib.all hasLoki fixtureNodes
               && lib.all (
                 n:
-                sweep n != null
-                && (sweep n).enable
-                && lib.hasInfix "-mmin +43200 " (sweep n).script
-                && (fixtureNode n).config.systemd.timers.loki-retired-store.enable
-              ) without;
+                (fixtureNode n).config.services.loki.configuration.limits_config.retention_period == "720h"
+                && (sweep n == null || !(sweep n).enable)
+              ) fixtureNodes;
             detail = [ ];
           }
 

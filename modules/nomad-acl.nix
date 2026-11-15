@@ -1,14 +1,18 @@
 # modules/nomad-acl.nix — Nomad's namespaces, policies and scoped tokens.
 #
 # Before this, every consumer of the API (the fence on every node, jfs-nomad-meta,
-# job registration, the autoscaler, avc) read the ACL bootstrap token, so every node
+# job registration, avc) read the ACL bootstrap token, so every node
 # held a management token: root on any worker was root on the cluster. Now:
 #
-#   nomad-acl-init     the `nomad-leader` node only, and the only reader of the
-#                      management token (`nomad-acl/token`, declared there only).
+#   nomad-acl-init     every Nomad server, and the only reader of the management
+#                      token (`nomad-acl/token`, declared on servers and no worker).
 #                      Bootstraps ACLs with it, then applies what is below: the
 #                      `apps` and `default` namespaces, one policy per role, the
-#                      `clan` JWT auth method and its binding rules.
+#                      `clan` JWT auth method and its binding rules. Every server
+#                      applies the same thing, so no one of them has to be up; a
+#                      server applies a generation once (see `once` below), so one
+#                      still on an old generation does not undo a newer one's
+#                      policies each time it boots.
 #   nomad-login@<role> every node, one per role the node has (lib/nomad-pki.nix
 #                      loginRoles): exchanges the machine's pre-signed JWT
 #                      (`nomad-login/jwt-<role>`, signed offline by `nomad-jwt`) for
@@ -41,7 +45,7 @@ let
   vars = config.clan.core.vars.generators;
   tls = pki.cliTlsFor vars;
   nomadAddr = net.nomadAddr node;
-  isLeader = net.hasTag "nomad-leader" node;
+  isServer = net.hasTag "nomad-server" node;
   roles = pki.loginRoles node;
 
   # A new ciphertext for a file is a new value: re-run what read the old one.
@@ -86,18 +90,9 @@ let
     node-meta = ''
       node { policy = "write" }
     '';
-    # Registers the rendered jobs (modules/nomad-bootstrap-leader.nix).
+    # Registers the rendered jobs (modules/nomad-register.nix).
     registrar = ''
       namespace "${ns}" { capabilities = ["submit-job", "read-job", "list-jobs"] }
-    '';
-    autoscaler = ''
-      namespace "${ns}" {
-        policy       = "scale"
-        capabilities = ["list-jobs"]
-      }
-      node { policy = "read" }
-      operator { policy = "read" }
-      agent { policy = "read" }
     '';
     # avc: status, logs, and `nomad job restart` (alloc-lifecycle). Never submit.
     operator-read = ''
@@ -113,7 +108,6 @@ let
     fence = "fence";
     node-meta = "node-meta";
     registrar = "registrar";
-    autoscaler = "autoscaler";
     avc = "operator-read";
   };
   bindingRules = lib.mapAttrsToList (role: policy: {
@@ -245,7 +239,13 @@ let
 
     # Binding rules: create what is missing, and delete what this module no longer
     # declares on this method, so a role taken away stops logging in.
-    api GET /v1/acl/binding-rules > "$work/have.json"
+    # The list is stubs, with no selector or bind name: each rule is read in full.
+    rules() {
+      api GET /v1/acl/binding-rules | jq -r '.[].ID' | while read -r id; do
+        api GET /v1/acl/binding-rule/"$id" || true
+      done | jq -s .
+    }
+    rules > "$work/have.json"
     want=${json "nomad-binding-rules.json" bindingRules}
     jq -c '.[]' "$want" | while read -r rule; do
       if ! jq -e --argjson r "$rule" --arg m ${pki.authMethod} \
@@ -263,6 +263,54 @@ let
       api DELETE /v1/acl/binding-rule/"$id" >/dev/null
       echo "nomad-acl-init: removed binding rule $id"
     done
+    # Two servers that both found a rule missing both made it. Keep the one with the
+    # lowest ID, which every server agrees on.
+    rules \
+      | jq -r --arg m ${pki.authMethod} \
+          '[ .[] | select(.AuthMethod == $m) ] | group_by([.BindType, .BindName, .Selector])
+           | .[] | sort_by(.ID) | .[1:][] | .ID' | while read -r id; do
+      api DELETE /v1/acl/binding-rule/"$id" >/dev/null || true
+      echo "nomad-acl-init: removed duplicate binding rule $id"
+    done
+  '';
+
+  # Every server runs this, and a server may be generations behind the others (held
+  # back by a failed deploy, or simply not deployed yet). Applied at every boot, an old
+  # generation would put its own policies back over a newer one's. So a server applies
+  # a generation once, when it switches to it, and after that only if the cluster has
+  # lost what it applied (ACL state rebuilt: the auth method is gone, or the token is
+  # no longer management).
+  initStamp = "/var/lib/nomad-acl-init/applied";
+  initOnce = pkgs.writeShellScript "nomad-acl-init-once" ''
+    set -euo pipefail
+    export PATH=${
+      lib.makeBinPath [
+        pkgs.coreutils
+        pkgs.curl
+      ]
+    }
+    want="${initScript} ${lib.concatStrings (ciphertextHash "nomad-jwt" "signing.pub")}"
+    if [ "$(cat ${initStamp} 2>/dev/null || true)" = "$want" ]; then
+      # Wait for an answer before deciding the state is there or gone: no answer is
+      # not "gone".
+      for _ in $(seq 1 60); do
+        code=$(curl -sS --max-time 10 ${tls.curlArgs} -o /dev/null -w '%{http_code}' \
+          -H "X-Nomad-Token: $(cat "$CREDENTIALS_DIRECTORY/token")" \
+          "${nomadAddr}/v1/acl/auth-method/${pki.authMethod}") || code=000
+        case "$code" in
+          200)
+            echo "nomad-acl-init: this generation is already applied, and the cluster still has it"
+            exit 0
+            ;;
+          403 | 404) break ;;
+        esac
+        sleep 5
+      done
+      echo "nomad-acl-init: applied before, but the cluster no longer has it (HTTP $code): applying again"
+    fi
+    ${initScript}
+    printf '%s' "$want" > ${initStamp}.tmp
+    mv ${initStamp}.tmp ${initStamp}
   '';
 
   loginScript =
@@ -306,8 +354,7 @@ let
   # reinstalled, raft reset in a recovery): every consumer of it would get 403 until
   # the next timer. So every few minutes a refused token gets a fresh login. Only a
   # refusal does: Nomad not answering is not this unit's problem, and logging in then
-  # would fail too. The autoscaler picks the new token up through its login's
-  # ExecStartPost; the fence and the scripts read the file on every run.
+  # would fail too. The fence and the scripts read the file on every run.
   tokenCheckScript = pkgs.writeShellScript "nomad-token-check" ''
     set -uo pipefail
     export PATH=${
@@ -332,6 +379,10 @@ let
   '';
 in
 {
+  # The tag once named the one node that registered jobs and held the management
+  # token. Every server does both now, and the tag does nothing.
+  warnings = lib.optional (net.hasTag "nomad-leader" node) "topology: the `nomad-leader` tag no longer means anything (every `nomad-server` node registers jobs and applies ACLs); remove it from the node's tags.";
+
   systemd.tmpfiles.rules = [ "d ${pki.tokenDir} 0700 root root -" ];
 
   systemd.services = lib.mkMerge [
@@ -346,7 +397,7 @@ in
       };
     }
 
-    (lib.mkIf isLeader {
+    (lib.mkIf isServer {
       nomad-acl-init = {
         description = "Nomad ACLs: bootstrap, namespaces, policies, JWT login";
         after = [
@@ -361,7 +412,8 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = "${initScript}";
+          ExecStart = "${initOnce}";
+          StateDirectory = "nomad-acl-init";
           LoadCredential = [
             "token:${vars.nomad-acl.files.token.path}"
             "signing.pub:${vars.nomad-jwt.files."signing.pub".path}"
@@ -377,14 +429,14 @@ in
         role:
         lib.nameValuePair "nomad-login@${role}" {
           description = "Nomad login as ${role} (a scoped token in ${pki.tokenDir}/${role})";
-          # On the leader, after the auth method exists. Elsewhere the leader may not be
-          # up yet: Restart= retries until it is.
+          # On a server, after the auth method exists. On a worker no server may be
+          # up yet: Restart= retries until one is.
           after = [
             "nomad.service"
             "network-online.target"
           ]
-          ++ lib.optional isLeader "nomad-acl-init.service";
-          wants = [ "network-online.target" ] ++ lib.optional isLeader "nomad-acl-init.service";
+          ++ lib.optional isServer "nomad-acl-init.service";
+          wants = [ "network-online.target" ] ++ lib.optional isServer "nomad-acl-init.service";
           wantedBy = [ "multi-user.target" ];
           serviceConfig = {
             Type = "oneshot";
@@ -392,11 +444,6 @@ in
             LoadCredential = [ "jwt:${vars.nomad-login.files."jwt-${role}".path}" ];
             Restart = "on-failure";
             RestartSec = 10;
-          }
-          # The autoscaler loads its token once, at start (a DynamicUser reads it as a
-          # credential). --no-block: at boot it is queued behind this very unit.
-          // lib.optionalAttrs (role == "autoscaler") {
-            ExecStartPost = "-${pkgs.systemd}/bin/systemctl --no-block try-restart nomad-autoscaler.service";
           };
         }
       ) roles

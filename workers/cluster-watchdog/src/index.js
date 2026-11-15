@@ -82,10 +82,10 @@ export async function check(env, now) {
     env,
     `[FIRING] ${env.CLUSTER_NAME ?? "cluster"} has gone silent`,
     `No alerting heartbeat for ${minutes(silent)} minutes (last: ${new Date(state.lastSeen).toISOString()}).\n\n` +
-      "Either the metrics node is down or unreachable, or Prometheus / Alertmanager / " +
+      "Either every node is down or unreachable, or Prometheus / Alertmanager / " +
       "alert-email-bridge on it has stopped. While this lasts, NO cluster alert can " +
       "reach you -- including failed backups.\n\n" +
-      "Check: ssh root@<metrics node> 'systemctl status prometheus alertmanager alert-email-bridge'\n\n" +
+      "Check: ssh root@<node> 'systemctl status prometheus alertmanager alert-email-bridge'\n\n" +
       `This repeats every ${REPEAT_MS / 3600000} hours until heartbeats resume.\n\n-- cluster-watchdog`,
   );
   await putState(env, { ...state, alertedAt: now });

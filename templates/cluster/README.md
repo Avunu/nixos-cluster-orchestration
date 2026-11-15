@@ -45,11 +45,11 @@ After that, every node rebuilds itself from `main` on a timer. `avc` is the guid
 
 ## Keep an offline kit
 
-Off the cluster and away from your laptop: the offline age identity, a dated `git bundle create site-<date>.bundle --all` of this repository, and copies of each node's `luks/passphrase`, `restic/password`, `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase`, `<app>-db-archive/key` for each app that archives its database, the S3 and backup-target keys, and `backup.repoSalt`. The library's README, "The offline kit", says what each restores. Refresh the bundle whenever `vars/` or `secrets/` change. Name a second person who can unlock a node.
+Off the cluster and away from your laptop: the offline age identity, a dated `git bundle create site-<date>.bundle --all` of this repository, and copies of each node's `luks/passphrase`, `restic/password`, `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase`, the S3 and backup-target keys (and the state backup target's), and `backup.repoSalt`. The library's README, "The offline kit", says what each restores. Refresh the bundle whenever `vars/` or `secrets/` change. Name a second person who can unlock a node.
 
 ## Secrets policy
 
-`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says, and each app's database archive key (`<app>-db-archive`) is marked never; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
+`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
 
 ## Nodes that already run an earlier library
 
@@ -58,6 +58,10 @@ The first deploy of a library version with boot security waits on every such nod
 ## Adding an app
 
 Write `apps/<name>.nix`, run `clan vars generate <node>`, and ship it (`avc deploy ship`). To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
+
+## Deploying on merge, and previews
+
+Without anything more, a merge reaches the nodes at their next timer, and a project's new commits reach this repository's lock once a week. A GitHub App and its Worker (`workers/cluster-ci` in the library) remove both waits, and give each pull request of a project a container of its own on a copy of production. Set `ci.url` in `topology.nix` and `preview` on an app; the library's README, "Previews and continuous deployment", has the setup and what a preview is trusted with. `.github/workflows/flake-update.yml` is what the Worker starts when a project's branch moves, so keep its file name, or set the Worker's `FLAKE_UPDATE_WORKFLOW`.
 
 ## Updating the library
 

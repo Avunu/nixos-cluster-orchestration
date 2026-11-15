@@ -26,9 +26,9 @@ let
   checks = [
     # ── generated units ─────────────────────────────────────────────────────
     {
-      name = "every clusterApp pinned to node1 has backup + rehearsal units";
+      name = "every backed-up clusterApp has backup + rehearsal units, on any node";
       ok = lib.all (a: svc ? "cluster-backup-${a}" && svc ? "cluster-backup-verify-${a}") (
-        lib.attrNames (lib.filterAttrs (_: a: a.homeNode == "node1") c.clusterApps)
+        lib.attrNames (lib.filterAttrs (_: a: a.backup.enable) c.clusterApps)
       );
     }
     {

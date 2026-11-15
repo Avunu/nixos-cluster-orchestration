@@ -5,9 +5,8 @@
 # CPU/memory surfaces without any in-container agent (see README's
 # "Operational loop", step 1).
 #
-# The scraping/scaling half (Prometheus + Nomad Autoscaler) is a singleton and
-# lives in modules/monitoring-server.nix, assigned by the `metrics` tag through
-# inventory.instances. This file carries no leader conditional.
+# The scraping half (Prometheus, and with it Alertmanager and Loki) is
+# modules/monitoring-server.nix, on every node as well.
 #
 # Both exporters listen on the node's mesh address (modules/mesh-control-core.nix)
 # only: before the mesh, an attacker on the control VLAN read all of node_exporter.
@@ -22,8 +21,6 @@
 let
   textDir = "/var/lib/prometheus-node-exporter-text";
   known = lib.attrNames config.clusterApps;
-  # modules/db-archive.nix's relay writes these only for apps that archive.
-  archived = lib.attrNames (lib.filterAttrs (_: a: a.archive.enable or false) config.clusterApps);
   net = clusterLib.net;
   meshIp = net.meshIp topology node;
 in
@@ -49,7 +46,7 @@ in
   systemd.tmpfiles.rules = [ "d ${textDir} 0755 root root -" ];
 
   # Per-app textfile metrics outlive the app: once an app leaves apps/, nothing
-  # rewrites its cluster_backup_*, cluster_app_deploy_* or cluster_db_archive_* file, so its
+  # rewrites its cluster_backup_* or cluster_app_deploy_* file, so its
   # BackupStale and AppDeployDegraded alerts would fire forever (demo-erp
   # did, for a week after its removal). Drop the files of apps no longer
   # declared on every switch. Only metrics are removed; the app's state under
@@ -68,16 +65,8 @@ in
         *) echo "prune-app-metrics: removing $b ($app is no longer declared)"; rm -f "$f" ;;
       esac
     done
-    archived=" ${lib.concatStringsSep " " archived} "
-    for f in ${textDir}/cluster_db_archive_*.prom; do
-      [ -e "$f" ] || continue
-      b=''${f##*/}
-      app=''${b#cluster_db_archive_}; app=''${app%.prom}
-      case "$archived" in
-        *" $app "*) ;;
-        *) echo "prune-app-metrics: removing $b ($app does not archive its database)"; rm -f "$f" ;;
-      esac
-    done
+    # The database archive is gone (it wrote these); so are its metrics.
+    rm -f ${textDir}/cluster_db_archive_*.prom
   '';
 
   # SMART health and wear of every disk (the ZFS mirror's NVMes).

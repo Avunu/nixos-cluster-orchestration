@@ -16,34 +16,5 @@
     (final: _prev: {
       buildGo125Module = final.buildGo126Module;
     })
-
-    # WAL-G for MariaDB (modules/db-mariadb.nix). nixpkgs builds only the PostgreSQL
-    # command (`main/pg`); the MariaDB one is the same source, another subpackage,
-    # with its own version variables. The binary is `wal-g-mysql`.
-    #
-    # WAL-G calls its MySQL/MariaDB interface unstable. checks.db-archive runs a
-    # push, a retention pass and the refusals against this build: run it on every
-    # version change.
-    (final: _prev: {
-      wal-g-mysql = final.wal-g.overrideAttrs (old: {
-        pname = "wal-g-mysql";
-        subPackages = [ "main/mysql" ];
-        ldflags = [
-          "-s"
-          "-w"
-          "-X github.com/wal-g/wal-g/cmd/mysql.walgVersion=${old.version}"
-          "-X github.com/wal-g/wal-g/cmd/mysql.gitRevision=${old.src.rev}"
-        ];
-        # The upstream checks are the PostgreSQL command's.
-        doCheck = false;
-        doInstallCheck = false;
-        postInstall = ''
-          mv $out/bin/mysql $out/bin/wal-g-mysql
-        '';
-        meta = old.meta // {
-          mainProgram = "wal-g-mysql";
-        };
-      });
-    })
   ];
 }

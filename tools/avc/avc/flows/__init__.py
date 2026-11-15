@@ -9,5 +9,7 @@ group("secrets", "Secrets", 30)
 group("deploy", "Deploy", 40)
 group("boot", "Boot", 50)
 group("audit", "Audit trail", 60)
+group("ci", "Pipeline", 70)
+group("cloud", "Providers (OpenTofu)", 80)
 
-from avc.flows import apps, audit, boot, deploy, sites, status, secrets  # noqa: E402, F401
+from avc.flows import apps, audit, boot, ci, cloud, deploy, sites, status, secrets  # noqa: E402, F401

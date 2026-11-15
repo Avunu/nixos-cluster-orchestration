@@ -74,6 +74,25 @@ class Ctx:
             machines = {}
         return [n for n in self.index.nodes if machines.get(n, {}).get("installedAt")]
 
+    def contact(self) -> Node:
+        """A node to ask Nomad through: any node will do, so the first that answers.
+        Asked once per run. With one candidate there is nothing to choose, and its own
+        error says more than a probe's would."""
+        return self.memo("contact", self._contact)
+
+    def _contact(self) -> Node:
+        names = self.installed or [self.index.reference]
+        if len(names) == 1:
+            return self.node(names[0])
+        for name in names:
+            node = self.node(name)
+            try:
+                if node.run("true", check=False, timeout=15).returncode == 0:
+                    return node
+            except (AvcError, subprocess.TimeoutExpired, OSError):
+                continue
+        raise AvcError(f"no node answers over SSH ({', '.join(names)})")
+
     def installed_nodes(self) -> list[Node]:
         return [self.node(n) for n in self.installed]
 

@@ -1,7 +1,6 @@
 # demo-erp — the frappe kind, over a stub package.
 { pkgs, ... }:
 {
-  homeNode = "node1";
   frappe = {
     package = import ../stubs/frappe.nix { inherit pkgs; };
     site = "erp.example.com";

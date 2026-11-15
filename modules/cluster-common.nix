@@ -143,7 +143,7 @@ in
     "flakes"
   ];
 
-  # Nomad + nomad-autoscaler are BSL-licensed (unfree).
+  # Nomad is BSL-licensed (unfree).
   nixpkgs.config.allowUnfree = true;
 
   # REQUIRED, not convenience: nix shells out to `git` to fetch `git+https://`
@@ -261,6 +261,12 @@ in
       server = lib.optionalAttrs isServer {
         enabled = true;
         bootstrap_expect = net.serverCount topology;
+        # Spread, not Nomad's default of packing the fullest node first: the nodes are
+        # a fixed fleet that is paid for whether used or not, so an app goes to the
+        # emptiest one that can run it. Read when the cluster is first bootstrapped
+        # only; on one that exists, `nomad operator scheduler set-config
+        # -scheduler-algorithm=spread` (README, "Upgrading a running cluster").
+        default_scheduler_config.scheduler_algorithm = "spread";
         # Without a join list the voters never find each other: each waits
         # for bootstrap_expect peers forever ("No cluster leader"). Invisible
         # with one voter, which bootstraps alone; tests/cluster.nix boots
@@ -337,7 +343,7 @@ in
         denied_host_uids = rawExecDeniedUids;
       };
 
-      # /v1/metrics in Prometheus form, on EVERY node: the metrics node's Prometheus
+      # /v1/metrics in Prometheus form, on EVERY node: every node's Prometheus
       # scrapes them all (modules/monitoring-server.nix). This used to be set only
       # there, so every other node answered the scrape with an error and its
       # `up{job="nomad"}` was 0, unnoticed until tests/cluster.nix asked.

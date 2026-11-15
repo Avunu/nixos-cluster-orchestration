@@ -252,18 +252,19 @@ let
           type = types.attrsOf types.str;
           default = { };
           description = ''
-            guestPath -> host path on LOCAL disk (DB data, never JuiceFS).
-            Ties the stack to its homeNode; dirs are created before start.
+            guestPath -> host path on LOCAL disk (DB data, never JuiceFS), under
+            /state/clients/<app>/. That directory is a ZFS dataset of the app's own,
+            mounted on the node Nomad runs the app on and replicated to the others
+            (modules/app-state.nix), so the app runs as one allocation and its
+            state follows it. Dirs are created before start.
           '';
         };
+        # Gone: Nomad chooses the node. Kept as a name so that a site which still
+        # sets it is told what to do, by the assertion below.
         homeNode = mkOption {
           type = types.nullOr types.str;
           default = null;
-          description = ''
-            Topology node key (e.g. "node1") this stack is pinned to. Required
-            for monolith/split tiers (their localState lives on that node).
-            Renders a Nomad constraint on the node's hostname.
-          '';
+          visible = false;
         };
         # `address` is gone: with the connector inside the container reaching the
         # app over a unix socket, nothing needs to reach a container inbound, so
@@ -328,7 +329,7 @@ let
             "scale"
           ];
           default = "replica";
-          description = "Per-client escalation tier (see plan). Default = replica (Tier 2).";
+          description = "Per-client escalation tier (see plan). Default = replica (Tier 2). Nothing reads it for placement: that is Nomad's.";
         };
         ha = mkOption {
           type = types.bool;
@@ -363,6 +364,86 @@ let
           default = { };
           description = "How modules/backup.nix backs this app up. Detected; override when detection is wrong.";
         };
+        preview = {
+          slots = mkOption {
+            type = types.ints.unsigned;
+            default = 0;
+            example = 2;
+            description = ''
+              How many branches of this app's project can have a preview at once
+              (modules/ci-agent.nix). Each slot is a container of its own,
+              `<name>-pv<k>`, declared like any other and dormant until a pull
+              request takes it: the same kind, mounts, limits and firewall, on a copy
+              of this app's database and files. 0 = no previews.
+            '';
+          };
+          input = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "my-odoo-project";
+            description = "The site flake's input this app's package comes from: what a preview builds at the pull request's commit.";
+          };
+          repo = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "OWNER/my-odoo-project";
+            description = "That input's GitHub repository, whose pull requests get previews.";
+          };
+          inputUrl = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "git+https://github.com/OWNER/my-odoo-project.git?ref={ref}&rev={rev}&submodules=1";
+            description = ''
+              The flake reference a preview overrides `input` with, where `{rev}` is the
+              commit and `{ref}` the branch. null = `github:<repo>/{rev}`. Set it when
+              the input is not a plain `github:` one (submodules, say), in the same
+              form as in flake.nix.
+            '';
+          };
+          healthPath = mkOption {
+            type = types.str;
+            default = "/";
+            description = "What is asked of a preview through its hostname before it is called live. Anything but a 5xx passes.";
+          };
+          of = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            internal = true;
+            description = "On a slot: the app it previews. Set by modules/apps.nix, never by hand.";
+          };
+          origin = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            internal = true;
+            description = "Where the app answers inside its container, as a cloudflared service. Set by the kind; a kind that sets none cannot be previewed.";
+          };
+          socketGroups = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            internal = true;
+            description = "Groups a slot's connector needs to reach `origin`. Set by the kind.";
+          };
+          # What a kind names its data by. A slot's is the app's own name, because the
+          # copy holds the app's database, under its own directory on its own volume.
+          base = mkOption {
+            type = types.str;
+            readOnly = true;
+            internal = true;
+            default = if config.preview.of != null then config.preview.of else name;
+          };
+          stateRoot = mkOption {
+            type = types.str;
+            readOnly = true;
+            internal = true;
+            default = if config.preview.of != null then "/state-preview/${name}" else "/state";
+          };
+          jfsRoot = mkOption {
+            type = types.str;
+            readOnly = true;
+            internal = true;
+            default = if config.preview.of != null then "previews/${name}" else "clients/${name}";
+          };
+        };
         network = mkOption {
           type = import ../lib/app-network-type.nix { inherit lib; };
           default = { };
@@ -389,6 +470,17 @@ in
     type = types.attrsOf appType;
     default = { };
     description = "Per-client application stacks; each generates a dormant container + Nomad job.";
+  };
+
+  # The apps Nomad runs: every one but the preview slots, which the pipeline's agent
+  # starts and stops (modules/ci-agent.nix). A slot is a job nowhere, so whatever
+  # registers jobs, fences containers without an allocation, backs up or probes reads
+  # this and not clusterApps.
+  options.cluster.nomadApps = mkOption {
+    type = types.attrsOf types.raw;
+    readOnly = true;
+    internal = true;
+    default = lib.filterAttrs (_: a: a.preview.of == null) config.clusterApps;
   };
 
   # Keep `config`'s TOP-LEVEL keys static (containers / systemd / system) so the
@@ -419,30 +511,25 @@ in
       assertions =
         clusterLib.net.guaAssertions (lib.attrNames config.clusterApps)
         ++ lib.concatMap (f: f.assertions or [ ]) frags
+        ++ lib.mapAttrsToList (n: a: {
+          assertion = a.homeNode == null;
+          message =
+            "clusterApps.${n}: homeNode is gone. Nomad chooses the node an app runs on, and"
+            + " an app's local state follows it (modules/app-state.nix). Remove the line; the"
+            + " app's data on ${toString a.homeNode} is taken into a dataset the next time it"
+            + " starts there (README, \"Upgrading a running cluster\").";
+        }) config.clusterApps
         # hostAccess (design 1.12): the identity is nspawn's vb-<name>, exact only up
-        # to 12 characters; and only the metrics node's own containers have a path to
-        # its mesh address, so the app must be pinned there.
-        ++ lib.concatLists (
-          lib.mapAttrsToList (n: a: [
-            {
-              assertion = lib.stringLength n <= 12;
-              message =
-                "clusterApps.${n}: network.hostAccess needs a name of at most 12 characters"
-                + " (this one has ${toString (lib.stringLength n)}). The host firewall names the"
-                + " container by its veth, vb-<name>, and nspawn shortens a longer one"
-                + " unpredictably, so the rule would never match. Rename the app.";
-            }
-            {
-              assertion = a.homeNode != null && net.hasTag "metrics" (topology.nodes.${a.homeNode} or { });
-              message =
-                "clusterApps.${n}: network.hostAccess reaches the metrics node's mesh address,"
-                + " which only a container on that node can route to. Pin it there: homeNode"
-                + " must be a node tagged `metrics` (it is ${
-                   if a.homeNode == null then "unset" else "\"${a.homeNode}\""
-                 }).";
-            }
-          ]) hostAccessApps
-        );
+        # to 12 characters. A container reaches the mesh address of the node it is on,
+        # where every node has the same services, so the app runs on any.
+        ++ lib.mapAttrsToList (n: _: {
+          assertion = lib.stringLength n <= 12;
+          message =
+            "clusterApps.${n}: network.hostAccess needs a name of at most 12 characters"
+            + " (this one has ${toString (lib.stringLength n)}). The host firewall names the"
+            + " container by its veth, vb-<name>, and nspawn shortens a longer one"
+            + " unpredictably, so the rule would never match. Rename the app.";
+        }) hostAccessApps;
 
       # The host firewall (modules/overlay-network.nix) reads this, and nothing else
       # of the apps.
@@ -455,6 +542,9 @@ in
       # conflicting definitions rather than deep-merge (unlike containers /
       # systemd.services, which are attrsOf). Union them into ONE definition.
       system.build.nomadJobs = lib.foldl' (acc: f: acc // (f.system.build.nomadJobs or { })) { } frags;
+      system.build.nomadJobSpecs = lib.foldl' (
+        acc: f: acc // (f.system.build.nomadJobSpecs or { })
+      ) { } frags;
 
       # What a raw_exec task (nomad-apps, lib/mk-app-container.nix) may ask of
       # systemd: start and stop a container@ unit this host declares, and nothing
@@ -472,7 +562,7 @@ in
             if (action.id == "org.freedesktop.systemd1.manage-units"
                 && subject.user == ${builtins.toJSON clusterLib.nomad.appsUser}) {
               var units = ${
-                builtins.toJSON (map (n: "container@${n}.service") (lib.attrNames config.clusterApps))
+                builtins.toJSON (map (n: "container@${n}.service") (lib.attrNames config.cluster.nomadApps))
               };
               var unit = action.lookup("unit");
               var verb = action.lookup("verb");

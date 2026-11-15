@@ -1,0 +1,35 @@
+# cluster-ci — deploy: see README "Previews and continuous deployment".
+name = "cluster-ci"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# All state (previews, what each node's agent last said, the deploy counter) is one
+# Durable Object, so a webhook and an agent's poll never see two versions of it.
+[[durable_objects.bindings]]
+name = "PIPELINE"
+class_name = "PipelineObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PipelineObject"]
+
+[vars]
+CLUSTER_NAME = "my-cluster"
+# Previews are served at <branch>-<app>.<PREVIEW_DOMAIN>. A zone of its own, not one
+# that serves production: a preview runs a pull request's code, and a subdomain of a
+# production zone could set cookies for it.
+PREVIEW_DOMAIN = "preview.example.com"
+CF_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+CF_ZONE_ID = "REPLACE_WITH_THE_PREVIEW_ZONE_ID"
+GITHUB_APP_ID = "REPLACE_WITH_THE_APP_ID"
+# The workflow in the site's repository that updates flake.lock (templates/cluster).
+FLAKE_UPDATE_WORKFLOW = "flake-update.yml"
+
+# Secrets (wrangler secret put):
+#   GITHUB_APP_PRIVATE_KEY  the App's private key, the .pem as GitHub downloads it
+#   GITHUB_WEBHOOK_SECRET   the App's webhook secret
+#   CF_API_TOKEN            Cloudflare Tunnel: Edit on the account, DNS: Edit on the
+#                           preview zone, and nothing else
+#   AGENT_TOKENS            `avc ci tokens`: {"<token>": "<node>"}, one per node from
+#                           its `ci/token`

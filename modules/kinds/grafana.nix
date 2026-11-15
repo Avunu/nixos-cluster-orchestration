@@ -4,7 +4,7 @@
 #   grafana = { hostname; adminGroup; editorGroup; };
 #   oidc.idp = "<the FreeIPA app whose Authelia signs users in>";
 #
-# A monolith pinned to the `metrics` node, where Loki and Prometheus run, with
+# One container, on whichever node Nomad picks: each has Loki and Prometheus, with
 # its own tunnel. Nothing about it is special to the platform: it is one more
 # container, which may reach those two services on that node's mesh address and
 # nothing else on the host (network.hostAccess; modules/overlay-network.nix).
@@ -39,6 +39,7 @@
   topology,
   clusterLib,
   clusterSite,
+  node,
   ...
 }:
 let
@@ -46,7 +47,6 @@ let
   net = clusterLib.net;
   hostApps = config.clusterApps;
 
-  metricsNode = net.soleTaggedNode topology "metrics";
 
   socket = "/run/grafana/grafana.sock";
   dataDir = "/var/lib/grafana";
@@ -132,17 +132,18 @@ let
               type = "loki";
               uid = "loki";
               isDefault = true;
-              # On the metrics node's mesh address: the container is on that node,
-              # and the host firewall lets this app's bridge port, and no other
+              # On the mesh address of the node this container is built for and runs
+              # on: every node has a Loki and a Prometheus with the whole cluster in
+              # them, and the host firewall lets this app's bridge port, and no other
               # container's, reach these two ports there (network.hostAccess).
-              url = "http://${net.meshIp topology metricsNode}:${toString net.lokiPort}";
+              url = "http://${net.meshIp topology node}:${toString net.lokiPort}";
               jsonData.maxLines = 5000;
             }
             {
               name = "Prometheus";
               type = "prometheus";
               uid = "prometheus";
-              url = "http://${net.meshIp topology metricsNode}:${toString net.prometheusPort}";
+              url = "http://${net.meshIp topology node}:${toString net.prometheusPort}";
             }
           ];
         };
@@ -215,10 +216,8 @@ in
 
           config = lib.mkIf (config.grafana != null) {
             tier = lib.mkDefault "monolith";
-            # Beside Loki and Prometheus, which it reaches on that node's mesh address.
-            homeNode = lib.mkDefault metricsNode.hostName;
-            # The only host ports it may reach, by its bridge port: so its name is at
-            # most 12 characters, and it stays on a metrics node (both asserted).
+            # The only host ports it may reach, by its bridge port, on the node it is
+            # on: so its name is at most 12 characters (asserted).
             network.hostAccess = [
               net.lokiPort
               net.prometheusPort

@@ -19,6 +19,10 @@
   verifiedApps ? backupApps,
   # FreeIPA servers (modules/kinds/freeipa.nix), whose health the node reports.
   freeipaApps ? [ ],
+  # Apps whose local state goes to topology.backup.state (modules/state-backup-core.nix),
+  # and how old the newest such backup may be: a few runs of its schedule.
+  stateBackupApps ? [ ],
+  stateBackupStaleHours ? 4,
   # Tests set this false: promtool compares annotations verbatim, and the
   # expressions and labels are what the tests are about.
   annotate ? true,
@@ -63,11 +67,12 @@ in
       rules = [
         (rule {
           alert = "BackupStale";
-          expr = "time() - cluster_backup_last_success_timestamp_seconds > ${hours 30}";
+          # Every node an app has run on has a timestamp of its own; the newest is the app's.
+          expr = "time() - max by (app) (cluster_backup_last_success_timestamp_seconds) > ${hours 30}";
           for = "10m";
           severity = "critical";
           summary = "{{ $labels.app }}: no successful backup for {{ $value | humanizeDuration }}";
-          description = "Check `journalctl -u cluster-backup-{{ $labels.app }}` on the app's homeNode; run `cluster-backup {{ $labels.app }}` once fixed.";
+          description = "Check `journalctl -u cluster-backup-{{ $labels.app }}` on the node running the app (`cluster-state status`); run `cluster-backup {{ $labels.app }}` once fixed.";
         })
         (rule {
           alert = "BackupPartial";
@@ -78,7 +83,7 @@ in
         })
         (rule {
           alert = "BackupVerifyStale";
-          expr = "time() - cluster_backup_verify_last_success_timestamp_seconds > ${days 8}";
+          expr = "time() - max by (app) (cluster_backup_verify_last_success_timestamp_seconds) > ${days 8}";
           for = "10m";
           severity = "warning";
           summary = "{{ $labels.app }}: backups not proven restorable for {{ $value | humanizeDuration }}";
@@ -86,7 +91,7 @@ in
         })
         (rule {
           alert = "BackupCheckStale";
-          expr = "time() - cluster_backup_check_last_success_timestamp_seconds > ${days 8}";
+          expr = "time() - max by (app) (cluster_backup_check_last_success_timestamp_seconds) > ${days 8}";
           for = "10m";
           severity = "warning";
           summary = "{{ $labels.app }}: repository not pruned/checked for {{ $value | humanizeDuration }}";
@@ -163,6 +168,65 @@ in
           description = "`nixos-container run {{ $labels.app }} -- systemctl --failed`; the reload's own report is in `journalctl -u container@{{ $labels.app }}`. A new secret or bind mount needs `nomad job restart app-{{ $labels.app }}`.";
         })
       ];
+    }
+    {
+      # From cluster-state replicate (modules/app-state.nix), every minute on every
+      # node that has an app with local state.
+      name = "state";
+      rules = [
+        (rule {
+          alert = "StateReplicaLagging";
+          expr = "cluster_state_replica_lag_seconds > 600";
+          for = "10m";
+          severity = "warning";
+          summary = "{{ $labels.app }}: {{ $labels.instance }}'s copy of its state is {{ $value | humanizeDuration }} behind";
+          description = "If the node running the app died now, this is what starting it on {{ $labels.instance }} would lose. `journalctl -u cluster-state-replicate` there; `cluster-state status` on any node.";
+        })
+        (rule {
+          alert = "StateReplicationStale";
+          expr = "time() - cluster_state_last_run_timestamp_seconds > 900";
+          for = "5m";
+          severity = "warning";
+          summary = "{{ $labels.instance }}: app state has not been snapshotted or pulled for {{ $value | humanizeDuration }}";
+          description = "`systemctl status cluster-state-replicate.timer cluster-state-replicate.service` on the node.";
+        })
+        (rule {
+          alert = "StateReplicationFailing";
+          expr = "cluster_state_failed_apps > 0";
+          for = "15m";
+          severity = "warning";
+          summary = "{{ $labels.instance }}: replicating {{ $value }} app(s)' state fails";
+          description = "`journalctl -u cluster-state-replicate` on the node names each app and why.";
+        })
+        (rule {
+          alert = "StateBackupStale";
+          # One node backs an app's state up, and which one moves with the app.
+          expr = "time() - max by (app) (cluster_state_backup_last_success_timestamp_seconds) > ${hours stateBackupStaleHours}";
+          for = "10m";
+          severity = "warning";
+          summary = "{{ $labels.app }}: its state has not reached the state backup target for {{ $value | humanizeDuration }}";
+          description = "`cluster-state-backup {{ $labels.app }}` on a node holding a replica (`cluster-state status`), and `journalctl -u cluster-state-backup` there. The nodes' own copies are unaffected.";
+        })
+        (rule {
+          alert = "StateOrphaned";
+          expr = "cluster_state_orphans > 0";
+          for = "5m";
+          severity = "warning";
+          summary = "{{ $labels.instance }}: {{ $value }} copy(ies) of app state set aside";
+          description = "The node ran an app, died or was cut off, and the app was started elsewhere from an earlier snapshot. What it wrote after that snapshot is only in the orphan: `cluster-state orphans` on the node, mount it to recover anything, then `cluster-state drop-orphan`.";
+        })
+      ]
+      ++ map (
+        app:
+        rule {
+          alert = "StateBackupNeverRan";
+          labels.app = app;
+          expr = ''absent(cluster_state_backup_last_success_timestamp_seconds{app="${app}"})'';
+          for = "${toString stateBackupStaleHours}h";
+          severity = "warning";
+          summary = "${app}: its state has never reached the state backup target";
+        }
+      ) stateBackupApps;
     }
     {
       name = "nomad";
@@ -468,7 +532,7 @@ in
           for = "5m";
           severity = "critical";
           summary = "{{ $labels.app }} is unreachable at {{ $labels.instance }}";
-          description = "Probed from the metrics node through Cloudflare: tunnel, nginx and app all have to work.";
+          description = "Probed from every node through Cloudflare: tunnel, nginx and app all have to work.";
         })
         (rule {
           alert = "BackupTargetDown";
@@ -476,6 +540,33 @@ in
           for = "30m";
           severity = "warning";
           summary = "backup target {{ $labels.instance }} is unreachable";
+        })
+      ];
+    }
+    {
+      # The binary cache (modules/kinds/attic.nix). Warnings both: the cache is an
+      # optimisation, and a cluster without it builds what it would have fetched.
+      name = "cache";
+      rules = [
+        (rule {
+          alert = "CacheDown";
+          # Every node probes it through its own HAProxy; one that reaches it is enough
+          # to say it is up.
+          expr = "max(cluster_cache_up) == 0";
+          for = "30m";
+          severity = "warning";
+          summary = "the binary cache answers no node";
+          description = "Deploys build everything themselves meanwhile. `avc app status` for the cache app; in its container, `journalctl -u atticd -u attic-init`.";
+        })
+        (rule {
+          alert = "CachePushStale";
+          # A node pushes its system after every switch and once a day. 0 is a node
+          # that has never pushed.
+          expr = "time() - cluster_cache_push_last_success_timestamp_seconds > ${days 3}";
+          for = "1h";
+          severity = "warning";
+          summary = "{{ $labels.instance }} has pushed nothing to the binary cache for {{ $value | humanizeDuration }}";
+          description = "`cluster-cache-push` on the node says why (it never fails, it reports). The other nodes build what this one could have given them.";
         })
       ];
     }
@@ -562,7 +653,8 @@ in
       rules = [
         (rule {
           alert = "FreeIPADown";
-          expr = "cluster_freeipa_up == 0";
+          # Every node reports every server, and all but the one running it say 0.
+          expr = "max by (app) (cluster_freeipa_up) == 0";
           # A first install takes about five minutes, an upgrade longer.
           for = "20m";
           severity = "critical";
@@ -571,7 +663,7 @@ in
         })
         (rule {
           alert = "FreeIPAUnhealthy";
-          expr = "cluster_freeipa_healthcheck_errors > 0";
+          expr = "max by (app) (cluster_freeipa_healthcheck_errors) > 0";
           for = "30m";
           severity = "warning";
           summary = "{{ $labels.app }}: ipa-healthcheck reports {{ $value }} error(s)";
@@ -579,7 +671,7 @@ in
         })
         (rule {
           alert = "FreeIPARestartPending";
-          expr = "cluster_freeipa_restart_pending == 1";
+          expr = "max by (app) (cluster_freeipa_restart_pending) == 1";
           for = "24h";
           severity = "warning";
           summary = "{{ $labels.app }}: a deployed FreeIPA change has not been applied for a day";
@@ -587,7 +679,7 @@ in
         })
         (rule {
           alert = "FreeIPAHealthStale";
-          expr = "time() - cluster_freeipa_health_last_run_timestamp_seconds > ${hours 1}";
+          expr = "time() - max by (app) (cluster_freeipa_health_last_run_timestamp_seconds) > ${hours 1}";
           for = "15m";
           severity = "warning";
           summary = "{{ $labels.app }}: the FreeIPA health check has not run for {{ $value | humanizeDuration }}";
@@ -617,8 +709,8 @@ in
           expr = ''up{job="loki"} == 0'';
           for = "5m";
           severity = "warning";
-          summary = "Loki on {{ $labels.instance }} is down: logs are queueing on every node";
-          description = "Nodes keep their journals and resume from their cursors, so nothing is lost until a guest journal rotates past SystemMaxUse. `journalctl -u loki` on the metrics node.";
+          summary = "Loki on {{ $labels.instance }} is down: its copy of the logs is falling behind";
+          description = "The other nodes' Lokis have every line. This one's own node resumes from its journal cursor; the others hold 512 MiB for it each, and what is past that is a gap in this copy. `journalctl -u loki` on the node.";
         })
         (rule {
           alert = "LogShipperDown";
@@ -630,11 +722,11 @@ in
         })
         (rule {
           alert = "LogShippingFailing";
-          expr = ''sum by (instance) (rate(vector_component_errors_total{component_id="loki"}[10m])) > 0'';
+          expr = ''sum by (instance) (rate(vector_component_errors_total{component_id=~"loki-.*"}[10m])) > 0'';
           for = "15m";
           severity = "warning";
-          summary = "{{ $labels.instance }} has been failing to push logs to Loki for 15m";
-          description = "`journalctl -u vector` on the node; usually Loki rejecting (limits, clock skew) or unreachable.";
+          summary = "{{ $labels.instance }} has been failing to push logs to a Loki for 15m";
+          description = "`journalctl -u vector` on the node says which; usually a Loki rejecting (limits, clock skew) or a node that is down, which NodeDown says too.";
         })
       ];
     }

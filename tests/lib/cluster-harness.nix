@@ -21,6 +21,9 @@
 #   disks        the qemu VM module overrides disko's fileSystems/swap; the disk
 #                layout is covered by tests/install-boot.nix instead.
 #   pull loop    the timer is unhooked: it would fetch github: and fail offline.
+#   app state    with no ZFS, /state is a directory, so `cluster.state` is off: an
+#                app's local state is wherever the app starts, and does not follow
+#                it. tests/app-state.nix has the pools, and proves that it does.
 #
 # A function of the topology: Nomad's server certificates follow the `nomad-server`
 # tag (tests/lib/fixture-pki.nix), so tests/cluster.nix, which promotes node2 and
@@ -36,6 +39,9 @@
   # (tests/voter-growth.nix: the same CA before and after a worker becomes a voter).
   # null: made here, from this topology.
   fixturePki ? null,
+  # "<generator>/<file>" -> a path, for a test whose vars need more than a
+  # placeholder (tests/attic.nix: a real RSA key, and a token signed with it).
+  extraFixtureSources ? { },
 }:
 let
   # Where the stand-in internet answers. Not in the topology, because it is no
@@ -73,7 +79,7 @@ let
           "ssh_login"
           "canary"
         ]
-        ++ lib.optional (lib.elem "nomad-leader" (n.tags or [ ])) "nomad_acl";
+        ++ lib.optional (lib.elem "nomad-server" (n.tags or [ ])) "nomad_acl";
       };
     }) topology.nodes
   );
@@ -154,7 +160,9 @@ let
       file,
       node,
     }:
-    if gen == "nomad-ca" || gen == "nomad-gossip" || gen == "nomad-jwt" || gen == "juicefs-rsa" then
+    if extraFixtureSources ? "${gen}/${file}" then
+      extraFixtureSources."${gen}/${file}"
+    else if gen == "nomad-ca" || gen == "nomad-gossip" || gen == "nomad-jwt" || gen == "juicefs-rsa" then
       "${pki}/${file}"
     else if gen == "nomad-tls" || gen == "nomad-login" then
       "${pki}/${node}/${file}"
@@ -242,6 +250,8 @@ let
       # Offline: a tick of the pull loop would only fail on fetching github:.
       # The unit itself stays, so its configuration is still built.
       systemd.timers.cluster-upgrade.wantedBy = lib.mkForce [ ];
+      # No ZFS in these VMs: see the header.
+      cluster.state.enable = false;
 
       # QEMU reports no CPU frequency on some hosts, which leaves Nomad
       # fingerprinting 0 MHz and every allocation "exhausted" on cpu.

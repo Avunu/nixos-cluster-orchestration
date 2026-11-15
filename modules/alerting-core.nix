@@ -24,7 +24,13 @@ let
 
   rules = import ../lib/alert-rules.nix {
     inherit lib;
-    inherit (cfg) backupApps verifiedApps freeipaApps;
+    inherit (cfg)
+      backupApps
+      verifiedApps
+      freeipaApps
+      stateBackupApps
+      stateBackupStaleHours
+      ;
   };
   rulesFile = pkgs.writeText "cluster-alert-rules.yml" (builtins.toJSON rules);
 
@@ -40,7 +46,7 @@ let
   alertmanagerPort = 9093;
 
   # Where to reach the local Prometheus: its bind address, unless that is a
-  # wildcard. On the metrics node it binds the control IP so Grafana's
+  # wildcard. On a node it binds the mesh address so Grafana's
   # container can query it (modules/monitoring-server.nix), and a loopback
   # query would be refused.
   promHost =
@@ -87,7 +93,7 @@ let
                     lines.append("  %s=%s" % (key, labels[key]))
             lines.append("  since " + a.get("startsAt", "?"))
             lines.append("")
-        lines.append("-- ${cfg.clusterName} alerting (Alertmanager on the metrics node)")
+        lines.append("-- ${cfg.clusterName} alerting (Alertmanager)")
         return subject, "\n".join(lines)
 
 
@@ -213,6 +219,16 @@ let
       ]
     }
     prom=http://${promHost}:${toString config.services.prometheus.port}/api/v1/query
+    ${lib.optionalString (cfg.report.self != null) ''
+      # Every node has this timer, and one sends: of the nodes this one's Prometheus
+      # sees up, the one whose address sorts first. With that one down, the next.
+      first=$(curl -fsS --get "$prom" --data-urlencode 'query=up{job="nixos-hosts"} == 1' \
+        | jq -r '[.data.result[].metric.instance] | sort | .[0] // empty')
+      if [ -n "$first" ] && [ "$first" != ${lib.escapeShellArg cfg.report.self} ]; then
+        echo "the weekly report is $first's to send"
+        exit 0
+      fi
+    ''}
     # app -> value, for one metric
     q() { curl -fsS --get "$prom" --data-urlencode "query=$1" | jq -r '.data.result[] | "\(.metric.app // .metric.alertname)\t\(.value[1])"'; }
     now=$(date +%s)
@@ -221,9 +237,9 @@ let
       if [ "$s" -lt 7200 ]; then echo "$(( s / 60 ))m ago"; elif [ "$s" -lt 172800 ]; then echo "$(( s / 3600 ))h ago"; else echo "$(( s / 86400 ))d ago"; fi
     }
     declare -A last verify check added
-    while IFS=$'\t' read -r a v; do last[$a]=$v; done < <(q cluster_backup_last_success_timestamp_seconds)
-    while IFS=$'\t' read -r a v; do verify[$a]=$v; done < <(q cluster_backup_verify_last_success_timestamp_seconds)
-    while IFS=$'\t' read -r a v; do check[$a]=$v; done < <(q cluster_backup_check_last_success_timestamp_seconds)
+    while IFS=$'\t' read -r a v; do last[$a]=$v; done < <(q 'max by (app) (cluster_backup_last_success_timestamp_seconds)')
+    while IFS=$'\t' read -r a v; do verify[$a]=$v; done < <(q 'max by (app) (cluster_backup_verify_last_success_timestamp_seconds)')
+    while IFS=$'\t' read -r a v; do check[$a]=$v; done < <(q 'max by (app) (cluster_backup_check_last_success_timestamp_seconds)')
     while IFS=$'\t' read -r a v; do added[$a]=$v; done < <(q cluster_backup_bytes_added)
     firing=$(curl -fsS --get "$prom" --data-urlencode 'query=ALERTS{alertstate="firing", alertname!="Watchdog"}' \
       | jq -r '.data.result[] | .metric.alertname + (if .metric.app then " (" + .metric.app + ")" else "" end)' | sort -u)
@@ -249,7 +265,7 @@ let
     nfiring=0
     if [ -n "$firing" ]; then nfiring=$(printf '%s\n' "$firing" | wc -l); fi
     subject="[REPORT] weekly: $ok/$((ok + bad)) apps backed up, $nfiring alert(s) firing"
-    body+=$'\n'"Firing now: ''${firing:-nothing}"$'\n\n'"-- ${cfg.clusterName} weekly report (cluster-weekly-report on the metrics node)"
+    body+=$'\n'"Firing now: ''${firing:-nothing}"$'\n\n'"-- ${cfg.clusterName} weekly report (cluster-weekly-report, from $(cat /proc/sys/kernel/hostname))"
     exec ${notifyEmail}/bin/send-notification-email "$subject" "$body"
   '';
 
@@ -291,6 +307,16 @@ in
       default = [ ];
       description = "Apps with a database, whose backups must pass the weekly restore rehearsal.";
     };
+    stateBackupApps = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Apps whose local state must keep reaching topology.backup.state.";
+    };
+    stateBackupStaleHours = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = "How old the newest state backup may be before StateBackupStale: a few runs of its schedule.";
+    };
     freeipaApps = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -319,7 +345,28 @@ in
         description = "File with the bearer token the Worker expects.";
       };
     };
+    gossip = {
+      listenAddress = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "The address this Alertmanager gossips on with its peers. null = a single instance.";
+      };
+      peers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "The other Alertmanagers' gossip addresses.";
+      };
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 9094;
+      };
+    };
     report = {
+      self = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "This node's `instance` in the `nixos-hosts` scrape job. Set, the weekly report is sent only by the node whose instance sorts first among those up. null = always sent.";
+      };
       schedule = lib.mkOption {
         type = lib.types.str;
         default = "Mon *-*-* 12:00:00";
@@ -344,8 +391,15 @@ in
         enable = true;
         listenAddress = "127.0.0.1";
         port = alertmanagerPort;
-        # Single instance: no gossip port listening on every interface.
-        extraFlags = [ "--cluster.listen-address=" ];
+        # Alone, no gossip port at all. With peers (modules/alerting.nix: every node
+        # runs one), they gossip what each has sent, on the one address given, so that
+        # N Alertmanagers hearing of one alert from N Prometheuses send one email.
+        extraFlags =
+          if cfg.gossip.listenAddress == null then
+            [ "--cluster.listen-address=" ]
+          else
+            [ "--cluster.listen-address=${cfg.gossip.listenAddress}:${toString cfg.gossip.port}" ]
+            ++ map (p: "--cluster.peer=${p}:${toString cfg.gossip.port}") cfg.gossip.peers;
         configuration = {
           route = {
             receiver = "email";

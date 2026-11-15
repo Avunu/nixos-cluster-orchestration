@@ -8,9 +8,9 @@
 #       starts and stops container@<name>) collected into
 #       system.build.nomadJobs.<name>.
 #
-# Tier semantics (per plan):
-#   monolith/split -> pinned to app.homeNode (its localState lives there), count=1.
-#   replica/scale  -> DB tier layered by db-* modules; app spreads via Nomad.
+# Nomad chooses the node. An app with `localState` runs as one allocation, and its
+# state follows it there (modules/app-state.nix); one without spreads as `nomad` says.
+# The one constraint an app carries by itself is derived, not named: a ready JuiceFS mount.
 { lib }:
 let
   inherit (lib)
@@ -22,7 +22,12 @@ let
     optionals
     ;
   net = import ./net.nix { inherit lib; };
-  inherit (import ./nomad.nix) maxKillTimeoutSeconds appsNamespace appsUser;
+  inherit (import ./nomad.nix)
+    maxKillTimeoutSeconds
+    stopOnClientAfterSeconds
+    appsNamespace
+    appsUser
+    ;
 in
 {
   app, # one clusterApps.<name> submodule value
@@ -30,7 +35,7 @@ in
   pkgs,
   topology,
   node, # THIS host's topology node — the container's IPv6 GUA comes from the
-  # node it actually runs on, not from app.homeNode.
+  # node it actually runs on.
   # Whether this app is in a peerAccess flow (modules/app-container.nix): then its
   # br-app veth is vp-<iid>, which the host firewall names, not nspawn's vb-<name>.
   peerPort ? false,
@@ -39,8 +44,41 @@ let
   n = app.name;
 
   usesJfs = app.juicefsPaths != { };
-  pinned = app.homeNode != null;
-  home = if pinned then topology.nodes.${app.homeNode} else null;
+  # One writer: a database's directory, wherever Nomad puts the app.
+  stateful = app.localState != { };
+
+  # A preview slot (modules/apps.nix, modules/ci-agent.nix): declared like any app, so
+  # everything the host decides about a container is decided here, at evaluation, and
+  # reviewed with the site. Three things differ. What runs in it is not this
+  # evaluation's closure but the one the agent built from a pull request, behind a
+  # profile. Its tunnel is made per branch, so its credentials and its one hostname
+  # arrive at run time. And Nomad knows nothing of it.
+  isPreview = app.preview.of != null;
+  previewRunDir = "/run/cluster-preview/${n}";
+  previewModule =
+    { pkgs, ... }:
+    {
+      systemd.services.preview-tunnel = {
+        description = "This preview's Cloudflare tunnel";
+        wantedBy = [ "multi-user.target" ];
+        wants = [ "network-online.target" ];
+        after = [ "network-online.target" ];
+        serviceConfig = {
+          # Both files are root's, on the host's /run; the unit is handed copies and
+          # runs as nobody in particular, like every app's connector.
+          LoadCredential = [
+            "config.yml:/run/preview/config.yml"
+            "credentials.json:/run/preview/credentials.json"
+          ];
+          ExecStart = "${pkgs.cloudflared}/bin/cloudflared tunnel --no-autoupdate --config %d/config.yml run";
+          DynamicUser = true;
+          SupplementaryGroups = app.preview.socketGroups;
+          Restart = "always";
+          RestartSec = 5;
+          LogExtraFields = [ "APP_SERVICE=tunnel" ];
+        };
+      };
+    };
 
   # Per-site tunnel, run inside the container against a unix socket. Because the
   # route is a socket PATH rather than an address, it stays correct wherever the
@@ -51,12 +89,9 @@ let
   # The credentials secret rides the existing secrets bind-mount mechanism, so
   # the connector needs no special handling — it is just another guest secret.
   #
-  # Deliberately NOT gated on "can this app run here". Every node builds an
-  # identical container for every app — that is the core of the design (dormant
-  # everywhere, Nomad decides when, not whether it exists). Mounting secrets
-  # only on an app's homeNode would make the container definition differ per
-  # node, so escalating a monolith to a replica tier, or removing a pin, would
-  # start it somewhere with no credentials and fail silently. App secrets are
+  # Every node builds an identical container for every app — that is the core of
+  # the design (dormant everywhere, Nomad decides when and where, not whether it
+  # exists). So every node has every app's secrets, and app secrets are
   # `share = true` for the same reason.
   credsGuestName = "cloudflared";
 
@@ -205,13 +240,24 @@ let
     }
   ) app.localState;
 
-  bindMounts = secretMounts // jfsMounts // localMounts // app.extraBindMounts;
+  previewMounts = optionalAttrs isPreview {
+    "/run/preview" = {
+      hostPath = previewRunDir;
+      isReadOnly = true;
+    };
+  };
+
+  bindMounts = secretMounts // jfsMounts // localMounts // previewMounts // app.extraBindMounts;
 
   # Bind-mount sources must exist before nspawn starts. tmpfiles can't order
   # after the JuiceFS service mount, so create them in ExecStartPre instead.
   bindSources =
     (map (sub: "/mnt/jfs/${sub}") (builtins.attrValues app.juicefsPaths))
-    ++ builtins.attrValues app.localState;
+    ++ optionals (!isPreview) (builtins.attrValues app.localState)
+    # A slot's local state is a ZFS clone the agent mounts. Made here instead, it
+    # would be an empty directory on the root dataset that the database then
+    # initialises, and the clone would mount over a running database.
+    ++ optional isPreview previewRunDir;
 
   # The raw_exec wrapper: task-alive == container running; SIGTERM stops it
   # cleanly within kill_timeout. The node-local fencing reconciler (Phase 7)
@@ -236,11 +282,6 @@ let
 
   constraints =
     app.nomad.constraints
-    ++ optional pinned {
-      LTarget = "\${node.unique.name}";
-      Operand = "=";
-      RTarget = home.hostName;
-    }
     ++ optional usesJfs {
       LTarget = "\${meta.jfs_ready}";
       Operand = "=";
@@ -251,7 +292,7 @@ let
       RTarget = "true";
     };
 
-  count = if pinned then 1 else app.nomad.count;
+  count = if stateful then 1 else app.nomad.count;
 
   # Nomad jobspec (JSON) — submitted by nomad-bootstrap.service (Phase 7).
   job = {
@@ -300,7 +341,12 @@ let
               }
             ];
           }
-          // optionalAttrs (app.nomad.max > app.nomad.min && !pinned) {
+          // optionalAttrs stateful {
+            # Cut off from the servers, this node stops the app by itself, because
+            # they will have started it elsewhere (lib/nomad.nix). Nanoseconds.
+            Disconnect.StopOnClientAfter = stopOnClientAfterSeconds * 1000000000;
+          }
+          // optionalAttrs (app.nomad.max > app.nomad.min && !stateful) {
             Scaling = {
               Min = app.nomad.min;
               Max = app.nomad.max;
@@ -445,9 +491,6 @@ let
     };
   };
 in
-assert lib.assertMsg (
-  (app.tier == "monolith" || app.tier == "split") -> pinned
-) "clusterApps.${n}: tier \"${app.tier}\" requires homeNode (its local state lives there)";
 assert lib.assertMsg (app.nomad.killTimeoutSeconds >= app.stopTimeoutSeconds)
   "clusterApps.${n}: nomad.killTimeoutSeconds (${toString app.nomad.killTimeoutSeconds}) is shorter than stopTimeoutSeconds (${toString app.stopTimeoutSeconds}) — Nomad would SIGKILL the wrapper while the container is still stopping cleanly.";
 assert lib.assertMsg (app.nomad.killTimeoutSeconds <= maxKillTimeoutSeconds)
@@ -492,6 +535,10 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
     extraVeths.${wanIf}.hostBridge = "br-wan";
     additionalCapabilities = app.additionalCapabilities;
     inherit bindMounts;
+    # As the guest sees it: its own profile, /nix/var/nix/profiles/per-container/<name>
+    # on the host, which the agent points at the closure it built. So a deploy of the
+    # host neither builds a slot's guest nor reloads it.
+    path = lib.mkIf isPreview (lib.mkForce "/nix/var/nix/profiles/system");
     extraFlags = [
       "--resolv-conf=off"
     ]
@@ -510,7 +557,8 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
           # a pin made on the host would be ignored here.
           ../modules/nixpkgs-overlays.nix
         ]
-        ++ optional hasTunnel tunnelModule;
+        ++ optional hasTunnel tunnelModule
+        ++ optional isPreview previewModule;
         system.stateVersion = topology.stateVersion;
       };
   };
@@ -598,5 +646,10 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
   };
 
   # (b) rendered Nomad job for the bootstrap oneshot to register.
-  system.build.nomadJobs.${n} = pkgs.writeText "nomad-${n}.json" (builtins.toJSON job);
+  # Not for a slot: the agent starts and stops it, on the node the Worker gave it.
+  system.build.nomadJobs = optionalAttrs (!isPreview) {
+    ${n} = pkgs.writeText "nomad-${n}.json" (builtins.toJSON job);
+  };
+  # The same job as a value, for whatever asks where an app may run without building.
+  system.build.nomadJobSpecs = optionalAttrs (!isPreview) { ${n} = job; };
 }

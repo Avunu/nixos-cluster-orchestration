@@ -16,7 +16,6 @@ from avc.core import proc
 class App:
     name: str
     kind: str | None
-    home_node: str | None
     job: str
     tunnel: str
     hostnames: list[str]
@@ -25,7 +24,8 @@ class App:
 
 @dataclass(frozen=True)
 class Index:
-    leader: str
+    # A machine to read and write shared vars through. Not where anything runs.
+    reference: str
     flake_url: str
     nodes: dict[str, dict[str, Any]]
     apps: dict[str, App]
@@ -39,7 +39,6 @@ def parse_index(data: dict[str, Any]) -> Index:
         name: App(
             name=name,
             kind=a.get("kind"),
-            home_node=a.get("homeNode"),
             job=a["job"],
             tunnel=a.get("tunnel", ""),
             hostnames=a.get("hostnames", []),
@@ -47,7 +46,7 @@ def parse_index(data: dict[str, Any]) -> Index:
         )
         for name, a in data["apps"].items()
     }
-    return Index(leader=data["leader"], flake_url=data["flakeUrl"], nodes=data["nodes"], apps=apps)
+    return Index(reference=data["reference"], flake_url=data["flakeUrl"], nodes=data["nodes"], apps=apps)
 
 
 def load_index(root: Path) -> Index:

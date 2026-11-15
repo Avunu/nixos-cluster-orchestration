@@ -1,21 +1,28 @@
 # modules/alerting.nix — alerting, wired to topology, clusterApps and clan vars.
 #
-# Imported by modules/monitoring-server.nix, so it runs on the ONE node tagged
-# `metrics`, next to Prometheus. The logic is modules/alerting-core.nix; this
+# Imported by modules/monitoring-server.nix, so it runs on every node, next to that
+# node's Prometheus. Each node evaluates the same rules over the same targets and
+# tells its own Alertmanager; the Alertmanagers gossip on the mesh, so one alert is
+# one email, whichever nodes are up. The logic is modules/alerting-core.nix; this
 # file only decides what to watch and where the token comes from.
 #
 #   cluster-alert-test      fire a test alert through the whole path
 #
 # Recipients and sender: topology.alerting. The Cloudflare token:
-#   clan vars set <metrics node> alerting/cf-email-token
+#   clan vars set <node> alerting/cf-email-token
 {
   config,
   lib,
   pkgs,
   topology,
+  node,
+  nodeName,
+  clusterLib,
   ...
 }:
 let
+  net = clusterLib.net;
+  peers = lib.filterAttrs (n: nd: n != nodeName && (nd.provisioned or true)) topology.nodes;
   apps = config.clusterApps;
   backedUp = lib.filterAttrs (_: a: a.backup.enable) apps;
   hasDb =
@@ -56,13 +63,24 @@ in
     };
   };
 
+  # It gossips on the mesh address, which exists only once the mesh is up.
+  systemd.services.alertmanager = net.meshBoundUnit;
+
   cluster.alerting = {
+    gossip = {
+      listenAddress = net.meshIp topology node;
+      peers = lib.mapAttrsToList (_: nd: net.meshIp topology nd) peers;
+      port = net.alertmanagerClusterPort;
+    };
+    report.self = "${net.meshIp topology node}:${toString net.nodeExporterPort}";
     clusterName = config.clan.core.settings.name;
     inherit (topology.alerting) cloudflareAccountId from to;
     tokenFile = config.clan.core.vars.generators.alerting.files.cf-email-token.path;
     backupApps = lib.attrNames backedUp;
     verifiedApps = lib.attrNames (lib.filterAttrs isVerified backedUp);
     freeipaApps = lib.attrNames (lib.filterAttrs (_: a: a.freeipa != null) apps);
+    stateBackupApps = config.cluster.stateBackup.apps or [ ];
+    stateBackupStaleHours = topology.backup.state.staleHours or 4;
     # Every public hostname of every app, probed the way a user reaches it --
     # except those behind Cloudflare Access, where the edge answers with its
     # login redirect and the probe would never reach the tunnel or the app.

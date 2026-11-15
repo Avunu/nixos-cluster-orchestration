@@ -12,6 +12,7 @@ let
     inherit lib;
     backupApps = [ "demo-odoo" ];
     freeipaApps = [ "idm" ];
+    stateBackupApps = [ "demo-odoo" ];
     annotate = false;
   };
   rulesFile = pkgs.writeText "rules.yml" (builtins.toJSON rules);
@@ -215,6 +216,199 @@ let
         "1x3 0x30"
       ]
     ] "10m" none)
+
+    # ── app state (modules/app-state.nix) ───────────────────────────────────
+    (case "StateReplicaLagging"
+      [
+        [
+          ''cluster_state_replica_lag_seconds{app="demo-odoo",instance="n"}''
+          "900x40"
+        ]
+      ]
+      "20m"
+      [
+        {
+          app = "demo-odoo";
+          instance = "n";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "StateReplicaLagging" [
+      [
+        ''cluster_state_replica_lag_seconds{app="demo-odoo",instance="n"}''
+        "900x5 0x40"
+      ]
+    ] "20m" none)
+    (case "StateReplicationStale"
+      [
+        [
+          ''cluster_state_last_run_timestamp_seconds{instance="n"}''
+          "0x60"
+        ]
+      ]
+      "30m"
+      [
+        {
+          instance = "n";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "StateReplicationStale" [
+      [
+        ''cluster_state_last_run_timestamp_seconds{instance="n"}''
+        "0+60x60"
+      ]
+    ] "30m" none)
+    (case "StateReplicationFailing"
+      [
+        [
+          ''cluster_state_failed_apps{instance="n"}''
+          "1x40"
+        ]
+      ]
+      "20m"
+      [
+        {
+          instance = "n";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "StateReplicationFailing" [
+      [
+        ''cluster_state_failed_apps{instance="n"}''
+        "1x5 0x40"
+      ]
+    ] "20m" none)
+    (case "StateOrphaned"
+      [
+        [
+          ''cluster_state_orphans{instance="n"}''
+          "1x40"
+        ]
+      ]
+      "10m"
+      [
+        {
+          instance = "n";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "StateOrphaned" [
+      [
+        ''cluster_state_orphans{instance="n"}''
+        "0x40"
+      ]
+    ] "10m" none)
+    (case "CacheDown"
+      [
+        [
+          ''cluster_cache_up{instance="a"}''
+          "0x60"
+        ]
+        [
+          ''cluster_cache_up{instance="b"}''
+          "0x60"
+        ]
+      ]
+      "40m"
+      [ { severity = "warning"; } ]
+    )
+    # One node reaching it is a cache that is up.
+    (case "CacheDown" [
+      [
+        ''cluster_cache_up{instance="a"}''
+        "0x60"
+      ]
+      [
+        ''cluster_cache_up{instance="b"}''
+        "1x60"
+      ]
+    ] "40m" none)
+    (case "CachePushStale"
+      [
+        [
+          ''cluster_cache_push_last_success_timestamp_seconds{instance="n"}''
+          "0x5000"
+        ]
+      ]
+      "80h"
+      [
+        {
+          instance = "n";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "CachePushStale" [
+      [
+        ''cluster_cache_push_last_success_timestamp_seconds{instance="n"}''
+        "0+60x5000"
+      ]
+    ] "80h" none)
+    # The state backup is one node's job per app, and that node changes: the newest counts.
+    (case "StateBackupStale"
+      [
+        [
+          ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo",instance="n"}''
+          "0x400"
+        ]
+      ]
+      "5h"
+      [
+        {
+          app = "demo-odoo";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "StateBackupStale" [
+      [
+        ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo",instance="old"}''
+        "0x400"
+      ]
+      [
+        ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo",instance="new"}''
+        "0+60x400"
+      ]
+    ] "5h" none)
+    (case "StateBackupNeverRan" [ ] "5h" [
+      {
+        app = "demo-odoo";
+        severity = "warning";
+      }
+    ])
+    (case "StateBackupNeverRan" [
+      [
+        ''cluster_state_backup_last_success_timestamp_seconds{app="demo-odoo"}''
+        "0+60x400"
+      ]
+    ] "5h" none)
+    # An app that moved: the node it left has a timestamp that stands still, and a
+    # FreeIPA it does not run. The node it is on now is the one that counts.
+    (case "BackupStale" [
+      [
+        ''cluster_backup_last_success_timestamp_seconds{app="demo-odoo",instance="old"}''
+        "0x2000"
+      ]
+      [
+        ''cluster_backup_last_success_timestamp_seconds{app="demo-odoo",instance="new"}''
+        "0+60x2000"
+      ]
+    ] "31h" none)
+    (case "FreeIPADown" [
+      [
+        ''cluster_freeipa_up{app="idm",instance="old"}''
+        "0x40"
+      ]
+      [
+        ''cluster_freeipa_up{app="idm",instance="new"}''
+        "1x40"
+      ]
+    ] "25m" none)
 
     # ── availability ────────────────────────────────────────────────────────
     (case "NodeDown"
@@ -525,7 +719,7 @@ let
     (case "LogShippingFailing"
       [
         [
-          ''vector_component_errors_total{component_id="loki",instance="n"}''
+          ''vector_component_errors_total{component_id="loki-m",instance="n"}''
           "0+5x40"
         ]
       ]
@@ -539,7 +733,7 @@ let
     )
     (case "LogShippingFailing" [
       [
-        ''vector_component_errors_total{component_id="loki",instance="n"}''
+        ''vector_component_errors_total{component_id="loki-m",instance="n"}''
         "0+5x5 25x40"
       ]
     ] "35m" none)
@@ -1100,6 +1294,7 @@ let
         inherit lib;
         backupApps = [ "demo-odoo" ];
         freeipaApps = [ "idm" ];
+        stateBackupApps = [ "demo-odoo" ];
       }
     )
   );

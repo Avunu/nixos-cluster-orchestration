@@ -59,8 +59,6 @@ let
   # failed check rather than two metadata engines over one S3 bucket.
   singletonTags = [
     "juicefs-meta"
-    "nomad-leader"
-    "metrics"
   ];
   singletonsResolve = builtins.all (
     t: (clusterLib.net.soleTaggedNode topology t) ? controlIp

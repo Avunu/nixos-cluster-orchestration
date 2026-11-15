@@ -2,7 +2,6 @@
 { inputs, ... }:
 assert inputs.private-flake.marker != null;
 {
-  homeNode = "node1";
   resources = {
     cpu = 100;
     memoryMB = 256;

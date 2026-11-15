@@ -76,10 +76,10 @@ pkgs.testers.runNixOSTest {
     CTRL = "${ctrl}"
     # Everything but Nomad is on the control mesh.
     M1 = MESH["node1"]
-    # node1 is the nomad-leader and metrics node, so it logs in as every role.
+    # node1 is a Nomad server, so it logs in as every role.
     ROLES = ${builtins.toJSON (nomadPki.loginRoles node)}
     POLICY = {"fence": "fence", "node-meta": "node-meta", "avc": "operator-read",
-              "registrar": "registrar", "autoscaler": "autoscaler"}
+              "registrar": "registrar"}
     assert sorted(ROLES) == sorted(POLICY), f"node1 should hold every role: {ROLES}"
 
     wan.start()
@@ -233,10 +233,6 @@ pkgs.testers.runNixOSTest {
                 f"curl -fsS 'http://{M1}:9090/api/v1/query?query=up%7Bjob%3D%22nomad%22%7D' | jq -e '.data.result[0].value[1] == \"1\"'",
                 timeout=180,
             )
-            # The autoscaler holds the same certificate the same way. Nothing in this
-            # fixture scales, so the most it can show is that it is not refused.
-            node1.wait_for_unit("nomad-autoscaler.service")
-            node1.fail("journalctl -u nomad-autoscaler.service --no-pager | grep -Ei 'x509|tls: |certificate required|bad certificate'")
 
     with subtest("first boot: cold start"):
         node1.start()

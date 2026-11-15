@@ -90,7 +90,8 @@ rec {
     concatStringsSep "." (octets ++ [ (toString node.index) ]);
 
   # The TCP ports a node serves on the mesh, by role. Appendix E of the design:
-  # every node its exporters and its log shipper; `metrics` Loki and Prometheus;
+  # every node its exporters, its log shipper, its app state, and its Loki, Prometheus
+  # and Alertmanager gossip (each node runs the whole of monitoring);
   # `etcd` etcd; `juicefs-meta` the metadata engine. The host firewall accepts
   # exactly these on the mesh interface, and nothing of them anywhere else.
   meshPortsFor =
@@ -99,10 +100,10 @@ rec {
       nodeExporterPort
       smartctlExporterPort
       vectorMetricsPort
-    ]
-    ++ lib.optionals (hasTag "metrics" node) [
+      statePort
       lokiPort
       prometheusPort
+      alertmanagerClusterPort
     ]
     ++ lib.optionals (hasTag "etcd" node) [
       etcdClientPort
@@ -172,6 +173,17 @@ rec {
   # bootstrap_expect = number of raft voters, i.e. nodes tagged nomad-server.
   serverCount = topology: builtins.length (taggedNames topology "nomad-server");
 
+  # One machine's name, for what needs any one evaluation and not a place to run:
+  # the app catalogue (the same on every node) and the shared vars (one value for all
+  # of them). A Nomad server, because the servers declare every shared generator
+  # (`nomad-acl` is on no worker). The first by name; nothing runs there for being it.
+  referenceNode =
+    topology:
+    let
+      servers = taggedNames topology "nomad-server";
+    in
+    if servers == [ ] then throw "topology: no node is tagged nomad-server" else lib.head servers;
+
   # The local agent's API address. NOT 127.0.0.1: modules/cluster-common.nix
   # sets `bind_addr = node.controlIp`, so Nomad listens ONLY on the control
   # VLAN and every loopback client gets "connection refused".
@@ -185,6 +197,19 @@ rec {
   # this (lib/nomad-pki.nix), and every caller presents a client certificate.
   nomadAddr = node: "https://${node.controlIp}:${toString nomadHttpPort}";
 
+  # ── App state ───────────────────────────────────────────────────────────────
+  # Where each node answers its peers about the app state it holds, and sends it
+  # (modules/app-state.nix). On the mesh, like everything but Nomad.
+  statePort = 8731;
+
+  # ── Binary cache ────────────────────────────────────────────────────────────
+  # modules/kinds/attic.nix. `cachePort` is each node's own loopback, where Nix asks;
+  # `cacheMeshPort` is where a node passes requests on to the cache when the cache is
+  # one of its containers; `cacheGuestPort` is atticd, in that container.
+  cachePort = 8732;
+  cacheMeshPort = 8733;
+  cacheGuestPort = 8080;
+
   # ── Observability ───────────────────────────────────────────────────────────
   # Named here rather than in the modules because the exporter port is bound by
   # the per-node half (modules/monitoring.nix) and scraped by the singleton half
@@ -192,10 +217,13 @@ rec {
   nodeExporterPort = 9100;
   smartctlExporterPort = 9633;
   prometheusPort = 9090;
-  # Loki on the metrics node (modules/logging-server.nix), pushed to by every
+  # Loki on every node (modules/logging-server.nix), pushed to by every
   # node's Vector (modules/logging.nix), which exposes its own health here.
   lokiPort = 3100;
   vectorMetricsPort = 9598;
+  # Alertmanager's gossip between the nodes' instances (modules/alerting.nix), TCP and
+  # UDP: what makes N of them send one email.
+  alertmanagerClusterPort = 9094;
 
   # ── Galera (per-client MariaDB) ─────────────────────────────────────────────
   # gcomm connection string from a list of member IPs.
