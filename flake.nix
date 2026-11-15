@@ -90,6 +90,8 @@
         apps = ./modules/apps.nix;
         freeipa = ./modules/kinds/freeipa.nix;
         grafana = ./modules/kinds/grafana.nix;
+        # The cluster's binary cache, and every node's use of it.
+        attic = ./modules/kinds/attic.nix;
         odoo = ./modules/kinds/odoo.nix;
         frappe = ./modules/kinds/frappe.nix;
         # wpdb declares `wordpressDatabases`, which the wordpress kind fills
@@ -608,6 +610,17 @@
                 fixtureCluster
                 fixtureTopology
                 ;
+            }
+          );
+
+          # The binary cache: placed by Nomad, filled by a push, read back by
+          # substitution, read-only from outside, and never needed (tests/attic.nix).
+          checks.attic = detach (
+            _:
+            import ./tests/attic.nix {
+              inherit pkgs lib;
+              mkClan = mkFixtureCluster;
+              topology = fixtureTopology;
             }
           );
 

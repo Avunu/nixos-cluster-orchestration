@@ -202,6 +202,14 @@ rec {
   # (modules/app-state.nix). On the mesh, like everything but Nomad.
   statePort = 8731;
 
+  # ── Binary cache ────────────────────────────────────────────────────────────
+  # modules/kinds/attic.nix. `cachePort` is each node's own loopback, where Nix asks;
+  # `cacheMeshPort` is where a node passes requests on to the cache when the cache is
+  # one of its containers; `cacheGuestPort` is atticd, in that container.
+  cachePort = 8732;
+  cacheMeshPort = 8733;
+  cacheGuestPort = 8080;
+
   # ── Observability ───────────────────────────────────────────────────────────
   # Named here rather than in the modules because the exporter port is bound by
   # the per-node half (modules/monitoring.nix) and scraped by the singleton half

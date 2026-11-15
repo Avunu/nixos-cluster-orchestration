@@ -53,6 +53,7 @@ let
       ../modules/boot-security.nix
       ../modules/backup.nix
       ../modules/alerting.nix
+      ../modules/kinds/attic.nix
     ];
     modules = ../modules;
     lib = ../lib;

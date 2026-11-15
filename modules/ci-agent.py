@@ -299,7 +299,16 @@ class Agent:
             err.seek(0)
             if proc.returncode != 0:
                 raise Failed(f"The build failed:\n{tail(err.read())}")
-            return out.read().strip().splitlines()[-1]
+            path = out.read().strip().splitlines()[-1]
+        # To the site's binary cache, when it has one, so the next node to build this
+        # fetches it. Not waited for and not checked: the preview does not depend on it.
+        if CFG.get("cachePush"):
+            try:
+                subprocess.Popen([CFG["cachePush"], path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)  # fmt: skip
+            except OSError:
+                pass
+        return path
 
     def clone_names(self, name: str) -> tuple[str, str, str]:
         """The app's dataset on this node (modules/app-state.nix), and the slot's clone."""

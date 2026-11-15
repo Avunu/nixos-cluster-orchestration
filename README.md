@@ -684,6 +684,7 @@ An app is one file in `appsDir`, named after the app. It is a function of `{ inp
 | `frappe` | `package`, `site`, `webThreads`, `settings` | A bench, local MariaDB and Redis, the site directory on JuiceFS, its secrets. |
 | `freeipa` | `hostname`, `domain`, `realm`, `privateIp4`, `image`, `authelia` | The upstream FreeIPA image under podman, a private address reachable only over WARP, optional Authelia as an OIDC provider, nightly upgrades. |
 | `grafana` | `hostname`, `loginName`, `adminGroup`, `editorGroup`, with `oidc.idp` | Grafana on whichever node Nomad picks, signed in through an identity provider's Authelia, reaching Loki and Prometheus through `network.hostAccess`. |
+| `attic` | `bucket`, `public`, `hostname`, `retentionDays`, `cache`, `hostOctet` | The cluster's binary cache ([The binary cache](#the-binary-cache)): an Attic server on whichever node Nomad picks, its NARs in a bucket of its own, its index in the app's dataset, and on every node the substituter, the push after each switch, and the proxy that finds it. One per cluster. |
 | `wpdb` | `address`, `port`, `clientHosts`, `bufferPoolSize` | The one MariaDB every WordPress site shares, with databases and grants per site. Runs on the node whose app subnet holds `address`. |
 | `wordpress` | The `wordpress` section, usually written by a tool as JSON | One file, two containers: `<name>` (read-only public face) and `<name>-admin` (writable admin face), each reaching `wpdb` through `network.peerAccess`. |
 
@@ -752,6 +753,10 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `restic/password` | Every app's backup repositories, nightly and state. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
 | `backup-target/{access-key,secret-key}` | The backup target | Prompt |
 | `backup-state-target/{access-key,secret-key}` | The state backup's target, only with `backup.state` | Prompt |
+| `cache-s3/{access-key,secret-key}` | The binary cache's bucket, only with an `attic` app. In the cache's container, on the node it runs on | `avc cloud apply`, or prompt |
+| `cache-token/rs256.pem` | What the cache checks every token with, and what makes them. In the cache's container. Regenerating it revokes every token: regenerate `cache-push` with it | Generated |
+| `cache-push/token` | Every node's token for the cache: pull and push on the one cache, nothing else. Made from `cache-token`, good for ten years | Generated |
+| `cache-signing/{secret,public}` | The key the cache signs with. The secret half in the cache's container; the public half is not a secret, is in the repository, and is what every node's `nix.conf` trusts. A new one orphans nothing: the cache signs again as paths are fetched | Generated |
 | `alerting/cf-email-token` | Alert emails | Prompt, a Cloudflare token with Email Sending only |
 | `alerting-watchdog/token` | The dead-man heartbeat | Generated |
 | `cloudflare/provision-token` | The operator's own Cloudflare token, for site provisioning and for `avc cloud`; never deployed to a node | Prompt |
@@ -886,7 +891,8 @@ avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and 
 | Provider | What is made | From |
 | --- | --- | --- |
 | OVH | A bucket, a user of its own, that user's S3 key pair, and a policy that reaches that bucket and no other | `objectStorage.juicefsBucket`; `backup.state.target.bucket` when it is on the same endpoint |
-| OVH | Versioning on the state backup's bucket, and hidden versions expired after `noncurrentDays` | the same |
+| OVH | The same for the binary cache's bucket, unversioned | an app of kind `attic`, its `attic.bucket` |
+| OVH | Versioning on the state backup's bucket, and hidden versions expired after `noncurrentDays` | `backup.state.target.bucket` |
 | Cloudflare | A tunnel per app, locally configured | every app with a hostname |
 | Cloudflare | A proxied CNAME per hostname, to the app's tunnel | hostnames in a zone of `cloud.cloudflare.zones` |
 | Cloudflare | The private route to a FreeIPA server's address | `freeipa.privateIp4` |
@@ -894,7 +900,7 @@ avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and 
 
 No user may delete an object version, so on the versioned bucket a node that is taken over can hide backups and not destroy them.
 
-**What comes back goes where the site reads it.** An S3 key pair into its var (`ovh-s3`, `backup-state-target`), written only when it differs. A new tunnel's id into `apps/<app>.json`, which merges with the app's `.nix`, and its credentials file into the app's `<app>-cf/cloudflared`. So a new app with a hostname needs no `cloudflared tunnel create` and no `tunnel.id`: `avc cloud apply` makes the tunnel and writes both. The apply ends in the same pull request every change does.
+**What comes back goes where the site reads it.** An S3 key pair into its var (`ovh-s3`, `backup-state-target`, `cache-s3`), written only when it differs. A new tunnel's id into `apps/<app>.json`, which merges with the app's `.nix`, and its credentials file into the app's `<app>-cf/cloudflared`. So a new app with a hostname needs no `cloudflared tunnel create` and no `tunnel.id`: `avc cloud apply` makes the tunnel and writes both. The apply ends in the same pull request every change does.
 
 **A tunnel made by hand is adopted.** An app that already has a `tunnel.id` gets an import of it, and its secret and its name stay as they are. A DNS record made by hand is not known to the topology by any id: delete it first, or `avc cloud tofu "import cloudflare_dns_record.<name> <zone id>/<record id>"`. A bucket made by hand likewise (`import ovh_cloud_project_storage.juicefs <project>/<region>/<name>`); its old user and key are then yours to remove once the new pair is deployed.
 
@@ -905,6 +911,34 @@ No user may delete an object version, so on the versioned bucket a node that is 
 To turn it on: `cloud` in the topology; `clan vars generate` for `cloud-state`, and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
 
 Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket (the site provisioner's), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
+
+### The binary cache
+
+One app of kind `attic` gives the cluster a binary cache, an [Attic](https://github.com/zhaofengli/attic) server:
+
+```nix
+# apps/cache.nix
+{
+  attic.bucket = "example-cluster-cache";
+}
+```
+
+Then `avc cloud apply` (the bucket and its key), `clan vars generate <node>` (`cache-token`, `cache-signing`, `cache-push`), and ship. The nodes ask the cache once `cache-signing/public` is in the repository, which generating the vars puts there.
+
+- **What goes in.** Each node pushes the closure of the system it runs after every switch and once a day (`cluster-cache-push`), and that closure holds every app container the node was built with. The CI agent pushes each preview it builds. Attic leaves out what cache.nixos.org already signed, so the bucket holds what the cluster built and nothing else. With pull-deploy the canary node builds first and pushes; the others fetch.
+- **What comes out.** Every node has the cache as a substituter at its own loopback (port 8732). HAProxy there passes the request over the mesh (port 8733) to whichever node has the container, found by health check. The container takes a fixed address in the app subnet of the node it starts on (`attic.hostOctet`, 9), so no node has to be told where it went.
+- **It is never needed.** A push that fails is the `CachePushStale` alert, and fails nothing. With the cache on no node the loopback port refuses connections, Nix leaves the substituter alone for a minute at a time and builds. That is also how a new cluster's first deploy goes, and the cache's own.
+- **Who may write.** Reading needs no token. Writing needs `cache-push/token`, which every node holds and which can push and pull on this one cache and nothing else.
+- **Retention.** A path nobody pushed or fetched for `attic.retentionDays` (90) is dropped, and chunks no path uses are deleted from the bucket, every twelve hours. What a node runs is pushed daily, so it stays.
+- **What is not backed up.** The bucket. The index (a SQLite file) is the app's local state, replicated and snapshotted like any app's; lose both and the nodes fill a new cache as they deploy.
+
+**`attic.public = true` serves it to anyone**, at `attic.hostname` on the app's tunnel, read-only: an nginx in the container passes `GET` and `HEAD` and refuses Attic's API, so nothing is pushed or configured from outside whatever token is presented. It is off by default, because of what it gives away:
+
+- **Every store path the cluster built**, to anyone who knows or can compute its name. That includes each node's whole system closure: the rendered configuration of every service and every app, which is your private repository's `apps/` and topology in built form (hostnames, addresses, firewall rules, job specifications, package versions).
+- **Your apps' own code**, as built packages, if the projects are private.
+- **Not the secrets.** They are clan vars, decrypted on the node into `/run/secrets` and never part of a store path. That holds for what this library writes; a value you put in an app's `module` as a string is in the store, and so in the cache.
+
+Attic does not list a cache's contents, and a store path's name starts with a hash of everything it was built from, so a path is fetched by someone who has its name: from a deployed system's closure, or by evaluating the same flake. Treat that as slowing a reader down, not stopping one. If other people should have the apps' packages and not your cluster's configuration, a public cache is the wrong tool as it stands: it pushes whole system closures.
 
 ### Backups and restore
 
@@ -1053,6 +1087,8 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `StateReplicationStale` | warning | A node has not snapshotted or pulled app state for 15 minutes. |
 | `StateReplicationFailing` | warning | Replicating some app's state fails on a node. |
 | `StateOrphaned` | warning | A node holds a copy of app state set aside after a failover, with writes no other node has. |
+| `CacheDown` | warning | The binary cache answers no node. Deploys build what they would have fetched. |
+| `CachePushStale` | warning | A node has pushed nothing to the binary cache for three days. |
 | `LokiDown` | warning | Loki is down: logs are queueing on every node. |
 | `LogShipperDown` | warning | A node's log shipper is down. |
 | `LogShippingFailing` | warning | A node has been failing to push logs. |
@@ -1165,6 +1201,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |
 | `cloud` | The fixture's OpenTofu configuration validated against the OVH and Cloudflare providers' own schemas, with the OpenTofu `avc` runs: a bucket, user, key pair and one-bucket policy per bucket, none able to delete a version; a tunnel per app, adopted where the app names one; proxied CNAMEs, FreeIPA's private route, the locked audit bucket; and where each output is written back. No provider is contacted. |
 | `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM. |
+| `attic` | The binary cache on the fixture node, placed by Nomad: made with the site's signing key and unchanged by a second run; reached at the node's loopback through the mesh port; a pushed path deleted and substituted back, which takes the trusted signature; no configuring or pushing without a token, no configuring with a node's; the public face serving reads and refusing every write and the API; and with the cache stopped, a refused port, a build that goes ahead, a push that fails nothing, and a probe that says down. The fixture keeps NARs in a directory: S3 is not exercised. |
 | `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
 | `cluster-single` | `node1`'s real machine module boots and walks the whole cold start, twice: secrets, networking, the mesh, etcd, encrypted JuiceFS on S3, Nomad with TLS and scoped tokens, every app's job, monitoring, the audit producers. Jobs register but aren't placed. About 5 GB of RAM. |

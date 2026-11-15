@@ -69,7 +69,9 @@ let
   meshIf = net.meshIf;
   meshIp = net.meshIp topology node;
   meshSubnet = topology.mesh.subnet;
-  meshPorts = lib.concatMapStringsSep ", " toString (net.meshPortsFor node);
+  meshPorts = lib.concatMapStringsSep ", " toString (
+    net.meshPortsFor node ++ config.cluster.mesh.extraPorts
+  );
 
   # ── Container default-deny (design WS9, Appendix E) ─────────────────────────
   # What each app declares it may reach (clusterApps.<n>.network, set by
@@ -382,6 +384,14 @@ in
   # What the host's ruleset lets each container reach. Set from clusterApps by
   # modules/app-container.nix; a test with no containers sets it directly.
   imports = [ ./app-network-option.nix ];
+
+  # A mesh port that follows from what the site declares and not from a node's tags:
+  # the binary cache's, when an app is one (modules/kinds/attic.nix).
+  options.cluster.mesh.extraPorts = lib.mkOption {
+    type = lib.types.listOf lib.types.port;
+    default = [ ];
+    description = "TCP ports this node accepts on the mesh interface, besides lib/net.nix meshPortsFor.";
+  };
 
   config = {
     assertions = [

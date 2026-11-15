@@ -59,6 +59,9 @@ let
     stateMount = "/state";
     cloneRoot = "/state-preview";
     jfsMount = clusterLib.juicefs.mountPoint;
+    # What a built preview is pushed with, when the site has a binary cache
+    # (modules/kinds/attic.nix).
+    cachePush = config.cluster.cache.pushCommand or null;
     apps = lib.mapAttrs (name: a: {
       inherit (a.preview) repo input healthPath;
       inputUrl =

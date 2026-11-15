@@ -12,8 +12,8 @@
 #
 # What it makes, where `topology.cloud` names the provider:
 #
-#   OVH          per bucket (JuiceFS's, and the state backup's when it is on the same
-#                endpoint): the bucket, a user of its own, that user's S3 key pair, and a
+#   OVH          per bucket (JuiceFS's, the binary cache's when an app is one, and the
+#                state backup's when it is on the same endpoint): the bucket, a user of its own, that user's S3 key pair, and a
 #                policy that reaches this bucket and no other. No user may delete an
 #                object VERSION, and the state backup's bucket is versioned, with
 #                versions past `noncurrentDays` expired: a node taken over can hide what
@@ -86,6 +86,21 @@ let
               description = "${clusterName}: the state backup";
             };
           }
+      # The binary cache's (modules/kinds/attic.nix), when an app is one.
+      // lib.concatMapAttrs (
+        _: a:
+        lib.optionalAttrs ((a.attic or null) != null && (a.attic.storage.type or "") == "s3") {
+          cache = {
+            name = a.attic.bucket;
+            versioned = false;
+            vars = {
+              access = "cache-s3/access-key";
+              secret = "cache-s3/secret-key";
+            };
+            description = "${clusterName}: the binary cache";
+          };
+        }
+      ) apps
     );
 
   # What a user may do, in its one bucket. Everything restic and JuiceFS need, deleting

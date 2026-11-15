@@ -39,6 +39,9 @@
   # (tests/voter-growth.nix: the same CA before and after a worker becomes a voter).
   # null: made here, from this topology.
   fixturePki ? null,
+  # "<generator>/<file>" -> a path, for a test whose vars need more than a
+  # placeholder (tests/attic.nix: a real RSA key, and a token signed with it).
+  extraFixtureSources ? { },
 }:
 let
   # Where the stand-in internet answers. Not in the topology, because it is no
@@ -157,7 +160,9 @@ let
       file,
       node,
     }:
-    if gen == "nomad-ca" || gen == "nomad-gossip" || gen == "nomad-jwt" || gen == "juicefs-rsa" then
+    if extraFixtureSources ? "${gen}/${file}" then
+      extraFixtureSources."${gen}/${file}"
+    else if gen == "nomad-ca" || gen == "nomad-gossip" || gen == "nomad-jwt" || gen == "juicefs-rsa" then
       "${pki}/${file}"
     else if gen == "nomad-tls" || gen == "nomad-login" then
       "${pki}/${node}/${file}"

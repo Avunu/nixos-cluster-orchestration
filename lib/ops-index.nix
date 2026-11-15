@@ -27,6 +27,7 @@ let
     "frappe"
     "freeipa"
     "grafana"
+    "attic"
   ];
 
   secretRefs =

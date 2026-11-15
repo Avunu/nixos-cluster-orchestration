@@ -544,6 +544,33 @@ in
       ];
     }
     {
+      # The binary cache (modules/kinds/attic.nix). Warnings both: the cache is an
+      # optimisation, and a cluster without it builds what it would have fetched.
+      name = "cache";
+      rules = [
+        (rule {
+          alert = "CacheDown";
+          # Every node probes it through its own HAProxy; one that reaches it is enough
+          # to say it is up.
+          expr = "max(cluster_cache_up) == 0";
+          for = "30m";
+          severity = "warning";
+          summary = "the binary cache answers no node";
+          description = "Deploys build everything themselves meanwhile. `avc app status` for the cache app; in its container, `journalctl -u atticd -u attic-init`.";
+        })
+        (rule {
+          alert = "CachePushStale";
+          # A node pushes its system after every switch and once a day. 0 is a node
+          # that has never pushed.
+          expr = "time() - cluster_cache_push_last_success_timestamp_seconds > ${days 3}";
+          for = "1h";
+          severity = "warning";
+          summary = "{{ $labels.instance }} has pushed nothing to the binary cache for {{ $value | humanizeDuration }}";
+          description = "`cluster-cache-push` on the node says why (it never fails, it reports). The other nodes build what this one could have given them.";
+        })
+      ];
+    }
+    {
       # The vRack and the control mesh (modules/mesh-control-core.nix).
       name = "network";
       rules = [

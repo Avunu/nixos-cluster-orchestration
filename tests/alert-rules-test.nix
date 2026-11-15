@@ -303,6 +303,52 @@ let
         "0x40"
       ]
     ] "10m" none)
+    (case "CacheDown"
+      [
+        [
+          ''cluster_cache_up{instance="a"}''
+          "0x60"
+        ]
+        [
+          ''cluster_cache_up{instance="b"}''
+          "0x60"
+        ]
+      ]
+      "40m"
+      [ { severity = "warning"; } ]
+    )
+    # One node reaching it is a cache that is up.
+    (case "CacheDown" [
+      [
+        ''cluster_cache_up{instance="a"}''
+        "0x60"
+      ]
+      [
+        ''cluster_cache_up{instance="b"}''
+        "1x60"
+      ]
+    ] "40m" none)
+    (case "CachePushStale"
+      [
+        [
+          ''cluster_cache_push_last_success_timestamp_seconds{instance="n"}''
+          "0x5000"
+        ]
+      ]
+      "80h"
+      [
+        {
+          instance = "n";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "CachePushStale" [
+      [
+        ''cluster_cache_push_last_success_timestamp_seconds{instance="n"}''
+        "0+60x5000"
+      ]
+    ] "80h" none)
     # The state backup is one node's job per app, and that node changes: the newest counts.
     (case "StateBackupStale"
       [

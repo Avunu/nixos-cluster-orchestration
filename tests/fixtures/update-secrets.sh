@@ -19,7 +19,13 @@ for machine in node1 node2 node3; do
     gens: builtins.concatStringsSep "\n" (builtins.concatLists (map (g:
       map (f: "${f.rel_dir}/${f.name}") (builtins.filter (f: f.secret) (builtins.attrValues g.files))
     ) (builtins.attrValues gens))) + "\n"'
-done | sort -u | while read -r path; do
+done | {
+  cat
+  # Not in the fixture catalogue: the binary cache app tests/attic.nix declares
+  # for itself (modules/kinds/attic.nix), whose generators exist only with it.
+  printf 'shared/%s\n' cache-token/rs256.pem cache-signing/secret cache-push/token \
+    cache-s3/access-key cache-s3/secret-key
+} | sort -u | while read -r path; do
   name=${path##*/}
   mkdir -p "$dir/$path"
   echo "fixture placeholder, not ciphertext" > "$dir/$path/$name.age"
