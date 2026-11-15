@@ -6,8 +6,8 @@ shows what else regenerates with it (clan's dependent closure), and ends in
 the ship pipeline with a restart of every app that consumes any of it — a new
 value reaches a container as a bind mount, which a reload does not refresh.
 
-Shared generators have one value for the fleet, read and written through the
-nomad leader. Per-machine ones (the boot secrets, a node's own certificates and
+Shared generators have one value for the fleet, read and written through one
+machine. Per-machine ones (the boot secrets, a node's own certificates and
 keys) have one value per node, so every command that touches them goes machine
 by machine. A per-machine var is named `<machine>:<generator>/<file>`.
 """
@@ -88,9 +88,9 @@ class Scoped:
 
 
 def _machine(ctx: Ctx) -> str:
-    # Shared generators have one value for every node, so any machine reads and writes
-    # them; the nomad leader always exists.
-    return ctx.index.leader
+    # Shared generators have one value for every node, so any machine that declares
+    # them reads and writes them; the index names a Nomad server, which declares all.
+    return ctx.index.reference
 
 
 def _machines(ctx: Ctx) -> list[str]:
@@ -137,7 +137,7 @@ def _var_ids(ctx: Ctx) -> list[str]:
 
 
 def parse_var(ctx: Ctx, var: str) -> tuple[str, str]:
-    """(machine, generator/file) for a var id: shared through the leader, per-machine
+    """(machine, generator/file) for a var id: shared through one machine, per-machine
     through the machine it names."""
     machine, sep, rest = var.partition(":")
     if sep:
@@ -167,7 +167,7 @@ def _restarts(ctx: Ctx, generators: list[str]) -> list[ship.PostAction]:
     seen: dict[str, ship.PostAction] = {}
     for g in generators:
         for app in ctx.index.apps_using(g):
-            seen.setdefault(app.job, ship.restart(app.job, ctx.index.leader))
+            seen.setdefault(app.job, ship.restart(app.job, ctx.contact().name))
     return list(seen.values())
 
 
@@ -255,7 +255,7 @@ def provision(ctx: Ctx) -> None:
 
 
 def rotation_targets(ctx: Ctx, generator: str) -> tuple[str, ...]:
-    """The machines a rotation regenerates on: the leader for a shared generator, every
+    """The machines a rotation regenerates on: one machine for a shared generator, every
     machine that has it for a per-machine one."""
     scoped = _scoped(ctx).get(generator)
     if scoped is None:

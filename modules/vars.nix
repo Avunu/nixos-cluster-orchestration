@@ -60,7 +60,6 @@
 let
   pki = clusterLib.nomadPki;
   isServer = clusterLib.net.hasTag "nomad-server" node;
-  isLeader = clusterLib.net.hasTag "nomad-leader" node;
   loginRoles = pki.loginRoles node;
 in
 {
@@ -282,12 +281,12 @@ in
     # Must be a UUID — Nomad validates the format of an operator-supplied
     # bootstrap token and rejects anything else.
     #
-    # It is the management token, so it is declared ONLY on the `nomad-leader` node,
-    # and there only `nomad-acl-init` reads it (modules/nomad-acl.nix). Everything
+    # It is the management token, so it is declared on the Nomad servers and on no
+    # worker, and there only `nomad-acl-init` reads it (modules/nomad-acl.nix). Everything
     # else logs in for a scoped token (`nomad-login` below). Kept rather than deleted
     # after bootstrap: root on any server can mint a new one through
     # <data_dir>/server/acl-bootstrap-reset anyway, and policy changes need it.
-    nomad-acl = lib.mkIf isLeader {
+    nomad-acl = lib.mkIf isServer {
       share = true;
       files.token = { };
       runtimeInputs = [

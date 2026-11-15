@@ -97,8 +97,10 @@
         wpdb = ./modules/kinds/wpdb.nix;
         wordpress = ./modules/kinds/wordpress.nix;
         nomadBootstrap = ./modules/nomad-bootstrap.nix;
+        # Job registration, on every Nomad server.
+        nomadRegister = ./modules/nomad-register.nix;
         # Namespaces, policies, and every node's scoped-token logins; the ACL bootstrap
-        # on the nomad-leader node.
+        # on the Nomad servers.
         nomadAcl = ./modules/nomad-acl.nix;
         # The off-host audit trail (SSH logins, deploys, Nomad ACL changes) and each
         # boot's report on how it unlocked.

@@ -76,7 +76,7 @@ pkgs.testers.runNixOSTest {
     CTRL = "${ctrl}"
     # Everything but Nomad is on the control mesh.
     M1 = MESH["node1"]
-    # node1 is the nomad-leader, so it logs in as every role.
+    # node1 is a Nomad server, so it logs in as every role.
     ROLES = ${builtins.toJSON (nomadPki.loginRoles node)}
     POLICY = {"fence": "fence", "node-meta": "node-meta", "avc": "operator-read",
               "registrar": "registrar"}

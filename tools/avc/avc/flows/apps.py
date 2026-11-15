@@ -31,7 +31,7 @@ def _app(ctx: Ctx, app: str):  # noqa: ANN202
 def _any(ctx: Ctx, app: str) -> Node:
     """A node to ask Nomad about the app: any would do."""
     _app(ctx, app)
-    return ctx.node(ctx.index.leader)
+    return ctx.contact()
 
 
 def running_nodes(allocs_json: str) -> list[str]:
@@ -54,8 +54,9 @@ def _where(ctx: Ctx, app: str, *, or_any: bool = False) -> Node:
     if nodes:
         return ctx.node(nodes[0])
     if or_any:
-        ui.info(f"{app} is not running on any node; using {ctx.index.leader}")
-        return ctx.node(ctx.index.leader)
+        node = ctx.contact()
+        ui.info(f"{app} is not running on any node; using {node.name}")
+        return node
     raise AvcError(f"{app} is not running on any node (`avc app status {app}`)")
 
 

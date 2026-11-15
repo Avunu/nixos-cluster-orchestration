@@ -154,7 +154,6 @@
         "worker"
         "nomad-server"
         "etcd"
-        "nomad-leader"
         "juicefs-meta"
       ];
       hostId = "f0000001";

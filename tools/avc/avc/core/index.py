@@ -24,7 +24,8 @@ class App:
 
 @dataclass(frozen=True)
 class Index:
-    leader: str
+    # A machine to read and write shared vars through. Not where anything runs.
+    reference: str
     flake_url: str
     nodes: dict[str, dict[str, Any]]
     apps: dict[str, App]
@@ -45,7 +46,7 @@ def parse_index(data: dict[str, Any]) -> Index:
         )
         for name, a in data["apps"].items()
     }
-    return Index(leader=data["leader"], flake_url=data["flakeUrl"], nodes=data["nodes"], apps=apps)
+    return Index(reference=data["reference"], flake_url=data["flakeUrl"], nodes=data["nodes"], apps=apps)
 
 
 def load_index(root: Path) -> Index:

@@ -44,7 +44,7 @@
 #
 # `fence-stops-nothing-on-empty` and `fence-failsafe-on-5xx` need nodes that are not the
 # leader and containers Nomad placed, so they are in tests/cluster.nix, with
-# `management-absent-from-deployed-secrets` (the voters); `management-absent-from-workers`
+# `any-server-registers` (the voters); `management-absent-from-workers`
 # needs a client-only worker, and is in tests/control-plane-failure.nix.
 #
 # And first of all, once the cluster is up, raw_exec's lockdown: what a stolen

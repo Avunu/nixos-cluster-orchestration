@@ -16,7 +16,7 @@
 #   - the real `nomad-jwt` and `nomad-login` generators: the signing key stays off
 #     nodes, each machine gets a JWT for its own roles only (no registrar
 #     on a worker), each verifies and names its node and role; and the
-#     management token (`nomad-acl`) is declared on the nomad-leader node only
+#     management token (`nomad-acl`) is declared on Nomad servers only
 #
 # Run: nix build .#checks.x86_64-linux.nomad-pki
 {
@@ -27,7 +27,8 @@
 }:
 let
   pki = import ../lib/nomad-pki.nix { inherit lib; };
-  generatorsOf = name: fixtureCluster.config.nixosConfigurations.${name}.config.clan.core.vars.generators;
+  generatorsOf =
+    name: fixtureCluster.config.nixosConfigurations.${name}.config.clan.core.vars.generators;
   server = generatorsOf "node1";
   worker = generatorsOf "node2";
   fixturePki = import ./lib/fixture-pki.nix {
@@ -81,17 +82,17 @@ pkgs.runCommand "nomad-pki-check"
     [ "$(jq .caKeyDeployed $f)" = false ] || fail "the CA key is deployed to nodes"
     [ "$(jq -c .tlsDependencies $f)" = '["nomad-ca"]' ] || fail "nomad-tls does not depend on nomad-ca alone"
     pass "declarations: gossip on servers only, nomad-tls per machine, the CA key stays off nodes"
-    [ "$(jq .serverHasAcl $f)" = true ] || fail "the nomad-leader node does not declare nomad-acl"
+    [ "$(jq .serverHasAcl $f)" = true ] || fail "a Nomad server does not declare nomad-acl"
     [ "$(jq .workerHasAcl $f)" = false ] || fail "a worker declares nomad-acl: it would hold the management token"
     [ "$(jq .jwtKeyDeployed $f)" = false ] || fail "the JWT signing key is deployed to nodes"
     [ "$(jq .jwtShared $f)" = true ] || fail "nomad-jwt is not shared"
     [ "$(jq .loginShared $f)" = false ] || fail "nomad-login is shared: every node would hold every role"
     [ "$(jq -c .loginDependencies $f)" = '["nomad-jwt"]' ] || fail "nomad-login does not depend on nomad-jwt alone"
     [ "$(jq -c .serverLogins $f)" = '["jwt-avc","jwt-fence","jwt-node-meta","jwt-registrar"]' ] \
-      || fail "node1 (leader) logins: $(jq -c .serverLogins $f)"
+      || fail "node1 (server) logins: $(jq -c .serverLogins $f)"
     [ "$(jq -c .workerLogins $f)" = '["jwt-avc","jwt-fence","jwt-node-meta"]' ] \
       || fail "a worker's logins: $(jq -c .workerLogins $f)"
-    pass "declarations: nomad-acl on the leader only, the JWT key stays off nodes, logins per machine and per role"
+    pass "declarations: nomad-acl on servers only, the JWT key stays off nodes, logins per machine and per role"
 
     # ── run the generators as clan does ─────────────────────────────────────
     gen() { # name script indir outdir

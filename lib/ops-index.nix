@@ -14,12 +14,10 @@
 }:
 let
   # The catalogue is identical on every node (modules/apps.nix reads appsDir), so
-  # any node's view will do; the nomad leader's is the one that registers jobs.
-  leader = lib.findFirst (
-    n: lib.elem "nomad-leader" topology.nodes.${n}.tags
-  ) (throw "ops-index: no node tagged nomad-leader") (lib.attrNames topology.nodes);
+  # any node's view will do.
+  reference = clusterLib.net.referenceNode topology;
   # Without the preview slots: they are no Nomad job, and nothing here is theirs to do.
-  apps = nixosConfigurations.${leader}.config.cluster.nomadApps;
+  apps = nixosConfigurations.${reference}.config.cluster.nomadApps;
 
   # The kinds an app can be (modules/kinds/); each is a nullable namespace.
   kinds = [
@@ -37,7 +35,10 @@ let
     ++ lib.optional (a.tunnel.credentials != null) { inherit (a.tunnel.credentials) generator file; };
 in
 {
-  inherit leader;
+  # A machine to read and write shared vars through, and whose evaluation the
+  # catalogue above came from. Not a node anything runs on: avc asks whichever
+  # node answers.
+  inherit reference;
   flakeUrl = topology.deploy.flakeUrl;
 
   nodes = lib.mapAttrs (
@@ -51,7 +52,7 @@ in
       # node's own CLI one; the API refuses a handshake without one. The token is the
       # node's `avc` login (modules/nomad-acl.nix): status, logs and restarts in the
       # apps namespace, never a submit, and never the management token, which only the
-      # nomad-leader node holds.
+      # Nomad servers hold.
       nomad =
         let
           tls = clusterLib.nomadPki.cliTlsFor cfg.clan.core.vars.generators;

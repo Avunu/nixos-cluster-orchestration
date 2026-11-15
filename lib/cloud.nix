@@ -45,10 +45,8 @@ let
   ovh = cloud.ovh or null;
   cf = cloud.cloudflare or null;
 
-  leader = lib.findFirst (
-    n: lib.elem "nomad-leader" topology.nodes.${n}.tags
-  ) (throw "cloud: no node tagged nomad-leader") (lib.attrNames topology.nodes);
-  cfg = nixosConfigurations.${leader}.config;
+  reference = clusterLib.net.referenceNode topology;
+  cfg = nixosConfigurations.${reference}.config;
   apps = cfg.cluster.nomadApps;
   clusterName = cfg.clan.core.settings.name;
 
@@ -342,6 +340,6 @@ in
     # Hostnames in no zone the topology lists: their records are someone else's to make.
     unmanagedHosts = map (h: h.host) (lib.filter (h: h.zone == null) hostnames);
     # A machine to name when reading and writing vars: any holds the shared ones.
-    machine = leader;
+    machine = reference;
   };
 }

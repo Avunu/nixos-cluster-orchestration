@@ -2,7 +2,7 @@
 #
 #   cluster-audit send               spool -> the Worker's POST /event, for ever
 #   cluster-audit follow-journal     SSH logins and deploy outcomes -> spool
-#   cluster-audit follow-nomad-acl   Nomad's ACL event stream -> spool (nomad-leader only)
+#   cluster-audit follow-nomad-acl   Nomad's ACL event stream -> spool (Nomad servers only)
 #
 # Everything goes through one directory, the spool. A producer writes an event whole and
 # renames it in; only then does it move its own cursor on, so an event it has read is

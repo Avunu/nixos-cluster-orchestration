@@ -13,7 +13,7 @@
 #   cluster-audit-send          the spool -> the Worker, for ever; deletes on 2xx only
 #   cluster-audit-journal       sshd's "Accepted ..." lines and cluster-upgrade's
 #                               outcomes -> ssh_login and deploy events
-#   cluster-audit-nomad-acl     the nomad-leader node: Nomad's ACL event stream ->
+#   cluster-audit-nomad-acl     every Nomad server: Nomad's ACL event stream ->
 #                               nomad_acl events. It needs the management token: the
 #                               stream gives anonymous and scoped tokens an empty body.
 #   modules/boot-report.nix     one boot event per boot
@@ -113,7 +113,7 @@ in
     };
 
     nomadAcl = {
-      enable = lib.mkEnableOption "Nomad ACL change events from the event stream (the nomad-leader node)";
+      enable = lib.mkEnableOption "Nomad ACL change events from the event stream (a Nomad server)";
       address = mkOption {
         type = types.str;
         description = "Nomad's HTTPS address.";

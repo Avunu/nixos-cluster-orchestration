@@ -76,7 +76,7 @@ let
           "ssh_login"
           "canary"
         ]
-        ++ lib.optional (lib.elem "nomad-leader" (n.tags or [ ])) "nomad_acl";
+        ++ lib.optional (lib.elem "nomad-server" (n.tags or [ ])) "nomad_acl";
       };
     }) topology.nodes
   );

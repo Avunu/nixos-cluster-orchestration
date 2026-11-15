@@ -203,7 +203,7 @@ let
         let
           index = mkOpsIndex { inherit clan topology; };
         in
-        index.leader == "node1" && index.flakeUrl == topology.deploy.flakeUrl && index.apps ? probe;
+        index.reference == "node1" && index.flakeUrl == topology.deploy.flakeUrl && index.apps ? probe;
     }
     {
       name = "the template's flake evaluates, and enable = false leaves its example app out";

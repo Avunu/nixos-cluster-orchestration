@@ -7,9 +7,12 @@
 #   `audit/token`                per machine (modules/vars.nix). The Worker knows each by
 #                                its AUDIT_TOKENS secret, which `avc audit tokens` prints.
 #
-# The nomad-leader node also ships Nomad's ACL changes, with the management token it
-# already holds for nomad-acl-init. No other node has that token, and no other unit
-# reads it (tests/cluster-single.nix checks the list).
+# Every Nomad server also ships Nomad's ACL changes, with the management token it
+# already holds for nomad-acl-init. No worker has that token, and no other unit
+# reads it (tests/cluster-single.nix checks the list). Each server reads its own
+# event stream and sends what it saw, so one ACL change is in the trail once per
+# server, each copy under its own sender: no one server has to be up for a change to
+# be recorded, and no one server can keep it out.
 #
 # Opted-out nodes ship too when a URL is set: SSH logins and deploys are worth a trail
 # whatever the disks are, and the fixture cluster, which opts out, is how this is
@@ -26,7 +29,7 @@
 let
   url = topology.alerting.auditUrl or null;
   gens = config.clan.core.vars.generators;
-  isLeader = clusterLib.net.hasTag "nomad-leader" node;
+  isServer = clusterLib.net.hasTag "nomad-server" node;
   tls = clusterLib.nomadPki.cliTlsFor gens;
 in
 {
@@ -38,7 +41,7 @@ in
       inherit url;
       node = nodeName;
       tokenFile = gens.audit.files.token.path;
-      nomadAcl = lib.mkIf isLeader {
+      nomadAcl = lib.mkIf isServer {
         enable = true;
         address = clusterLib.net.nomadAddr node;
         tokenFile = gens.nomad-acl.files.token.path;

@@ -26,10 +26,11 @@
 #   - with no leader (Nomad stopped on two of three voters), the fence on the third
 #     gets a 5xx and stops nothing (`fence-failsafe-on-5xx`; mutant
 #     `fence-5xx-reads-empty`)
-#   - the voters that are not the nomad-leader are given no management token, and log
-#     in only as their own roles (modules/nomad-acl.nix); their raft.db does hold
-#     working management tokens, which is the accepted limit of design D6, asserted so
-#     that a change shows. A client-only worker is checked in control-plane-failure.
+#   - no voter is the one that registers jobs: each holds the management token and the
+#     `registrar` login, applies a generation once, and registers again what the
+#     cluster lost (`any-server-registers`). Their raft.db holds working management
+#     tokens as well, design D6, asserted so that a change shows. A client-only
+#     worker holds none: control-plane-failure.
 #   - node1's Prometheus scrapes, and its Loki receives the logs of, all three
 #   - every container's task runs as nomad-apps, which starts and stops it through
 #     polkit (lib/mk-app-container.nix): `nomad job restart` stops each cleanly and
@@ -432,33 +433,50 @@ pkgs.testers.runNixOSTest {
                 detail,
             )
 
-        with subtest("management-absent-from-deployed-secrets: a voter that isn't the nomad-leader is given no management token"):
-            # What this shows on voters, and only that: nothing deployed to node2 or node3
-            # (secrets, token files, the environment) is a management token. Their raft
-            # state is another matter, below. A client-only worker, which has no raft
-            # state, is checked in checks.control-plane-failure.
+        with subtest("any-server-registers: every voter holds what registering jobs and applying ACLs takes, and does both by itself"):
+            # No node is the one that registers: node2 and node3 hold the management
+            # token (read by nomad-acl-init and the audit trail's ACL stream, nothing
+            # else) and log in as `registrar`. A client-only worker holds neither
+            # (checks.control-plane-failure, `management-absent-from-workers`).
             for n in (node2, node3):
-                # Not deployed, read by nothing.
+                n.wait_for_unit("nomad-acl-init.service")
+                n.wait_for_unit("nomad-bootstrap.service")
                 present = n.execute("test -e /run/secrets/shared/nomad-acl")[0] == 0
                 readers = units_reading(n, "nomad-acl/token")
-                # Its own roles only: no registrar.
                 held = sorted(n.succeed(f"ls {TOKENS}").split())
-                # Every token-shaped value deployed to the node, tried against the API.
-                found = n.succeed(
-                    f"grep -rhoE '{UUID_RE}' /run/secrets /run/nomad-tokens /etc/secret-vars 2>/dev/null | sort -u || true"
-                ).split()
-                kinds: dict = {}
-                for t in found:
-                    code, body = as_token(n, CTRL[n.name], t, "/v1/acl/token/self")
-                    kinds[t[:8]] = json.loads(body)["Type"] if code == 200 else code
-                print(f"management-absent-from-deployed-secrets: {n.name}: nomad-acl deployed={present} readers={readers}"
-                      f" tokens={held} tried={kinds}")
-                control(
-                    "management-absent-from-deployed-secrets",
-                    not present and readers == [] and held == ["avc", "fence", "node-meta"]
-                    and len(found) >= 3 and "management" not in kinds.values(),
-                    f"{n.name}: nomad-acl deployed={present} readers={readers} tokens={held} tried={kinds}",
-                )
+                detail = f"{n.name}: nomad-acl deployed={present} readers={readers} tokens={held}"
+                print(f"any-server-registers: {detail}")
+                assert present and readers == ["cluster-audit-nomad-acl.service", "nomad-acl-init.service"] \
+                    and held == ["avc", "fence", "node-meta", "registrar"], detail
+            # Three servers applied the same ACLs at the same boot. Two that both found a
+            # binding rule missing both made it; one of each is left.
+            def rules_unique(_):
+                # The list is stubs: each rule in full.
+                rules = [nomad_api(node1, NODE1, f"/v1/acl/binding-rule/{r['ID']}")
+                         for r in nomad_api(node1, NODE1, "/v1/acl/binding-rules")]
+                keys = [(r["BindType"], r["BindName"], r["Selector"]) for r in rules]
+                return len(keys) >= 4 and len(keys) == len(set(keys))
+            retry(rules_unique, timeout_seconds=60)
+
+            # A server registers a generation once. Started again with nothing lost (a
+            # reboot), it submits nothing and applies nothing: one on an older
+            # generation would otherwise put its jobs and policies back at every boot.
+            mark = journal_mark(node3)
+            node3.succeed("systemctl restart nomad-acl-init.service nomad-bootstrap.service")
+            said = node3.succeed(f"journalctl -q -o cat --no-pager --after-cursor='{mark}' -u nomad-acl-init -u nomad-bootstrap")
+            assert "already applied" in said and "registering" not in said and "policy " not in said, said
+
+            # What the cluster lost, it registers again, with node1 having no part in it.
+            code, body = as_token(node1, NODE1, NOMAD_TOKEN, f"/v1/job/app-pinned?namespace={NS}&purge=true", method="DELETE")
+            assert code == 200, (code, body)
+            node2.wait_until_fails("systemctl is-active --quiet container@pinned.service", timeout=120)
+            assert as_token(node1, NODE1, NOMAD_TOKEN, f"/v1/job/app-pinned?namespace={NS}")[0] == 404
+            mark = journal_mark(node3)
+            node3.succeed("systemctl restart nomad-bootstrap.service")
+            said = node3.succeed(f"journalctl -q -o cat --no-pager --after-cursor='{mark}' -u nomad-bootstrap")
+            assert "app-pinned is not registered: registering it" in said and "app-probe" not in said, said
+            retry(pinned_on_node2, timeout_seconds=300)
+            node2.wait_for_unit("container@pinned.service", timeout=300)
 
         with subtest("voters-hold-acl-state-in-raft: the documented limit (design D6)"):
             # Every voter replicates the ACL tables, secrets included, so root on any

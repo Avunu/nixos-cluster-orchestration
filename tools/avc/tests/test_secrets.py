@@ -1,4 +1,4 @@
-"""Shared generators go through the leader; per-machine ones, machine by machine."""
+"""Shared generators go through one machine; per-machine ones, machine by machine."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def generated(monkeypatch):
     return calls
 
 
-def test_a_shared_generator_rotates_on_the_leader_alone(fleet, generated):
+def test_a_shared_generator_rotates_on_one_machine_alone(fleet, generated):
     with ui.scripted([True]):
         actions.find("secrets", "rotate").run(fleet, {"generator": "nomad-ca"})
     assert generated == [("node1", "nomad-ca", True)]

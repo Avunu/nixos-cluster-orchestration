@@ -6,14 +6,13 @@
 # managed container whose Nomad allocation is not running on THIS node,
 # restoring "task alive == container running".
 #
-# The other half — registering rendered jobspecs, which is a singleton — lives
-# in modules/nomad-bootstrap-leader.nix and is assigned by the `nomad-leader`
-# tag through inventory.instances. This file carries no leader conditional.
+# The other half, registering rendered jobspecs, is every Nomad server's:
+# modules/nomad-register.nix.
 #
 # What it asks, and what it does with the answer, is where the danger is:
 #
 #   - It runs as the `fence` role (modules/nomad-acl.nix): read-job in `apps` and
-#     agent read. Not the management token, which no longer leaves the leader.
+#     agent read. Not the management token, which no worker holds.
 #   - The allocation query names the `apps` namespace. Without it a scoped token gets
 #     403, and a management token gets `200 []`, which reads as "nothing runs
 #     anywhere" and would stop every container on the node. So the namespace, the

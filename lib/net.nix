@@ -173,6 +173,17 @@ rec {
   # bootstrap_expect = number of raft voters, i.e. nodes tagged nomad-server.
   serverCount = topology: builtins.length (taggedNames topology "nomad-server");
 
+  # One machine's name, for what needs any one evaluation and not a place to run:
+  # the app catalogue (the same on every node) and the shared vars (one value for all
+  # of them). A Nomad server, because the servers declare every shared generator
+  # (`nomad-acl` is on no worker). The first by name; nothing runs there for being it.
+  referenceNode =
+    topology:
+    let
+      servers = taggedNames topology "nomad-server";
+    in
+    if servers == [ ] then throw "topology: no node is tagged nomad-server" else lib.head servers;
+
   # The local agent's API address. NOT 127.0.0.1: modules/cluster-common.nix
   # sets `bind_addr = node.controlIp`, so Nomad listens ONLY on the control
   # VLAN and every loopback client gets "connection refused".

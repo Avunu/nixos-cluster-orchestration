@@ -17,7 +17,7 @@ from avc.errors import AvcError
 if TYPE_CHECKING:
     from avc.context import Ctx
 
-# What a node may send. The nomad-leader node adds nomad_acl.
+# What a node may send. A Nomad server adds nomad_acl.
 NODE_KINDS = ("boot", "deploy", "ssh_login", "canary")
 
 
