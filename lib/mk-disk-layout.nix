@@ -26,6 +26,11 @@
     a = "/dev/nvme0n1";
     b = "/dev/nvme1n1";
   },
+  # The swap partition on EACH disk, in GiB (topology `nodes.<n>.swapPerDiskGiB`).
+  # 32 x 2 = 64G was sized for a 32 GB node; zswap (modules/zfs-host.nix) spills here
+  # only once its compressed pool, 20% of RAM, is full. A partition's size is fixed at
+  # install: changing this on an installed node changes nothing until it is reinstalled.
+  swapSizePerDiskGiB ? 32,
   # Encrypted only: where disko reads the initial LUKS passphrase. Null would make
   # disko ask at the terminal, which a remote install has no one to answer.
   passwordFile ? null,
@@ -40,11 +45,7 @@ let
   # used zramSwap instead of any disk swap at all. A dedicated partition, one
   # per NVMe, sidesteps that without giving up the throughput headroom zswap
   # wants for its overflow tier.
-  #
-  # 32G × 2 = 64G total: generous relative to the 32GB RAM on the real node
-  # (node1), sized for zswap's usage pattern of spilling to disk only once its
-  # compressed pool (20% of RAM, see zfs-host.nix) is exhausted.
-  swapSizePerDiskGiB = 32;
+  # Its size is `swapSizePerDiskGiB`, above.
 
   swapContent = {
     type = "swap";

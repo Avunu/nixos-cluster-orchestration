@@ -637,6 +637,7 @@ The attribute key under `nodes` is the machine name everywhere: the clan machine
 | `appDhcpPoolOffset`, `appDhcpPoolSize` | The containers' DHCP pool. Addresses below the offset are free for static use, such as `wpdb.address`. |
 | `initrdNicModules` | Kernel modules for the WAN NIC in the initrd, such as `[ "igb" ]`, so the passphrase can be typed over SSH. Not detectable at evaluation; `lspci -k` on the node names them. Required unless opted out. |
 | `disks` | `{ a; b; }`, the two disk devices. Default `/dev/nvme0n1` and `/dev/nvme1n1`. Use `/dev/disk/by-id/...` on hardware whose enumeration swaps. |
+| `swapPerDiskGiB` | The swap partition on each disk, in GiB; the node's swap is twice this. Default 32. Fixed at install: a new value takes a reinstall. |
 | `insecurePlaintextBoot` | `"<reason>"`: the one opt-out from disk encryption and Secure Boot. See [Opting out](#opting-out). |
 | `provisioned` | `false` for a placeholder: not scraped or alerted on. Delete the line when the machine exists. |
 | `canary` | `true` on exactly one real node once the site has more than one: it takes each new boot stack first, and the others wait until it has rebooted into it (see [Deploying](#deploying)). Not a placeholder, and not an opted-out node while any node has boot security. |
