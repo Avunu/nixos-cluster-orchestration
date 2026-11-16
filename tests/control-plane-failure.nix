@@ -18,9 +18,11 @@
 #                                node2's key rotated, node1 not yet switched: the mesh
 #                                between them is down; once node1 lists the new key it
 #                                comes back, with nothing done on node2
-#   mesh-down-jfs-recovers       the mesh cut between the nodes: a write on node2 hangs
-#                                (killed at 80s), the mount survives, and writes work
-#                                again within 15s of the mesh returning
+#   mesh-down-jfs-recovers       the mesh cut between the nodes for 80s: a write on
+#                                node2 does not go through (its connection to the
+#                                primary is cut after about ten seconds: an I/O error,
+#                                or a hang that is killed), the mount survives, and
+#                                writes work again within 15s of the mesh returning
 #   nomad-cert-expired-outage-and-recovery
 #                                every agent certificate expired: every node `down`
 #                                within about 90s; a good certificate again, and up to
@@ -436,11 +438,11 @@ pkgs.testers.runNixOSTest {
                     break
                 time.sleep(1)
             seen = node1.execute("grep -qx ci-after-cut /mnt/jfs/ci-after-cut")[0] == 0
-            detail = (f"write during the cut: rc={rc} (124 = killed by timeout at 80s); mount survived={mounted},"
+            detail = (f"write during the cut: rc={rc} (1 = I/O error, 124 = hung and killed at 80s); mount survived={mounted},"
                       f" juicefs-mount active={alive}; writes again after {recovered}s; node1 reads it={seen}")
             print(f"mesh-down-jfs-recovers: {detail}")
             control("mesh-down-jfs-recovers",
-                    rc == "124" and mounted and alive and recovered is not None and recovered <= 15 and seen,
+                    rc in ("1", "124") and mounted and alive and recovered is not None and recovered <= 15 and seen,
                     detail)
 
         with subtest("nomad-cert-expired-outage-and-recovery: every agent certificate expires at once"):

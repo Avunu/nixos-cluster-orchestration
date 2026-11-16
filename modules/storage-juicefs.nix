@@ -119,9 +119,10 @@ in
       # The metadata primary is reached over the mesh unless it is this node's member.
       # With the mesh down a mount survives and its writes hang until it returns
       # (`mesh-down-jfs-recovers`), and a mount that could not start retries until it can.
+      # Not after juicefs-format: see there. Until the volume is formatted the
+      # gate below exits 4 and this is started again.
       after = [
         "network-online.target"
-        "juicefs-format.service"
         "${clusterLib.net.meshIf}-ready.service"
       ];
       wants = [
@@ -153,7 +154,14 @@ in
     systemd.services.jfs-health = {
       description = "Assert JuiceFS is mounted + writable";
       after = [ "juicefs-mount.service" ];
-      requires = [ "juicefs-mount.service" ];
+      # `wants`, not `requires`: a required unit that systemd is restarting takes
+      # this one round with it, every five seconds, and then this unit always has
+      # a start job pending. jfs-nomad-meta, nomad-bootstrap and multi-user.target
+      # wait behind that job, so a node whose mount could not start (no way to the
+      # metadata database) never finished booting (`missing-wg-key-boots`). It
+      # looks once, for a minute; jfs-nomad-meta's timer has it look again. What
+      # must go when the mount goes binds to the mount itself (a container does).
+      wants = [ "juicefs-mount.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -199,7 +207,7 @@ in
     # never advertises jfs_ready=true, so every JuiceFS-bound job sits in `pending`
     # forever against a constraint that looks like a scheduling problem rather than an
     # auth one. The token is the `node-meta` role's (node:write and nothing else,
-    # modules/nomad-acl.nix), from nomad-login@node-meta; Restart= covers the boot
+    # modules/nomad-acl.nix), from nomad-login@node-meta; the timer covers the boot
     # race where that login has not succeeded yet.
     systemd.services.jfs-nomad-meta = {
       description = "Advertise jfs_ready=true to the local Nomad agent";
@@ -216,8 +224,16 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        Restart = "on-failure";
-        RestartSec = 10;
+        # No Restart= here: systemd keeps the start job of a oneshot it is
+        # restarting, and nomad-bootstrap and multi-user.target, ordered after this
+        # unit, then wait for as long as /mnt/jfs is not there. A node that could
+        # not reach the metadata database never finished booting
+        # (`missing-wg-key-boots`). It fails once, and the timer below asks again.
+        #
+        # A flag that arrives late: the jobs registered meanwhile may have been
+        # evaluated without it (modules/nomad-register.nix), so registration runs
+        # again where this node does it. Nothing on a node that does not.
+        ExecStartPost = "-${config.systemd.package}/bin/systemctl try-restart --no-block nomad-bootstrap.service";
         # The CLI's client certificate: the API refuses a handshake without one.
         Environment = lib.mapAttrsToList (k: v: "${k}=${v}") (clusterLib.nomadPki.cliTlsFor vars).env;
         ExecStart = pkgs.writeShellScript "jfs-nomad-meta" ''
@@ -227,6 +243,15 @@ in
           exec ${config.services.nomad.package}/bin/nomad node meta apply \
             -address ${clusterLib.net.nomadAddr node} jfs_ready=true
         '';
+      };
+    };
+
+    # Until it has succeeded (RemainAfterExit: starting an active unit does nothing).
+    systemd.timers.jfs-nomad-meta = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "2min";
+        OnUnitInactiveSec = "30s";
       };
     };
 

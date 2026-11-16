@@ -365,6 +365,11 @@ in
     };
   };
 
+  systemd.timers.juicefs-format = {
+    wantedBy = [ "timers.target" ];
+    timerConfig.OnActiveSec = 0;
+  };
+
   systemd.services.juicefs-format = {
     description = "Format the JuiceFS volume, or restore it (idempotent, one node at a time)";
     # Ordering only: whichever serves the metadata database on this node, if any does.
@@ -376,8 +381,12 @@ in
       "network-online.target"
     ];
     wants = [ "network-online.target" ];
-    before = [ "juicefs-mount.service" ];
-    wantedBy = [ "multi-user.target" ];
+    # Not wanted by multi-user.target, and not ordered before the mount: a oneshot
+    # that systemd is restarting (exit 4, for as long as there is no primary) keeps
+    # its start job, and whatever waits on that job waits with it. A node with no
+    # way to the database (no mesh key, no etcd quorum) then never finished booting
+    # (`missing-wg-key-boots`). The timer below starts it instead, and the mount
+    # waits for a formatted volume by itself (its gate's exit 4).
     # A new ovh-s3 value has to reach the volume's settings, where every mount reads it
     # (and picks it up while mounted): re-run on a switch that changes its ciphertext.
     restartTriggers = ciphertextHash "ovh-s3" "access-key" ++ ciphertextHash "ovh-s3" "secret-key";

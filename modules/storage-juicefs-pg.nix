@@ -235,7 +235,13 @@ let
 
     listen jfs_meta
       bind ${jfs.metaHost}:${toString jfs.metaPort}
-      default-server inter 2s fastinter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+      # A member is given up after five failed checks, about ten seconds: its
+      # connections are then cut, so that a client is not left waiting on a dead
+      # node for as long as TCP would (a quarter of an hour). Not sooner: a query in
+      # flight on a cut connection comes back to the app as an I/O error, and a
+      # hiccup of the mesh should cost a stall and no more. A new primary is taken
+      # at its first good answer; Patroni's own 20 seconds come first either way.
+      default-server inter 2s fastinter 1s fall 5 rise 1 on-marked-down shutdown-sessions
       # With no primary (a failover, the mesh down), hold a new connection for a
       # few seconds and look again, not close it at once: a JuiceFS client gives up
       # on a file operation after some tens of failed connections, which closed at
@@ -423,7 +429,6 @@ in
           "haproxy.service"
         ];
         wants = [ (if ha then "patroni.service" else "postgresql.service") ];
-        before = [ "juicefs-format.service" ];
         wantedBy = [ "multi-user.target" ];
         restartTriggers = [
           dcsFile

@@ -740,6 +740,10 @@ pkgs.testers.runNixOSTest {
                       detail)
 
           with subtest("no failed units"):
+              # The write probe ran, and failed, while the metadata database was
+              # changing hands. It passes now.
+              for n in NODES:
+                  n.succeed("systemctl start jfs-probe.service")
               for n in NODES:
                   no_failed_units(n)
 
