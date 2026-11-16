@@ -151,5 +151,6 @@ in
         passwordFile = if encrypted then config.clan.core.vars.generators.luks.files.passphrase.path else null;
       }
       // lib.optionalAttrs (node ? disks) { devices = node.disks; }
+      // lib.optionalAttrs (node ? swapPerDiskGiB) { swapSizePerDiskGiB = node.swapPerDiskGiB; }
     )).disko.devices;
 }

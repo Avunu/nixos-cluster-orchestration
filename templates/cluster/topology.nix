@@ -194,6 +194,8 @@
       initrdNicModules = [ ];
       # disks = { a = "/dev/nvme0n1"; b = "/dev/nvme1n1"; };  # the default. Use
       # /dev/disk/by-id/... on hardware whose enumeration swaps.
+      # swapPerDiskGiB = 32;  # the default: a swap partition this size on each disk,
+      # so twice this in all. Fixed at install.
 
       # There is one opt-out from disk encryption and Secure Boot, per node, and it
       # takes a reason. Such a node gets plaintext disks and warns at every
