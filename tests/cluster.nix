@@ -11,7 +11,8 @@
 #   - etcd forms one 3-member cluster from etcdInitialCluster
 #   - three Nomad servers find each other (server_join) and elect one leader;
 #     all three clients join and advertise jfs_ready once /mnt/jfs is up
-#   - every node mounts the ONE JuiceFS volume through node1's metadata engine
+#   - every node mounts the ONE JuiceFS volume, whose metadata database has a member
+#     on each; the primary killed, a replica takes over and the mounts carry on
 #     over the WireGuard control mesh: a write on one node is read on another
 #   - the mesh: every node has a handshake with both others, and etcd, Loki,
 #     Prometheus and the exporters are reached at mesh addresses
@@ -577,6 +578,84 @@ pkgs.testers.runNixOSTest {
                     " | jq -e '.data.result | length > 0'",
                     timeout=180,
                 )
+
+        with subtest("jfs-meta-ha: one metadata database, a member on every node, and it outlives its primary"):
+            def members():
+                rc, out = node2.execute("patronictl -c /etc/patroni-jfs-meta-node2.yaml list -f json 2>/dev/null")
+                if rc != 0:
+                    rc, out = node3.execute("patronictl -c /etc/patroni-jfs-meta-node3.yaml list -f json 2>/dev/null")
+                try:
+                    return {m["Member"]: (m["Role"], m["State"]) for m in json.loads(out)}
+                except Exception:
+                    return {}
+            def formed(_=None):
+                ms = members()
+                leaders = [m for m, (role, _s) in ms.items() if role == "Leader"]
+                following = [m for m, (role, state) in ms.items() if role != "Leader" and state == "streaming"]
+                return len(ms) == 3 and len(leaders) == 1 and len(following) == 2
+            retry(formed, timeout_seconds=300)
+            before = members()
+            first = [m for m, (role, _s) in before.items() if role == "Leader"][0]
+            # A commit waits for one of the others (quorum commit): Patroni names them so.
+            quorum = sorted(role for role, _s in before.values() if role != "Leader")
+            by_name = {n.name: n for n in NODES}
+            victim = by_name[first]
+            survivors = [n for n in NODES if n is not victim]
+            # No JuiceFS client names a node: each asks its own loopback.
+            local_only = all(
+                n.succeed("systemctl cat juicefs-mount.service | grep ExecStart= | cut -d= -f2 | xargs cat"
+                          " | grep -c '@127.0.0.1:5432/'").strip() == "1" for n in NODES)
+            survivors[0].succeed("echo before-the-loss > /mnt/jfs/ci-meta-ha && sync")
+            # The primary dies without a word: Patroni and PostgreSQL killed, the lock
+            # left in etcd to run out. (Then stopped, so systemd doesn't bring it back
+            # before anybody has had to take over.)
+            victim.succeed("systemctl kill -s KILL patroni.service; systemctl stop patroni.service")
+            t0 = time.monotonic()
+            wrote = None
+            while time.monotonic() - t0 < 180:
+                if survivors[1].execute("timeout 5 sh -c 'echo after-the-loss > /mnt/jfs/ci-meta-ha2 && sync'")[0] == 0:
+                    wrote = round(time.monotonic() - t0, 1)
+                    break
+                time.sleep(1)
+            after = members()
+            second = [m for m, (role, _s) in after.items() if role == "Leader"]
+            kept = survivors[1].execute("grep -qx before-the-loss /mnt/jfs/ci-meta-ha")[0] == 0
+            mounts = {n.name: n.execute("mountpoint -q /mnt/jfs && systemctl is-active --quiet juicefs-mount.service")[0] == 0
+                      for n in NODES}
+            # The old primary comes back as a replica of the new one, by itself.
+            victim.succeed("systemctl start patroni.service")
+            rejoined = True
+            try:
+                retry(formed, timeout_seconds=300)
+            except Exception:
+                rejoined = False
+            again = members()
+            victim.wait_until_succeeds("grep -qx after-the-loss /mnt/jfs/ci-meta-ha2", timeout=60)
+            detail = (f"members {before}; every mount asks 127.0.0.1={local_only}; primary {first} killed;"
+                      f" a survivor wrote again after {wrote}s; primary now {second}; the write acknowledged before the loss"
+                      f" is there={kept}; mounts alive {mounts}; after {first} returned: {again}, formed={rejoined}")
+            print(f"jfs-meta-ha: {detail}")
+            control("jfs-meta-ha",
+                    local_only and quorum == ["Quorum Standby", "Quorum Standby"]
+                    and wrote is not None and wrote <= 90 and len(second) == 1 and second[0] != first
+                    and kept and all(mounts.values()) and rejoined,
+                    detail)
+
+        with subtest("jfs-meta-member-rebuilt: a member that lost its disk copies the database back"):
+            ms = members()
+            replica = by_name[[m for m, (role, _s) in ms.items() if role != "Leader"][0]]
+            replica.succeed("systemctl stop patroni.service && rm -rf /var/lib/postgresql/* && systemctl start patroni.service")
+            rebuilt = True
+            try:
+                retry(formed, timeout_seconds=300)
+            except Exception:
+                rebuilt = False
+            # It joined; nobody formatted or restored anything.
+            restored = {n.name: n.succeed("journalctl -u juicefs-format --no-pager | grep -c 'restoring\\|refusing' || true").strip()
+                        for n in NODES}
+            detail = f"{replica.name}'s data directory removed; members after: {members()}; restores or refusals in juicefs-format: {restored}"
+            print(f"jfs-meta-member-rebuilt: {detail}")
+            control("jfs-meta-member-rebuilt", rebuilt and all(v == "0" for v in restored.values()), detail)
 
         with subtest("no failed units anywhere"):
             for n in NODES:

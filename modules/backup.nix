@@ -21,7 +21,7 @@
 #     bump. The copies for the last hours are the replicas (modules/app-state.nix)
 #     and the state backup above, which is the raw directory, from a snapshot.
 #   - The JuiceFS metadata engine: it dumps itself hourly into its own bucket
-#     (modules/storage-juicefs-meta.nix restores the newest one on a rebuilt
+#     (modules/storage-juicefs-format.nix restores the newest one on a rebuilt
 #     node). Restoring a stale copy against a live bucket would orphan chunks.
 #   - Nomad and etcd state: declarative (re-registered from this flake) or empty.
 #   - Cloudflare D1/R2 (WordPress): Cloudflare's own Time Travel covers D1 for

@@ -1,14 +1,10 @@
 # modules/storage-juicefs.nix — universal shared FS client (Phase 4).
 #
 # JuiceFS over OVH Object Storage (S3), mounted at /mnt/jfs on EVERY node.
-# The metadata engine (PostgreSQL) is the other half of this pair and lives in
-# modules/storage-juicefs-meta.nix, assigned to the single `juicefs-meta`-tagged
-# node through inventory.instances. This file has no leader conditional in it:
-# it is what every node runs, unconditionally.
-#
-# TODO(HA): the metadata PG is still a single instance and therefore the
-# cluster's top SPOF — its loss strands /mnt/jfs on every node. Wrap it in
-# Patroni once >=2 real nodes exist.
+# Its metadata is a PostgreSQL database with a member on every node
+# (modules/storage-juicefs-pg.nix), and the volume is formatted, or restored, by
+# modules/storage-juicefs-format.nix, also on every node. No file of the three names
+# a node.
 #
 # The volume is encrypted (vars `juicefs-rsa`), and every mount refuses one that
 # isn't: see `assertEncryptedSh` in lib/juicefs.nix. Nothing at evaluation can see
@@ -28,12 +24,9 @@ let
   jfs = clusterLib.juicefs;
   vars = config.clan.core.vars.generators;
 
-  # The metadata engine's address is derived from the tag, not from a position
-  # in `topology.nodes`. Every node needs it (they all mount), so this is
-  # cross-node data rather than a role guard. It is on the control mesh, and
-  # comes from one helper, so an engine that moves (a primary that changes) is a
-  # change to lib/net.nix alone.
-  metaIp = clusterLib.net.jfsMetaHost topology;
+  # This node's loopback, where HAProxy passes the connection to the primary
+  # (modules/storage-juicefs-pg.nix). The primary moving is not a change here.
+  metaIp = jfs.metaHost;
 
   loadCreds = jfs.loadCredentials (
     id:
@@ -67,7 +60,7 @@ let
     JFS_RSA_PASSPHRASE="$(cat "$CREDENTIALS_DIRECTORY/${jfs.credIds.rsaPass}")"
     export JFS_RSA_PASSPHRASE
     # A client that died under its mount (node1, 2026-10-30: a switch stopped the
-    # local metadata PG out from under it) leaves a dead FUSE endpoint behind.
+    # metadata PG out from under it) leaves a dead FUSE endpoint behind.
     # Every stat of it fails with ENOTCONN, so the mkdir below fails and
     # Restart= loops forever while every container bound to it stays down.
     # Detach it so the restart can recover on its own. On a first boot the
@@ -107,10 +100,10 @@ let
 in
 {
   # A test seam, not a setting: every JuiceFS script's text passes through it on
-  # its way to the store, here and in modules/storage-juicefs-meta.nix. The named
+  # its way to the store, here and in modules/storage-juicefs-format.nix. The named
   # mutants of tests/jfs-encrypted.nix (flake.nix, legacyPackages.mutants) use it to
   # remove or fake one control and prove that the test notices. Declared here
-  # because every node imports this module, the metadata node included.
+  # because every node imports this module.
   options.cluster.juicefs.scriptEdit = lib.mkOption {
     type = lib.types.functionTo (lib.types.functionTo lib.types.str);
     default = _name: text: text;
@@ -123,9 +116,9 @@ in
 
     systemd.services.juicefs-mount = {
       description = "Mount JuiceFS (${jfs.jfsName}) at ${jfs.mountPoint}";
-      # The metadata engine is reached over the mesh. With the mesh down a mount
-      # survives and its writes hang until it returns (`mesh-down-jfs-recovers`), and
-      # a mount that could not start retries until it can.
+      # The metadata primary is reached over the mesh unless it is this node's member.
+      # With the mesh down a mount survives and its writes hang until it returns
+      # (`mesh-down-jfs-recovers`), and a mount that could not start retries until it can.
       after = [
         "network-online.target"
         "juicefs-format.service"
@@ -142,7 +135,11 @@ in
         Type = "simple";
         ExecStart = "${mountScript}";
         LoadCredential = loadCreds;
-        Restart = "on-failure";
+        # `always`, not `on-failure`: after some minutes without its metadata database
+        # the client's own watchdog ends it, cleanly ("exit successfully"), and
+        # on-failure then left the node without /mnt/jfs for good once the database
+        # was back (`meta-database-grows`). A `systemctl stop` is still a stop.
+        Restart = "always";
         RestartSec = 5;
         # A plaintext volume is refused for good, not retried every five seconds: the
         # unit stays failed (UnitFailed) next to cluster_jfs_encrypted 0. Everything

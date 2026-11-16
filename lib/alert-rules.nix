@@ -643,7 +643,40 @@ in
           for = "10m";
           severity = "warning";
           summary = "newest JuiceFS metadata dump is {{ $value | humanizeDuration }} old";
-          description = "A reinstalled juicefs-meta node restores from the newest dump; older means more orphaned chunks. On a volume that has never written one, the age counts from when the bucket was first seen without it.";
+          description = "A cluster that lost every copy of the metadata database restores from the newest dump; older means more lost. On a volume that has never written one, the age counts from when the bucket was first seen without it.";
+        })
+      ];
+    }
+    {
+      # The metadata database (modules/storage-juicefs-pg.nix): each node's Patroni,
+      # scraped by every node.
+      name = "jfs-meta";
+      rules = [
+        (rule {
+          alert = "JuiceFSMetaNoPrimary";
+          # `or vector(0)`: with every member unreachable there is no series to sum.
+          expr = ''(sum(patroni_primary{job="patroni"}) or vector(0)) < 1'';
+          # A failover takes under a minute.
+          for = "3m";
+          severity = "critical";
+          summary = "the JuiceFS metadata database has no primary";
+          description = "Every /mnt/jfs is stalled. `patronictl list` on any node; etcd without a quorum gives exactly this.";
+        })
+        (rule {
+          alert = "JuiceFSMetaMemberDown";
+          expr = ''up{job="patroni"} == 0 or patroni_postgres_running{job="patroni"} == 0'';
+          for = "15m";
+          severity = "warning";
+          summary = "the JuiceFS metadata database's member on {{ $labels.instance }} is down";
+          description = "The others carry on. With one member left, a commit waits for nobody else and that node's loss is the database's.";
+        })
+        (rule {
+          alert = "JuiceFSMetaReplicaNotStreaming";
+          expr = ''patroni_replica{job="patroni"} == 1 and on (instance) patroni_postgres_streaming{job="patroni"} == 0'';
+          for = "15m";
+          severity = "warning";
+          summary = "the JuiceFS metadata replica on {{ $labels.instance }} is not following the primary";
+          description = "It can't be promoted while it is behind. Its journal (patroni.service) says why; `patronictl reinit jfs-meta <node>` copies it afresh.";
         })
       ];
     }

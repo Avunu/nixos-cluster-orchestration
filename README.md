@@ -20,9 +20,9 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 - **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the TPM releases the disk key only to that signed boot. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
 - **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it. No entry names a node: Nomad places every app, and an app's data is where Nomad puts it ([Where an app runs](#where-an-app-runs)).
 - **Ingress is a tunnel per app, over a unix socket.** Each container runs its own `cloudflared` against a unix socket. See [Ingress](#ingress).
-- **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds shared files, the same on every node. The volume is encrypted, and every mount refuses one that is not.
+- **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds shared files, the same on every node. Its metadata is a PostgreSQL database with a member on every node, which survives the loss of the node holding its primary ([The JuiceFS metadata database](#the-juicefs-metadata-database)). The volume is encrypted, and every mount refuses one that is not.
 - **Secrets are `clan vars`** on clan's plain `age` backend. Values are generated offline, committed encrypted, and decrypted on the host at activation. Containers never hold a key: the plaintext is bind-mounted in.
-- **Cluster roles are tags, not positions.** Singleton services (the JuiceFS metadata engine, the Nomad job registrar, Prometheus) are assigned by `tags` through `modules/cluster-roles.nix`.
+- **No service belongs to one node.** A tag says what a node votes in (`nomad-server`, `etcd`) or that it runs apps (`worker`). Everything else, the JuiceFS metadata database, job registration, Prometheus, Alertmanager and Loki included, runs on every node or every Nomad server.
 - **The private network is not trusted.** Nomad speaks mTLS with a gossip key on the control VLAN. Everything else between nodes (etcd, Loki, Prometheus and its exporters, Vector, the JuiceFS metadata database) listens only on a WireGuard mesh, `wg-ctrl`, over that VLAN. See [The control plane](#the-control-plane).
 
 ### How a container runs
@@ -187,7 +187,6 @@ Other exports:
 
 Three things are easy to get wrong:
 
-- **`module.input = "self"` is resolved by clan against the clan's own `modules` option**, not your flake's outputs, so you don't re-export the `cluster-roles` service. `checks.mk-cluster` calls `mkCluster` with a `self` that exports nothing, to keep it that way.
 - **`nix flake check --no-build` evaluates read-only.** With `directory` as a path, clan's interpolation names a store path that a read-only run never adds, so that command fails on a consumer flake whose current source no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures pass a string to get past it, which a real site must not do: a string would keep the secrets out of the closure.
 - **Flakes only see tracked files.** Run `git add` on new apps and vars before you evaluate.
 
@@ -206,7 +205,7 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | The boot | Secure Boot through Lanzaboote, with keys made on the node at install and never copied off it (`/var/lib/sbctl`, on the encrypted root). No Microsoft keys by default: option ROMs this boot measured are enrolled by hash. |
 | A swapped volume | A per-node secret on the encrypted root whose hash is compiled into the signed initrd. The initrd checks it before it mounts anything from the pool, and halts on a mismatch, so a forged disk with copied identifiers gets nothing. |
 | The emergency shell | Protected by a hashed password, and entering it first extends PCR 7 with a burn, so the TPM refuses the disk key for the rest of that boot. |
-| The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount and the metadata node refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
+| The JuiceFS volume | Encrypted by JuiceFS with an RSA key (`juicefs-rsa`, `aes256gcm-rsa`). Every mount, and `juicefs-format` on every node, refuse a volume that is not encrypted (exit 3, `JuiceFSVolumeNotEncrypted`). Its automatic metadata dumps in the bucket are encrypted too. |
 | Logs | Each node's Loki keeps its store on that node's own encrypted disk (`/var/lib/loki`), not in a bucket. Core dumps are off on every node and in every container. |
 | Backups | restic, with each app's repository at a salted hash of its name. |
 | The state backup | Restic, like the nightly backup and under the same password, at a salted hash of the app's name that is not the nightly repository's. See [Backups and restore](#backups-and-restore). |
@@ -462,7 +461,7 @@ What the node held, and what replaces it:
 | `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
 | `nomad-gossip` on a server, `nomad-acl` on a server, the alerting tokens on every node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
-| `juicefs-pg` | By hand, in a window: every mount and the metadata role change together. |
+| `juicefs-pg`, `juicefs-patroni` | By hand, in a window: every mount, every member and the roles change together. |
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
 | `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
 | `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
@@ -476,8 +475,8 @@ The order: the GitHub token and the S3 pairs first, because they are what reache
 1. `cluster-backup` on a node, for each app running there (`avc app backup <app>` finds the node), and look at the result (`cluster-backup-list <app>`). These snapshots are what comes back.
 2. Hold every node (`avc deploy hold <node>`), and stop the apps (`nomad job stop app-<name>`) and then `juicefs-mount` on every node.
 3. Create a new, empty bucket. In one commit: its name in `objectStorage.juicefsBucket`, and a new key from `clan vars generate <node> --generator juicefs-rsa --regenerate`. Merge it.
-4. On the `juicefs-meta` node, empty the metadata database (as `postgres`: `dropdb juicefs`, then `createdb -O juicefs juicefs`). This is the step that makes the volume new. With the old metadata still there, `juicefs-format` finds a volume it knows and keeps it, old bucket and old key.
-5. Release the `juicefs-meta` node first (`avc deploy release <node>`). `juicefs-format` finds no metadata and an empty bucket, which is a first bring-up: it formats an encrypted volume with the new key. Then release the others.
+4. On the node holding the metadata database's primary (`patronictl list` names it), empty the database (as `postgres`: `dropdb -p 5433 juicefs`, then `createdb -p 5433 -O juicefs juicefs`). This is the step that makes the volume new. With the old metadata still there, `juicefs-format` finds a volume it knows and keeps it, old bucket and old key.
+5. Release the nodes (`avc deploy release <node>`). The first `juicefs-format` to run finds no metadata and an empty bucket, which is a first bring-up: it formats an encrypted volume with the new key, and the others find it formatted.
 6. With each app's container running on the new volume, `cluster-restore <app> --yes` on the node it is running on (`avc app restore <app>`).
 7. When every app has been checked, delete the old bucket. Until then the old volume can be read from the kit ([Restore without a node](#restore-without-a-node)).
 
@@ -514,7 +513,7 @@ All nodes gone, or a rebuild from scratch, in this order:
 
 1. The private repository from the offline kit: `git clone site-<date>.bundle site`, `AGE_KEYFILE=<offline identity>`, a new operator key added to `recipients`, and `clan vars fix <machine>` for each machine.
 2. The first node installed and sealed, S0 to S8.
-3. The JuiceFS metadata restored from the bucket with the PEM and its passphrase: the reinstalled `juicefs-meta` node does it by itself from a recent dump ([below](#when-the-juicefs-metadata-node-is-reinstalled)), or by hand ([Restore without a node](#restore-without-a-node)).
+3. The JuiceFS metadata restored from the bucket with the PEM and its passphrase: the first node does it from a recent dump once you tell it to start an empty database ([below](#when-every-copy-of-the-juicefs-metadata-is-lost)), or by hand ([Restore without a node](#restore-without-a-node)).
 4. Nomad bootstraps itself on the first voter, which registers every job.
 5. `cluster-restore <app> --yes` per app.
 
@@ -578,7 +577,7 @@ Accepted, and written here so they are accepted knowingly.
 - **The mesh authorizes nodes, not processes** (D1): any process on a node can reach etcd, Loki, Prometheus and the metadata database's port.
 - **The app VLAN is not authenticated.** An attacker on it who spoofs a container's source address can reach a port an app declared on another node: for traffic arriving from the VLAN, the rule checks the source subnet and port, not identity.
 - **Metadata leaks:** the bucket shows object sizes and timing; restic's key files show host names and times; metrics and alert emails carry app and host names to Cloudflare; PostgreSQL's WAL, the JuiceFS cache and backup staging hold plaintext on the encrypted disk until the next run.
-- **`juicefs config --secret-key` puts the S3 secret on a command line** on the metadata node for the seconds of its storage test, after a restore, a rotation or a lost state file. JuiceFS 1.4.1 has no other way.
+- **`juicefs config --secret-key` puts the S3 secret on a command line** on a node for the seconds of its storage test, after a restore or a rotation, and once on each node after its install. JuiceFS 1.4.1 has no other way.
 - **Logs are kept on the nodes only.** Every node's Loki holds the whole cluster's lines, so they survive any node but not all of them. Backing them up would keep client-bearing logs past their retention.
 - **`freeipa` keeps every capability** (`additionalCapabilities = [ "all" ]`), so a compromise of that container is host root whatever the firewall does.
 - **Cloudflare sees traffic at the tunnel edge,** and the alert emails' text.
@@ -648,8 +647,7 @@ What an unlock depends on (the node's `initrdNicModules`, `wanInterface`, `publi
 | --- | --- |
 | `worker` | Runs application containers (Nomad client). |
 | `nomad-server` | Votes in the Nomad raft. `bootstrap_expect` is asserted to be the number of nodes with this tag. Holds the gossip key, the management token, and every ACL token in raft state. Registers the rendered jobspecs and applies the ACL policies; every server does, so none of them has to be up for either. |
-| `etcd` | Votes in the etcd raft. |
-| `juicefs-meta` | Hosts the JuiceFS metadata PostgreSQL. Singleton: two would mean two metadata engines over one bucket. |
+| `etcd` | Votes in the etcd raft, which is also where the JuiceFS metadata database elects its primary. |
 
 Quorum size is derived from the tags, so a placeholder listed as a voter makes Nomad and etcd wait for a machine that does not exist. Add `nomad-server` and `etcd` in the same commit that fills in a node's real addressing. A cluster with fewer than three voters has no HA.
 
@@ -657,7 +655,7 @@ Quorum size is derived from the tags, so a placeholder listed as a voter makes N
 
 Go from one voter to three in a single commit: `nomad-server` on the two new nodes, and `etcd` on all three. etcd has no member add. It is created once, from the tags, so it is either absent or has an odd number of at least three members, and evaluation refuses anything else. A one-member etcd can't grow: its data directory makes it ignore the new member list, and the two new members would form a second cluster of their own. Nomad tolerates one voter growing, but two voters means no leader while either is down, so don't stop at two.
 
-The switch is safe for the running voter: Nomad ignores `bootstrap_expect` once it has raft state, and its allocations keep running. `checks.voter-growth` covers both orders (the first voter switching before or after the new ones start, a worker promoted, a fresh voter).
+The switch is safe for the running voter: Nomad ignores `bootstrap_expect` once it has raft state, and its allocations keep running. The JuiceFS metadata database changes hands in the same commit, from the one server's PostgreSQL to a member on every node that starts from that server's data, and `/mnt/jfs` is stalled from the moment the first node switches until etcd has formed and the old server's member is up. `checks.voter-growth` covers both orders (the first voter switching before or after the new ones start, a worker promoted, a fresh voter).
 
 **Before reinstalling a server that died, remove it from raft and wait.** Autopilot removes a failed server by itself a moment after serf marks it failed; a reinstall seconds later can be pulled back into the old cluster under its old identity. And never reinstall a node from a topology commit in which it is the only voter while the others still run: it would bootstrap a cluster of its own.
 
@@ -692,6 +690,23 @@ An app is one file in `appsDir`, named after the app. It is a function of `{ inp
 The payload modules come from [wordpress-nix](https://github.com/Avunu/wordpress), [frappe-nix](https://github.com/Avunu/frappe-nix) and [odoo-nix](https://github.com/Avunu/odoo-nix). Your project flake supplies the `package`. To pin its payload module to the library's, use `inputs.odoo-nix.follows = "cluster/odoo-nix"`.
 
 Beside the kind, every generic `clusterApps` option stays available (`modules/app-container.nix`): `tunnel.id`, `resources`, `startTimeout`, `network` ([Container networking](#container-networking)), `module` for extra guest config, and so on. `oidc = { idp = "<a FreeIPA app>"; }` makes any app a client of that provider's Authelia. `enable = false;` keeps a file without deploying it.
+
+### The JuiceFS metadata database
+
+JuiceFS keeps file names, sizes and the map from files to objects in PostgreSQL. On a site with an etcd, every node runs a member of one PostgreSQL cluster (`modules/storage-juicefs-pg.nix`), and Patroni keeps one of them the primary by a lock in etcd.
+
+- **Every member has the data as it is written.** The replicas stream from the primary, and a commit is not acknowledged until one of them has it (`synchronous_mode: quorum`). A node that dies takes no acknowledged write with it.
+- **The primary's node can die.** Its lock runs out after 20 seconds, a replica that holds every acknowledged write is promoted, and the mounts on the other nodes carry on. Writes stall meanwhile; they are not lost. `checks.cluster` kills the primary and measures it.
+- **No node is named.** Each mount asks its own node's loopback (`127.0.0.1:5432`), where HAProxy asks every member's Patroni which one is the primary and passes the connection there. A member that stops being the primary has its connections cut.
+- **A reinstalled node's member copies the database back** from the primary, by itself.
+- **A primary left alone keeps writing.** With every replica gone, the primary carries on without waiting for one (Patroni records that, and promotes nobody who missed those writes). The other choice would stop every app on a three-node site that is down to one node.
+- **It needs etcd's quorum.** With etcd down to a minority there is no primary, by design: that is what keeps two sides of a partition from both writing.
+
+`patronictl list` on any node shows the members (`Leader`, `Quorum Standby`), and `patronictl switchover` moves the primary by hand, before planned work on its node. Patroni's settings are in `modules/storage-juicefs-pg.nix`; each node applies them, so don't `patronictl edit-config`.
+
+A site with one Nomad server and no `etcd` tag has one PostgreSQL, on that server, in the same place and with the same roles. [Growing to three voters](#growing-to-three-voters) turns it into the first member.
+
+**Moving a site from the `juicefs-meta` tag.** The node that carried the tag has the database, and its member starts the cluster from it; the others, with nothing, wait until it has (a member with no data creates no database while the bucket holds a volume). Remove the tag in the same commit. This path is the one `checks.voter-growth` covers for a one-server site; on a site that already had an etcd it has not been run.
 
 ### Adding an app
 
@@ -737,9 +752,10 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `volume-identity/{secret,hash}` | The volume identity, per machine. The secret goes on the root at install; the hash is compiled into the signed initrd. **Never regenerate it** on an installed node | Generated |
 | `initrd-ssh/ssh_host_ed25519_key` | The initrd's SSH host key, per machine. Placed at install; the public half is what `avc boot unlock` expects. Rotation by hand (see [Recovery](#recovery)) | Generated |
 | `emergency-access/{password,hash}` | The initrd emergency shell, per machine. The password never leaves the repository; the hash is in every signed initrd | Generated |
-| `ovh-s3/{access-key,secret-key}` | JuiceFS on all nodes. The volume keeps its own copy in its settings, which every mount reads; the metadata node puts a new pair there when the vars change, and running mounts pick it up | Prompt, from your S3 provider |
+| `ovh-s3/{access-key,secret-key}` | JuiceFS on all nodes. The volume keeps its own copy in its settings, which every mount reads; `juicefs-format` puts a new pair there when the vars change, and running mounts pick it up | Prompt, from your S3 provider |
 | `juicefs-rsa/{rsa.pem,rsa-passphrase}` | The JuiceFS volume's encryption key. Never regenerate it: the volume's data can't be read without it, and `avc` refuses to rotate it | Generated |
-| `juicefs-pg/password` | The JuiceFS metadata engine. Manual: every mount and the metadata role change together | Generated |
+| `juicefs-pg/password` | The JuiceFS metadata database's role for the mounts. Manual: every mount and the role change together | Generated |
+| `juicefs-patroni/{superuser,replication,restapi}` | The metadata database's own: its superuser, the role its members replicate as, and what Patroni's API wants for anything that changes the cluster. Manual: restart `patroni` on each node afterwards, replicas first | Generated |
 | `nomad-acl/token` | Nomad's management token: the ACL bootstrap and `nomad-acl-init`, on the Nomad servers only | Generated |
 | `nomad-jwt/{signing.key,signing.pub}` | Signs each machine's login JWTs; the key never leaves the operator's machine | Generated |
 | `nomad-login/jwt-<role>` | Each machine's scoped Nomad logins (`fence`, `node-meta`, `avc`, plus `registrar` where jobs are registered), per machine | Generated, signed by `nomad-jwt` |
@@ -976,11 +992,15 @@ The staging, verify and restore directories (`/var/lib/cluster-backup/{staging,v
 
 For an S3 target, use a bucket with versioning and a user that cannot delete object versions, so a compromised cluster can hide objects but cannot destroy history.
 
-#### When the JuiceFS metadata node is reinstalled
+#### When every copy of the JuiceFS metadata is lost
+
+One reinstalled node is not this case: its member copies the database from the primary and nothing is restored. This is every member's data gone at once (or the one node of a one-node site), with the bucket intact.
+
+On a site with an etcd, every member then waits, because none of them may start an empty database while the bucket holds a volume: `patroni` restarts every 10 seconds and says so, and `JuiceFSMetaNoPrimary` fires. Pick one node and `touch /var/lib/patroni/found-new-cluster` there. That member starts empty, the others join it, and `juicefs-format` restores the newest dump. Remove the file afterwards. A one-node site needs no such step.
 
 `juicefs-format` restores the newest metadata dump on its own if it is at most 6 hours old. The mounts write one every 2 hours, encrypted, to `<bucket>/appfs/meta/`. An older one means the dumps stopped, and restoring it would lose every file written since, so the unit refuses with exit 5 and says why. To restore that dump anyway, name it on the node: `echo <dump name> > /var/lib/juicefs-format/restore-stale-dump`, then `systemctl restart juicefs-format`. Exit 4 is an outage (the database or the object storage unreachable). The unit retries it every 30 seconds, and `UnitRestartLoop` fires if it goes on for 15 minutes. Exit 3 is a volume that is not encrypted, which is refused for good.
 
-The JuiceFS metadata engine is deliberately not backed up by restic, because restoring a stale dump against a live bucket produces a filesystem that lies about its contents. Its recovery path is JuiceFS's own metadata dump in the bucket, which `juicefs-format.service` restores when a reinstalled metadata node comes up.
+The metadata database is deliberately not backed up by restic, because restoring a stale dump against a live bucket produces a filesystem that lies about its contents. Its protection is its replicas, and behind them JuiceFS's own metadata dump in the bucket.
 
 #### Restore without a node
 
@@ -1049,6 +1069,9 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `JuiceFSUnwritable` | critical | `/mnt/jfs` is not writable. |
 | `JuiceFSProbeStale` | warning | The JuiceFS probe has not run. |
 | `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old, or a volume has gone that long without writing its first. |
+| `JuiceFSMetaNoPrimary` | critical | The metadata database has had no primary for 3 minutes: every `/mnt/jfs` is stalled. |
+| `JuiceFSMetaMemberDown` | warning | A node's member of the metadata database is down or unreachable. |
+| `JuiceFSMetaReplicaNotStreaming` | warning | A replica of the metadata database is not following the primary. |
 | `AuditDeliveryStale` | warning | Audit events are held on the node, undelivered. |
 | `AuditProducerStale` | warning | An audit producer (sender, journal follower, Nomad stream) has stopped working. |
 | `AuditNomadStreamRefused` | warning | Nomad's ACL event stream refuses the audit follower. |
@@ -1134,7 +1157,7 @@ This version is written for fresh installs. A cluster running an earlier version
 - **Nomad TLS and the gossip key.** Rolled out node by node by the pull loop, servers with and without the key can't gossip, and plaintext and TLS RPC can't talk. All servers must switch together.
 - **Scoped tokens.** One server's `nomad-acl-init` has to run before any other node's logins succeed; until then those retry every 10 seconds, and a non-leader's deploy may report an activation failure once and then recover.
 - **The mesh.** etcd's peer addresses move from the control VLAN to the mesh, and etcd reads its member list only on a new data directory, so an existing member keeps advertising its old addresses: an in-place move needs `etcdctl member update` per member, or a fresh etcd. Not tested. SSH over the VLANs stops.
-- **JuiceFS encryption.** A volume formatted before is plaintext, and every mount and the metadata node now refuse it (exit 3). Moving to an encrypted volume is a migration (a new volume, copy, cut over), not a switch.
+- **JuiceFS encryption.** A volume formatted before is plaintext, and every mount and `juicefs-format` now refuse it (exit 3). Moving to an encrypted volume is a migration (a new volume, copy, cut over), not a switch.
 - **Loki's dataset.** A node installed before has no `rpool/loki`, and disko creates datasets only at install. Create it first, on every node: `zfs create -o mountpoint=legacy -o quota=50G -o com.sun:auto-snapshot=false rpool/loki`. Required mounts are in the boot contract, so the closure waits for approval anyway; create the dataset before approving. The old Loki bucket is no longer used.
 - **Hashed backup paths.** Apps with repositories at `apps/<app>` get new, empty ones at the hashed path; the old ones stay untouched. Deploy before the first backup, or `restic copy` each app across.
 - **Every container restarts once.** Each job now runs as `nomad-apps` with a new wrapper, so each allocation is replaced. Containers with `peerAccess` get a new veth, which a reload cannot apply: `nomad job restart app-<name>`. Containers' WAN MACs become fixed (`02:76:77:<node index>:<iid>`); if your provider pins MACs per port or address, check before rollout.
@@ -1189,7 +1212,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `control-plane-failure` | The control plane's own failures: the mesh cut, a key rotated on one side, a node booted without its mesh key, every Nomad certificate expired, and recovery from each. |
 | `jumbo-mtu` | MTU 9000 on the VLANs and 8920 on the mesh, on a link that carries it and on one that silently doesn't (`VrackJumboBroken`). |
 | `container-isolation` | Container to host and container to container: default-deny, the holes an app declares by bridge port, spoofed identities refused, the WAN segment's pinned MACs and neighbour discovery. |
-| `voter-growth` | One Nomad voter to three: the first voter's switch, a worker promoted, a fresh voter, etcd formed once three nodes carry it, and the `bootstrap_expect` trap. |
+| `voter-growth` | One Nomad voter to three: the first voter's switch, a worker promoted, a fresh voter, etcd formed once three nodes carry it, the metadata database growing from the one server's to three members with its data, and the `bootstrap_expect` trap. |
 | `jfs-encrypted` | The JuiceFS volume is encrypted; a plaintext one is refused at format and at mount; restore works with the key, only with the key, and from the offline kit alone; stale dumps, interrupted loads, S3 key rotation. |
 | `canary-scan` | Per class: plant the canary, scan, found; remove it, scan, not found. Swap plain against dm-crypt, a plaintext bucket against an encrypted one, a real compressed core a grep can't see into. |
 | `container-tunnel` | The generated container, tunnel and firewall wiring. |
@@ -1206,7 +1229,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
 | `cluster-single` | `node1`'s real machine module boots and walks the whole cold start, twice: secrets, networking, the mesh, etcd, encrypted JuiceFS on S3, Nomad with TLS and scoped tokens, every app's job, monitoring, the audit producers. Jobs register but aren't placed. About 5 GB of RAM. |
-| `cluster` | Three voters form quorums, share one JuiceFS volume, and run probe containers with cross-node reachability, an app held to one node by a constraint, and fencing. About 9 GB of RAM. |
+| `cluster` | Three voters form quorums, share one JuiceFS volume whose metadata database loses its primary and a replica's disk and carries on, and run probe containers with cross-node reachability, an app held to one node by a constraint, and fencing. About 9 GB of RAM. |
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 
@@ -1253,7 +1276,7 @@ These are accepted deliberately.
 4. **Config changes bounce the connector.** A container restart drops its tunnel briefly.
 5. **`br-wan` puts containers on the public L2 segment.** Their inbound filtering is the container's own firewall, with the host pinning each port's MAC and addresses.
 6. **No restore is to the second.** An app's state can be had back to the minute for the last four hours and to the hour for the last day, from any node's snapshots ([Where an app runs](#where-an-app-runs)); from off the nodes, to the hour with `backup.state` and to the night without. The continuous database archive an earlier version had is gone: it was the only thing here that reached a second, nothing restored from it, and replication took over what it was for.
-7. **The JuiceFS metadata engine is a single point of failure.** If the `juicefs-meta` node dies, every node's `/mnt/jfs` is stranded until it returns.
+7. **The JuiceFS metadata database needs etcd's quorum.** It survives a node, its primary's included, but with etcd down to a minority it has no primary and every `/mnt/jfs` stalls until the quorum is back. A site with one Nomad server and no etcd has one copy, on that server.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
 9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation.
 10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.

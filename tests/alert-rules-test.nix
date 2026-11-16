@@ -303,20 +303,16 @@ let
         "0x40"
       ]
     ] "10m" none)
-    (case "CacheDown"
+    (case "CacheDown" [
       [
-        [
-          ''cluster_cache_up{instance="a"}''
-          "0x60"
-        ]
-        [
-          ''cluster_cache_up{instance="b"}''
-          "0x60"
-        ]
+        ''cluster_cache_up{instance="a"}''
+        "0x60"
       ]
-      "40m"
-      [ { severity = "warning"; } ]
-    )
+      [
+        ''cluster_cache_up{instance="b"}''
+        "0x60"
+      ]
+    ] "40m" [ { severity = "warning"; } ])
     # One node reaching it is a cache that is up.
     (case "CacheDown" [
       [
@@ -559,6 +555,108 @@ let
         "0+60x300"
       ]
     ] "4h" none)
+
+    # ── The metadata database ───────────────────────────────────────────────
+    (case "JuiceFSMetaNoPrimary" [
+      [
+        ''patroni_primary{job="patroni",instance="a"}''
+        "0x20"
+      ]
+      [
+        ''patroni_primary{job="patroni",instance="b"}''
+        "0x20"
+      ]
+    ] "10m" [ { severity = "critical"; } ])
+    # No member scraped at all is no primary either.
+    (case "JuiceFSMetaNoPrimary" [
+      [
+        ''up{job="patroni",instance="a"}''
+        "0x20"
+      ]
+    ] "10m" [ { severity = "critical"; } ])
+    (case "JuiceFSMetaNoPrimary" [
+      [
+        ''patroni_primary{job="patroni",instance="a"}''
+        "0x20"
+      ]
+      [
+        ''patroni_primary{job="patroni",instance="b"}''
+        "1x20"
+      ]
+    ] "10m" none)
+    (case "JuiceFSMetaMemberDown"
+      [
+        [
+          ''up{job="patroni",instance="a"}''
+          "0x40"
+        ]
+      ]
+      "30m"
+      [
+        {
+          job = "patroni";
+          instance = "a";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "JuiceFSMetaMemberDown"
+      [
+        [
+          ''patroni_postgres_running{job="patroni",instance="a"}''
+          "0x40"
+        ]
+      ]
+      "30m"
+      [
+        {
+          job = "patroni";
+          instance = "a";
+          severity = "warning";
+        }
+      ]
+    )
+    (case "JuiceFSMetaMemberDown" [
+      [
+        ''up{job="patroni",instance="a"}''
+        "1x40"
+      ]
+      [
+        ''patroni_postgres_running{job="patroni",instance="a"}''
+        "1x40"
+      ]
+    ] "30m" none)
+    (case "JuiceFSMetaReplicaNotStreaming"
+      [
+        [
+          ''patroni_replica{job="patroni",instance="a"}''
+          "1x40"
+        ]
+        [
+          ''patroni_postgres_streaming{job="patroni",instance="a"}''
+          "0x40"
+        ]
+      ]
+      "30m"
+      [
+        {
+          job = "patroni";
+          instance = "a";
+          severity = "warning";
+        }
+      ]
+    )
+    # A primary streams from nobody, and is no replica.
+    (case "JuiceFSMetaReplicaNotStreaming" [
+      [
+        ''patroni_replica{job="patroni",instance="a"}''
+        "0x40"
+      ]
+      [
+        ''patroni_postgres_streaming{job="patroni",instance="a"}''
+        "0x40"
+      ]
+    ] "30m" none)
 
     # ── FreeIPA ─────────────────────────────────────────────────────────────
     (case "FreeIPADown"

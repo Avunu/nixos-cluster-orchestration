@@ -296,9 +296,8 @@ let
   heldTo =
     sys: app:
     map (k: k.RTarget) (
-      lib.filter (k: (k.LTarget or "") == "\${node.unique.name}") (
-        lib.head sys.config.system.build.nomadJobSpecs.${app}.Job.TaskGroups
-      ).Constraints
+      lib.filter (k: (k.LTarget or "") == "\${node.unique.name}")
+        (lib.head sys.config.system.build.nomadJobSpecs.${app}.Job.TaskGroups).Constraints
     );
 
   # The real kinds, as the fixture catalogue declares them, on this test's node1.
@@ -669,7 +668,7 @@ pkgs.testers.runNixOSTest {
         with subtest("marked-reaches-only-declared: gprobe and the real Grafana read Loki and Prometheus"):
             loki = run(node1, "gprobe", f"curl -fsS --max-time 10 http://{M1}:{LOKI}/ready")
             prom = run(node1, "gprobe", f"curl -fsS --max-time 10 http://{M1}:{PROM}/-/ready")
-            others = {p: reach(node1, "gprobe", M1, p) for p in (9100, 9633, 9598, 2379, 5432, 22)}
+            others = {p: reach(node1, "gprobe", M1, p) for p in (9100, 9633, 9598, 2379, 5432, 5433, 8008, 22)}
             # demo-grafana (modules/kinds/grafana.nix, as the fixture declares it): its
             # datasources, health-checked by Grafana itself, from inside its container.
             node1.wait_for_unit("container@demo-grafana.service", timeout=300)

@@ -831,10 +831,11 @@ pkgs.testers.runNixOSTest {
                     and all(v == (p in granted) for p, v in from_ctr.items()),
                     detail)
 
-        with subtest("juicefs-pg-unreachable-on-vlan: PostgreSQL listens everywhere, the attacker reaches it nowhere"):
-            everywhere = node1.execute("ss -Htln 'sport = :5432' | grep -qE '(0\\.0\\.0\\.0|\\*):5432'")[0] == 0
-            local = all(node1.execute(f"timeout 8 bash -c 'exec 3<>/dev/tcp/{ip}/5432'")[0] == 0 for ip in (CTRL, M1))
-            reached = {ip: reaches(f"nc -z -w5 {ip} 5432") for ip in (CTRL, M1, APP_IP, STG_IP)}
+        with subtest("juicefs-pg-unreachable-on-vlan: PostgreSQL and Patroni listen everywhere, the attacker reaches them nowhere"):
+            # 5433 is the member, 8008 its Patroni: both on every address. 5432 is HAProxy, on loopback.
+            everywhere = all(node1.execute(f"ss -Htln 'sport = :{p}' | grep -qE '(0\\.0\\.0\\.0|\\*):{p}'")[0] == 0 for p in (5433, 8008))
+            local = all(node1.execute(f"timeout 8 bash -c 'exec 3<>/dev/tcp/{ip}/{p}'")[0] == 0 for ip in (CTRL, M1) for p in (5433, 8008))
+            reached = {f"{ip}:{p}": reaches(f"nc -z -w5 {ip} {p}") for ip in (CTRL, M1, APP_IP, STG_IP) for p in (5432, 5433, 8008)}
             detail = f"listens on every address={everywhere}; node1 itself connects={local}; attacker reached {reached}"
             print(f"juicefs-pg-unreachable-on-vlan: {detail}")
             control("juicefs-pg-unreachable-on-vlan", everywhere and local and not any(reached.values()), detail)

@@ -77,6 +77,9 @@
         meshControl = ./modules/mesh-control.nix;
         storageEtcd = ./modules/storage-etcd.nix;
         storageJuicefs = ./modules/storage-juicefs.nix;
+        # Its metadata database (a member on every node) and the volume's format.
+        storageJuicefsPg = ./modules/storage-juicefs-pg.nix;
+        storageJuicefsFormat = ./modules/storage-juicefs-format.nix;
         monitoring = ./modules/monitoring.nix;
         # Prometheus, Alertmanager and Loki, on every node (it imports the other two).
         monitoringServer = ./modules/monitoring-server.nix;
@@ -1925,10 +1928,6 @@
           path = ./templates/cluster;
           description = "A private cluster flake: topology, apps/, hosts/ and a pinned input";
         };
-
-        # Local clan service registry, for clans that want the service directly.
-        # mkCluster does not depend on this output (see lib/mk-cluster.nix).
-        clan.modules.cluster-roles = ./modules/cluster-roles.nix;
 
         # The FIXTURE cluster, not anyone's fleet: what this flake's checks run
         # against. A consumer takes these from its own mkCluster call. Keyed by

@@ -8,7 +8,7 @@
 #
 #   secrets -> networkd (br-wan, vRack VLANs, br-app) + nftables
 #     -> etcd
-#     -> PostgreSQL -> juicefs-pg-password -> juicefs-format (encrypted) -> juicefs-mount
+#     -> Patroni (one member) -> juicefs-pg-setup -> juicefs-format (encrypted) -> juicefs-mount
 #        -> jfs-health -> jfs-nomad-meta (jfs_ready=true)
 #     -> Nomad leader (mTLS, gossip key) -> ACL bootstrap with OUR token
 #        -> namespaces, policies, JWT auth method -> each role's scoped token
@@ -123,18 +123,20 @@ pkgs.testers.runNixOSTest {
 
         with subtest("nftables is authoritative and drops by default"):
             node1.succeed("nft list chain inet filter input | grep -q 'policy drop'")
-            # From the WAN, SSH answers; PostgreSQL listens on every address
-            # (the JuiceFS metadata engine) but the WAN must not reach it.
-            node1.wait_for_open_port(5432)
+            # From the WAN, SSH answers; PostgreSQL and Patroni listen on every address
+            # (the JuiceFS metadata database) but the WAN must not reach them.
+            node1.wait_for_open_port(5433)
+            node1.wait_for_open_port(8008)
             wan.succeed("nc -z -w5 ${node.publicIp4} 22")
-            wan.fail("nc -z -w5 ${node.publicIp4} 5432")
+            for port in (5432, 5433, 8008):
+                wan.fail(f"nc -z -w5 ${node.publicIp4} {port}")
 
         with subtest("etcd: the shared DCS is healthy"):
             node1.wait_for_unit("etcd.service")
             node1.succeed(f"etcdctl --endpoints=http://{M1}:2379 endpoint health")
 
-        with subtest("JuiceFS: metadata engine, format, mount, health"):
-            for u in ["postgresql.service", "juicefs-pg-password.service",
+        with subtest("JuiceFS: metadata database, format, mount, health"):
+            for u in ["patroni.service", "haproxy.service", "juicefs-pg-setup.service",
                       "juicefs-format.service", "juicefs-mount.service", "jfs-health.service"]:
                 node1.wait_for_unit(u)
             node1.wait_until_succeeds("mountpoint -q /mnt/jfs", timeout=120)
@@ -145,7 +147,7 @@ pkgs.testers.runNixOSTest {
             # both (tests/jfs-encrypted.nix is where a plaintext volume is refused).
             node1.succeed(
                 "pgpass=$(cat /run/secrets/shared/juicefs-pg/password);"
-                f" juicefs status \"postgres://juicefs:$pgpass@{M1}:5432/juicefs\" 2>/dev/null"
+                " juicefs status \"postgres://juicefs:$pgpass@127.0.0.1:5432/juicefs\" 2>/dev/null"
                 " | jq -e '.Setting.EncryptKey == \"removed\"'"
             )
             node1.succeed("grep -qx 'cluster_jfs_encrypted 1' /var/lib/prometheus-node-exporter-text/jfs_encrypted.prom")

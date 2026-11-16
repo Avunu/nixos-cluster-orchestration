@@ -6,7 +6,7 @@
 #   s3      `rclone serve s3` (as in tests/jfs-encrypted.nix), and the off-host audit
 #           receiver: the REAL watchdog Worker behind tests/lib/audit-stub.mjs, on http.
 #   node1   the REAL modules/canary-scan.nix, with the real modules/vars.nix,
-#           storage-juicefs.nix and storage-juicefs-meta.nix under clanCore for the s3
+#           storage-juicefs.nix and storage-juicefs-format.nix under clanCore for the s3
 #           class (the jfs-encrypted pattern: fixture secrets, a dummy interface for the
 #           mesh address), modules/coredumps-off.nix, and the audit spool's sender.
 #           Extra disks, by serial: an ESP (vfat at /boot), a plain swap (declared
@@ -178,7 +178,8 @@ pkgs.testers.runNixOSTest {
           clanCoreModule
           ../modules/vars.nix
           ../modules/storage-juicefs.nix
-          ../modules/storage-juicefs-meta.nix
+          ../modules/storage-juicefs-format.nix
+          ./lib/jfs-plain-pg.nix
           ../modules/canary-scan.nix
           ../modules/coredumps-off.nix
           (harness.secretsModuleFor (
@@ -237,7 +238,7 @@ pkgs.testers.runNixOSTest {
         clan.core.settings.directory = toString ./fixtures;
         clan.core.vars.settings.secretStore = "age";
 
-        # The control-mesh address the metadata URL names (lib/net.nix jfsMetaHost).
+        # The control-mesh address the metadata URL names (a test that asks the database by that address).
         systemd.services."${net.meshIf}-ready" = {
           wantedBy = [ "multi-user.target" ];
           before = [
