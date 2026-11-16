@@ -153,6 +153,27 @@ in
       '';
     };
 
+    # ── JuiceFS metadata: Patroni ───────────────────────────────────────────
+    # The metadata database's own three (modules/storage-juicefs-pg.nix): its
+    # superuser, the role its members replicate as, and the password Patroni's API
+    # wants for anything that changes the cluster. Every node has a member, hence
+    # shared. No punctuation: they pass through shell and a pgpass file.
+    juicefs-patroni = {
+      share = true;
+      files.superuser = { };
+      files.replication = { };
+      files.restapi = { };
+      runtimeInputs = [
+        pkgs.coreutils
+        pkgs.openssl
+      ];
+      script = ''
+        for f in superuser replication restapi; do
+          openssl rand -hex 32 | tr -d '\n' > "$out/$f"
+        done
+      '';
+    };
+
     # ── JuiceFS volume encryption ───────────────────────────────────────────
     # The RSA key JuiceFS wraps every object's data key with. `format` and `load`
     # take the PEM; every client needs the passphrase, because the PEM is stored in

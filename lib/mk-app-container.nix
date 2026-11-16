@@ -626,6 +626,9 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
     ];
     after = optionals usesJfs [ "jfs-health.service" ];
     requires = optionals usesJfs [ "jfs-health.service" ];
+    # A client that ends leaves a dead mount under the container's binds: the
+    # container goes with it, and Nomad starts the app again.
+    bindsTo = optionals usesJfs [ "juicefs-mount.service" ];
     serviceConfig = {
       ExecStartPre = [
         "${pkgs.coreutils}/bin/rm -f ${degradedMarker}"

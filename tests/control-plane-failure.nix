@@ -1,5 +1,6 @@
 # VM test: what the control plane does when its own pieces fail, on two real nodes:
-# node1 (every singleton: Nomad server, etcd, the JuiceFS metadata engine, metrics)
+# node1 (the one Nomad server and the one etcd member, so the JuiceFS metadata
+# database's primary can only be there)
 # and node2, an installed worker. Their real machine modules, as tests/cluster.nix
 # boots them, over the fixture topology with node2 provisioned.
 #
@@ -17,9 +18,11 @@
 #                                node2's key rotated, node1 not yet switched: the mesh
 #                                between them is down; once node1 lists the new key it
 #                                comes back, with nothing done on node2
-#   mesh-down-jfs-recovers       the mesh cut between the nodes: a write on node2 hangs
-#                                (killed at 80s), the mount survives, and writes work
-#                                again within 15s of the mesh returning
+#   mesh-down-jfs-recovers       the mesh cut between the nodes for 80s: a write on
+#                                node2 does not go through (its connection to the
+#                                primary is cut after about ten seconds: an I/O error,
+#                                or a hang that is killed), the mount survives, and
+#                                writes work again within 15s of the mesh returning
 #   nomad-cert-expired-outage-and-recovery
 #                                every agent certificate expired: every node `down`
 #                                within about 90s; a good certificate again, and up to
@@ -38,8 +41,8 @@
 #   missing-wg-key-boots         node1 boots with no mesh key: no interface, the boot
 #                                completes, the mesh services wait; with the key back
 #                                (and nothing restarted by hand) node2's JuiceFS client
-#                                works again: PostgreSQL listens on every address, so
-#                                a mesh address that arrives late is still served
+#                                works again: Patroni waits for its etcd, and the
+#                                metadata database is back with nothing done by hand
 #
 # Every job is held off the fixture's own apps (node pool `ci-hold`), as in
 # tests/cluster-single.nix; the test places its own.
@@ -291,7 +294,7 @@ pkgs.testers.runNixOSTest {
         for n in NODES:
             n.start()
 
-        with subtest("both nodes up: Nomad, the mesh, JuiceFS through node1's metadata engine"):
+        with subtest("both nodes up: Nomad, the mesh, JuiceFS through the metadata database's primary, on node1"):
             node1.wait_for_unit("nomad-bootstrap.service", timeout=600)
             for n in NODES:
                 n.wait_for_unit(f"{MESH_IF}-ready.service")
@@ -435,11 +438,11 @@ pkgs.testers.runNixOSTest {
                     break
                 time.sleep(1)
             seen = node1.execute("grep -qx ci-after-cut /mnt/jfs/ci-after-cut")[0] == 0
-            detail = (f"write during the cut: rc={rc} (124 = killed by timeout at 80s); mount survived={mounted},"
+            detail = (f"write during the cut: rc={rc} (1 = I/O error, 124 = hung and killed at 80s); mount survived={mounted},"
                       f" juicefs-mount active={alive}; writes again after {recovered}s; node1 reads it={seen}")
             print(f"mesh-down-jfs-recovers: {detail}")
             control("mesh-down-jfs-recovers",
-                    rc == "124" and mounted and alive and recovered is not None and recovered <= 15 and seen,
+                    rc in ("1", "124") and mounted and alive and recovered is not None and recovered <= 15 and seen,
                     detail)
 
         with subtest("nomad-cert-expired-outage-and-recovery: every agent certificate expires at once"):
@@ -521,9 +524,9 @@ pkgs.testers.runNixOSTest {
             no_if = node1.execute(f"ip link show {MESH_IF}")[0] != 0
             node1.wait_until_succeeds(f"systemctl show -p ActiveState --value {MESH_IF}-ready | grep -qx active", timeout=120)
             ready_said = node1.execute(f"journalctl -b -u {MESH_IF}-ready --no-pager | grep -q 'no mesh address after 30s'")[0] == 0
-            pg_up = node1.execute("systemctl is-active --quiet postgresql.service")[0] == 0
-            pg_pid = node1.succeed("systemctl show -p MainPID --value postgresql.service").strip()
-            pg_everywhere = node1.execute("ss -Htln 'sport = :5432' | grep -qE '(0\\.0\\.0\\.0|\\*):5432'")[0] == 0
+            # Patroni is up and waiting for its etcd, which binds the mesh address.
+            pg_up = node1.execute("systemctl is-active --quiet patroni.service")[0] == 0
+            pg_pid = node1.succeed("systemctl show -p MainPID --value patroni.service").strip()
             stuck = not jfs_write(node2, "ci-while-keyless", 10)
             # The repair: the key back where the vars put it, and the restart a switch with
             # a new ciphertext would do (wg-key-rotation-restarts-networkd). Nothing else.
@@ -538,7 +541,7 @@ pkgs.testers.runNixOSTest {
                     recovered = round(time.monotonic() - start)
                     break
                 time.sleep(3)
-            same_pg = node1.succeed("systemctl show -p MainPID --value postgresql.service").strip() == pg_pid
+            same_pg = node1.succeed("systemctl show -p MainPID --value patroni.service").strip() == pg_pid
             # The mesh-bound units on node1 came up by themselves too.
             units = ["etcd", "prometheus-node-exporter", "loki", "vector", "prometheus", "juicefs-mount"]
             def all_active(_):
@@ -546,10 +549,10 @@ pkgs.testers.runNixOSTest {
             retry(all_active, timeout_seconds=300)
             states = {u: node1.succeed(f"systemctl show -p ActiveState --value {u}.service").strip() for u in units}
             detail = (f"booted without the key: key absent={key_absent}, no {MESH_IF}={no_if}, {MESH_IF}-ready exited and said so={ready_said};"
-                      f" postgresql up={pg_up} on every address={pg_everywhere}; node2 could not write meanwhile={stuck};"
-                      f" after the repair node2 wrote after {recovered}s, postgresql not restarted={same_pg}; node1's mesh units {states}")
+                      f" patroni up={pg_up}; node2 could not write meanwhile={stuck};"
+                      f" after the repair node2 wrote after {recovered}s, patroni not restarted={same_pg}; node1's mesh units {states}")
             print(f"missing-wg-key-boots: {detail}")
-            control("missing-wg-key-boots", key_absent and no_if and ready_said and pg_up and pg_everywhere and stuck, detail)
+            control("missing-wg-key-boots", key_absent and no_if and ready_said and pg_up and stuck, detail)
             control("missing-wg-key-boots-recovers", recovered is not None and same_pg, detail)
 
         with subtest("control-vlan-late-nomad-waits: node2 boots with its vRack trunk without carrier, and Nomad waits"):

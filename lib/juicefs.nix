@@ -1,8 +1,9 @@
 # lib/juicefs.nix — pure JuiceFS naming/URL helpers.
 #
-# Extracted so the client half (modules/storage-juicefs.nix, every node) and the
-# metadata half (modules/storage-juicefs-meta.nix, the juicefs-meta node) agree
-# on the volume name, mountpoint and meta URL without one importing the other.
+# Extracted so the client (modules/storage-juicefs.nix), the volume's format and
+# restore (modules/storage-juicefs-format.nix) and the metadata database
+# (modules/storage-juicefs-pg.nix), all three on every node, agree on the volume
+# name, mountpoint and meta URL without one importing the other.
 # No `pkgs`; only `lib`.
 { lib }:
 rec {
@@ -12,7 +13,27 @@ rec {
   # Days a deleted file stays in /mnt/jfs/.trash (juicefs format/config).
   trashDays = 7;
   cacheDir = "/var/jfsCache";
+  # Where a JuiceFS client finds the metadata database: its own node's loopback,
+  # always. HAProxy listens there and passes the connection to whichever node holds
+  # the primary (modules/storage-juicefs-pg.nix), so no client names a node.
+  metaHost = "127.0.0.1";
   metaPort = 5432;
+  # The PostgreSQL every member runs, and whose psql the scripts use: the major
+  # NixOS itself picks for a state version, so a data directory services.postgresql
+  # made is one this opens. One state version for the site (topology.stateVersion),
+  # so one major for every member. A major upgrade is pg_upgrade's business, by hand.
+  metaPgPackage =
+    pkgs: stateVersion:
+    if lib.versionAtLeast stateVersion "26.11" then
+      pkgs.postgresql_18
+    else if lib.versionAtLeast stateVersion "25.11" then
+      pkgs.postgresql_17
+    else
+      pkgs.postgresql_16;
+
+  # The session-level advisory lock juicefs-format holds while it decides and acts,
+  # so that two nodes never format or restore at once. Any constant; "jfsf".
+  formatLockId = 1785097062;
 
   # Credential IDs used with systemd LoadCredential. Both halves read the same
   # five, so they are named once here.
@@ -52,7 +73,7 @@ rec {
   # with JFS_RSA_PASSPHRASE set succeeds. Expects $META to be set.
   #
   # Exit 4: `juicefs status` failed, so the metadata engine could not be read. That
-  # is an outage (a cold start, the metadata node waiting for its passphrase, the
+  # is an outage (a cold start, the primary changing hands, a node waiting for its passphrase, the
   # mesh down), not a judgement on encryption.
   # Exit 3: status succeeded and the volume is NOT encrypted. A security refusal.
   #

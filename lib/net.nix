@@ -43,24 +43,6 @@ rec {
   taggedNodes = topology: tag: lib.filter (hasTag tag) (nodeList topology);
   hasTag = tag: node: builtins.elem tag (node.tags or [ ]);
 
-  # The single node carrying a singleton role. Throws rather than silently
-  # picking one: an ambiguous juicefs-meta means two metadata engines over one
-  # bucket, and an absent one means a cluster that never mounts.
-  soleTaggedNode =
-    topology: tag:
-    let
-      matches = taggedNodes topology tag;
-    in
-    if builtins.length matches == 1 then
-      builtins.head matches
-    else if matches == [ ] then
-      throw "topology: no node is tagged \"${tag}\"; exactly one must be."
-    else
-      throw (
-        "topology: ${toString (builtins.length matches)} nodes are tagged \"${tag}\""
-        + " (${concatStringsSep ", " (taggedNames topology tag)}); exactly one must be."
-      );
-
   # ── The control mesh (modules/mesh-control-core.nix) ──────────────────────
   # Every service but Nomad listens on a WireGuard interface carried over the
   # control VLAN (design D1): a machine on the VLAN reaches nothing there without
@@ -92,8 +74,9 @@ rec {
   # The TCP ports a node serves on the mesh, by role. Appendix E of the design:
   # every node its exporters, its log shipper, its app state, and its Loki, Prometheus
   # and Alertmanager gossip (each node runs the whole of monitoring);
-  # `etcd` etcd; `juicefs-meta` the metadata engine. The host firewall accepts
-  # exactly these on the mesh interface, and nothing of them anywhere else.
+  # and its member of the JuiceFS metadata database (PostgreSQL and Patroni's API);
+  # `etcd` etcd. The host firewall accepts exactly these on the mesh interface, and
+  # nothing of them anywhere else.
   meshPortsFor =
     node:
     [
@@ -104,12 +87,13 @@ rec {
       lokiPort
       prometheusPort
       alertmanagerClusterPort
+      jfsPgPort
+      patroniPort
     ]
     ++ lib.optionals (hasTag "etcd" node) [
       etcdClientPort
       etcdPeerPort
-    ]
-    ++ lib.optional (hasTag "juicefs-meta" node) jfsMetaPort;
+    ];
 
   # A unit that binds a mesh address, or talks to one at start: ordered after the
   # address exists, and retrying for as long as it takes. A node whose mesh key is
@@ -145,11 +129,13 @@ rec {
   appTransitIp = node: "10.20.0.${toString node.index}";
 
   # ── JuiceFS metadata ────────────────────────────────────────────────────────
-  # Where every node's JuiceFS client finds the metadata engine. One function, so
-  # that the day the engine follows a primary (Patroni, with an address that moves),
-  # this is the only place that changes: every client reads it from here.
-  jfsMetaPort = 5432;
-  jfsMetaHost = topology: meshIp topology (soleTaggedNode topology "juicefs-meta");
+  # One PostgreSQL cluster with a member on every node, led by Patroni
+  # (modules/storage-juicefs-pg.nix). `jfsPgPort` is each member, on the mesh;
+  # `patroniPort` is its Patroni, which says whether that member is the primary. A
+  # JuiceFS client asks neither: it asks its own node's loopback
+  # (lib/juicefs.nix metaHost:metaPort), where HAProxy passes it to the primary.
+  jfsPgPort = 5433;
+  patroniPort = 8008;
 
   # ── etcd ────────────────────────────────────────────────────────────────────
   # http, on the mesh: WireGuard authenticates the machine (D1), and etcd has no

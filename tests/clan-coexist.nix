@@ -54,16 +54,6 @@ let
   # two names catches any future sibling upstream adds.
   strayNets = lib.filter (n: lib.hasPrefix "99-" n) netNames;
 
-  # Exactly one machine may hold each singleton role. clusterLib.soleTaggedNode
-  # throws on 0 or >1, so forcing it here turns "two juicefs-meta nodes" into a
-  # failed check rather than two metadata engines over one S3 bucket.
-  singletonTags = [
-    "juicefs-meta"
-  ];
-  singletonsResolve = builtins.all (
-    t: (clusterLib.net.soleTaggedNode topology t) ? controlIp
-  ) singletonTags;
-
   checks = [
     # ── secrets: what the PULL loop actually requires ───────────────────────
     #
@@ -148,10 +138,6 @@ let
     }
 
     # ── role assignment ─────────────────────────────────────────────────────
-    {
-      name = "each singleton role resolves to exactly one machine";
-      ok = singletonsResolve;
-    }
     {
       # The whole point of the tag refactor: nothing may reintroduce a guard
       # that depends on where a node sorts in topology.nodes.

@@ -609,7 +609,7 @@ pkgs.testers.runNixOSTest {
                             for n in NODES}
                   reach = {
                       "node2->node1 loki": node2.execute(f"curl -fsS --max-time 5 http://{M1}:3100/ready")[0] == 0,
-                      "node2->node1 postgres": node2.execute(f"nc -z -w 5 {M1} 5432")[0] == 0,
+                      "node2->node1 postgres": node2.execute(f"nc -z -w 5 {M1} 5433")[0] == 0,
                       "node2->node3 exporter": node2.execute(f"curl -fsS --max-time 5 -o /dev/null http://{MESH['node3']}:9100/metrics")[0] == 0,
                       "node1->node2 exporter": node1.execute(f"curl -fsS --max-time 5 -o /dev/null http://{MESH['node2']}:9100/metrics")[0] == 0,
                   }
@@ -649,6 +649,9 @@ pkgs.testers.runNixOSTest {
               voter3 = [s for s in raft_servers() if s["Node"] == "node3.global"]
               same, state = unchanged("after node3's promotion")
               data = node3.succeed("cat /var/lib/ci-worker/marker").strip()
+              # The metadata database changes hands in this commit, and node2's mount
+              # (a fresh install) has only had it since node1's member came up.
+              node2.wait_until_succeeds("timeout 20 cat /mnt/jfs/ci-worker", timeout=300)
               jfs = node2.succeed("cat /mnt/jfs/ci-worker").strip()
               node3_status = {x["Name"]: (x["Status"], x["SchedulingEligibility"]) for x in api_any("/v1/nodes")}["node3"]
               detail = (f"certificate {cn}, reissued={reissued}; gossip key present={gossip};"
@@ -694,7 +697,53 @@ pkgs.testers.runNixOSTest {
                       and all(v == "three" for v in read.values()),
                       detail)
 
+          with subtest("meta-database-grows: node1's PostgreSQL became the first of three members, with its data"):
+              def members():
+                  rc, out = node1.execute("patronictl -c /etc/patroni-jfs-meta-node1.yaml list -f json 2>/dev/null")
+                  try:
+                      return {m["Member"]: (m["Role"], m["State"]) for m in json.loads(out)}
+                  except Exception:
+                      return {}
+              def formed(_):
+                  ms = members()
+                  return (len(ms) == 3 and sum(1 for role, _s in ms.values() if role == "Leader") == 1
+                          and sum(1 for role, state in ms.values() if role != "Leader" and state == "streaming") == 2)
+              grew = True
+              try:
+                  retry(formed, timeout_seconds=420)
+              except Exception:
+                  grew = False
+              # A member with no data must not have created the database while the bucket
+              # held the volume. In order B the two new members were up before node1 was
+              # one, and each has to have said so.
+              waited = {n.name: n.execute("journalctl -u patroni --no-pager | grep -q 'not creating a metadata database'")[0] == 0
+                        for n in (node2, node3)}
+              restored = {n.name: n.succeed("journalctl -u juicefs-format --no-pager | grep -c 'restoring' || true").strip()
+                          for n in NODES}
+              # node1's and node3's mounts lived through minutes without the database
+              # (from node1's switch until etcd had three members): their clients end
+              # themselves, and are started again.
+              def reads(n):
+                  try:
+                      n.wait_until_succeeds("timeout 20 grep -qx from-the-worker /mnt/jfs/ci-worker", timeout=180)
+                      return True
+                  except Exception:
+                      return False
+              old = {n.name: reads(n) for n in NODES}
+              new = node2.execute("timeout 30 sh -c 'echo after-growth > /mnt/jfs/ci-grown && sync'")[0] == 0
+              detail = (f"members {members()}; the empty members waited for node1: {waited}; restores from a dump: {restored};"
+                        f" the file written before the growth reads on {old}; node2 writes={new}")
+              print(f"meta-database-grows: {detail}")
+              control("meta-database-grows",
+                      grew and all(v == "0" for v in restored.values()) and all(old.values()) and new
+                      and (ORDER == "a" or all(waited.values())),
+                      detail)
+
           with subtest("no failed units"):
+              # The write probe ran, and failed, while the metadata database was
+              # changing hands. It passes now.
+              for n in NODES:
+                  n.succeed("systemctl start jfs-probe.service")
               for n in NODES:
                   no_failed_units(n)
 

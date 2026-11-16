@@ -1,14 +1,10 @@
 # modules/storage-juicefs.nix — universal shared FS client (Phase 4).
 #
 # JuiceFS over OVH Object Storage (S3), mounted at /mnt/jfs on EVERY node.
-# The metadata engine (PostgreSQL) is the other half of this pair and lives in
-# modules/storage-juicefs-meta.nix, assigned to the single `juicefs-meta`-tagged
-# node through inventory.instances. This file has no leader conditional in it:
-# it is what every node runs, unconditionally.
-#
-# TODO(HA): the metadata PG is still a single instance and therefore the
-# cluster's top SPOF — its loss strands /mnt/jfs on every node. Wrap it in
-# Patroni once >=2 real nodes exist.
+# Its metadata is a PostgreSQL database with a member on every node
+# (modules/storage-juicefs-pg.nix), and the volume is formatted, or restored, by
+# modules/storage-juicefs-format.nix, also on every node. No file of the three names
+# a node.
 #
 # The volume is encrypted (vars `juicefs-rsa`), and every mount refuses one that
 # isn't: see `assertEncryptedSh` in lib/juicefs.nix. Nothing at evaluation can see
@@ -28,12 +24,9 @@ let
   jfs = clusterLib.juicefs;
   vars = config.clan.core.vars.generators;
 
-  # The metadata engine's address is derived from the tag, not from a position
-  # in `topology.nodes`. Every node needs it (they all mount), so this is
-  # cross-node data rather than a role guard. It is on the control mesh, and
-  # comes from one helper, so an engine that moves (a primary that changes) is a
-  # change to lib/net.nix alone.
-  metaIp = clusterLib.net.jfsMetaHost topology;
+  # This node's loopback, where HAProxy passes the connection to the primary
+  # (modules/storage-juicefs-pg.nix). The primary moving is not a change here.
+  metaIp = jfs.metaHost;
 
   loadCreds = jfs.loadCredentials (
     id:
@@ -67,7 +60,7 @@ let
     JFS_RSA_PASSPHRASE="$(cat "$CREDENTIALS_DIRECTORY/${jfs.credIds.rsaPass}")"
     export JFS_RSA_PASSPHRASE
     # A client that died under its mount (node1, 2026-10-30: a switch stopped the
-    # local metadata PG out from under it) leaves a dead FUSE endpoint behind.
+    # metadata PG out from under it) leaves a dead FUSE endpoint behind.
     # Every stat of it fails with ENOTCONN, so the mkdir below fails and
     # Restart= loops forever while every container bound to it stays down.
     # Detach it so the restart can recover on its own. On a first boot the
@@ -107,10 +100,10 @@ let
 in
 {
   # A test seam, not a setting: every JuiceFS script's text passes through it on
-  # its way to the store, here and in modules/storage-juicefs-meta.nix. The named
+  # its way to the store, here and in modules/storage-juicefs-format.nix. The named
   # mutants of tests/jfs-encrypted.nix (flake.nix, legacyPackages.mutants) use it to
   # remove or fake one control and prove that the test notices. Declared here
-  # because every node imports this module, the metadata node included.
+  # because every node imports this module.
   options.cluster.juicefs.scriptEdit = lib.mkOption {
     type = lib.types.functionTo (lib.types.functionTo lib.types.str);
     default = _name: text: text;
@@ -123,12 +116,13 @@ in
 
     systemd.services.juicefs-mount = {
       description = "Mount JuiceFS (${jfs.jfsName}) at ${jfs.mountPoint}";
-      # The metadata engine is reached over the mesh. With the mesh down a mount
-      # survives and its writes hang until it returns (`mesh-down-jfs-recovers`), and
-      # a mount that could not start retries until it can.
+      # The metadata primary is reached over the mesh unless it is this node's member.
+      # With the mesh down a mount survives and its writes hang until it returns
+      # (`mesh-down-jfs-recovers`), and a mount that could not start retries until it can.
+      # Not after juicefs-format: see there. Until the volume is formatted the
+      # gate below exits 4 and this is started again.
       after = [
         "network-online.target"
-        "juicefs-format.service"
         "${clusterLib.net.meshIf}-ready.service"
       ];
       wants = [
@@ -142,7 +136,11 @@ in
         Type = "simple";
         ExecStart = "${mountScript}";
         LoadCredential = loadCreds;
-        Restart = "on-failure";
+        # `always`, not `on-failure`: after some minutes without its metadata database
+        # the client's own watchdog ends it, cleanly ("exit successfully"), and
+        # on-failure then left the node without /mnt/jfs for good once the database
+        # was back (`meta-database-grows`). A `systemctl stop` is still a stop.
+        Restart = "always";
         RestartSec = 5;
         # A plaintext volume is refused for good, not retried every five seconds: the
         # unit stays failed (UnitFailed) next to cluster_jfs_encrypted 0. Everything
@@ -156,7 +154,14 @@ in
     systemd.services.jfs-health = {
       description = "Assert JuiceFS is mounted + writable";
       after = [ "juicefs-mount.service" ];
-      requires = [ "juicefs-mount.service" ];
+      # `wants`, not `requires`: a required unit that systemd is restarting takes
+      # this one round with it, every five seconds, and then this unit always has
+      # a start job pending. jfs-nomad-meta, nomad-bootstrap and multi-user.target
+      # wait behind that job, so a node whose mount could not start (no way to the
+      # metadata database) never finished booting (`missing-wg-key-boots`). It
+      # looks once, for a minute; jfs-nomad-meta's timer has it look again. What
+      # must go when the mount goes binds to the mount itself (a container does).
+      wants = [ "juicefs-mount.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -202,7 +207,7 @@ in
     # never advertises jfs_ready=true, so every JuiceFS-bound job sits in `pending`
     # forever against a constraint that looks like a scheduling problem rather than an
     # auth one. The token is the `node-meta` role's (node:write and nothing else,
-    # modules/nomad-acl.nix), from nomad-login@node-meta; Restart= covers the boot
+    # modules/nomad-acl.nix), from nomad-login@node-meta; the timer covers the boot
     # race where that login has not succeeded yet.
     systemd.services.jfs-nomad-meta = {
       description = "Advertise jfs_ready=true to the local Nomad agent";
@@ -219,8 +224,16 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        Restart = "on-failure";
-        RestartSec = 10;
+        # No Restart= here: systemd keeps the start job of a oneshot it is
+        # restarting, and nomad-bootstrap and multi-user.target, ordered after this
+        # unit, then wait for as long as /mnt/jfs is not there. A node that could
+        # not reach the metadata database never finished booting
+        # (`missing-wg-key-boots`). It fails once, and the timer below asks again.
+        #
+        # A flag that arrives late: the jobs registered meanwhile may have been
+        # evaluated without it (modules/nomad-register.nix), so registration runs
+        # again where this node does it. Nothing on a node that does not.
+        ExecStartPost = "-${config.systemd.package}/bin/systemctl try-restart --no-block nomad-bootstrap.service";
         # The CLI's client certificate: the API refuses a handshake without one.
         Environment = lib.mapAttrsToList (k: v: "${k}=${v}") (clusterLib.nomadPki.cliTlsFor vars).env;
         ExecStart = pkgs.writeShellScript "jfs-nomad-meta" ''
@@ -230,6 +243,15 @@ in
           exec ${config.services.nomad.package}/bin/nomad node meta apply \
             -address ${clusterLib.net.nomadAddr node} jfs_ready=true
         '';
+      };
+    };
+
+    # Until it has succeeded (RemainAfterExit: starting an active unit does nothing).
+    systemd.timers.jfs-nomad-meta = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "2min";
+        OnUnitInactiveSec = "30s";
       };
     };
 

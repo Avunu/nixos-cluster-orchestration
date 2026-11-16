@@ -74,13 +74,6 @@ in
 libraryInputs.clan-core.lib.clan {
   inherit self directory meta;
 
-  # Local clan services. `module.input = "self"` resolves against THIS option,
-  # never against the consumer flake's `clan.modules` output: clan's `self`
-  # option rewrites `inputs.self` to `{ clan = <clan config>; }`, so "self" means
-  # "this clan", not "the flake it was called from". That is why a consumer does
-  # not have to re-export the service.
-  modules.cluster-roles = ../modules/cluster-roles.nix;
-
   # Plain `age` decryption, no sops-nix in the loop — see modules/vars.nix and
   # modules/nixpkgs-overlays.nix for why. Recipients are declared here rather
   # than via `clan secrets users add`: anyone listed can `clan vars generate` /
@@ -107,18 +100,6 @@ libraryInputs.clan-core.lib.clan {
     deploy.targetHost = "root@${node.deployHost}";
     inherit (node) tags;
   }) topology.nodes;
-
-  # Singleton roles, assigned by tag. This is what replaced the
-  # `head (attrNames topology.nodes)` guard that used to appear in
-  # modules/{nomad-bootstrap,storage-juicefs,monitoring}.nix — see
-  # modules/cluster-roles.nix for why each role is a singleton.
-  inventory.instances.cluster-roles = {
-    module = {
-      name = "cluster-roles";
-      input = "self";
-    };
-    roles.juicefs-meta.tags = [ "juicefs-meta" ];
-  };
 
   machines = lib.mapAttrs (
     name: node:

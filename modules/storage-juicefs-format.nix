@@ -1,13 +1,14 @@
-# modules/storage-juicefs-meta.nix — the JuiceFS metadata engine (singleton).
+# modules/storage-juicefs-format.nix — the JuiceFS volume: format it once, or restore it.
 #
-# Assigned to the ONE node tagged `juicefs-meta` via inventory.instances in
-# flake.nix, and constrained to maxMachines = 1 by modules/cluster-roles.nix:
-# two metadata engines over one S3 bucket is a split-brain filesystem, so it is
-# an eval-time error rather than a runbook warning.
+# On every node. Nothing here says which node: the script talks to the metadata
+# database where every JuiceFS client does (lib/juicefs.nix metaHost:metaPort, this
+# node's loopback, which leads to the primary wherever it is), and holds a lock IN
+# that database while it decides and acts, so three nodes booting together format
+# one volume, once, and the other two find it formatted.
 #
-# There is deliberately no `isBootstrap`-style conditional in this file. Whether
-# a node runs it is inventory data (the tag), not module logic — that is the
-# whole point of the split.
+# The database itself is modules/storage-juicefs-pg.nix. This file doesn't care
+# what serves it, which is what lets tests/jfs-encrypted.nix and tests/canary-scan.nix
+# run it against one plain PostgreSQL (tests/lib/jfs-plain-pg.nix).
 {
   config,
   lib,
@@ -21,8 +22,7 @@ let
   os = topology.objectStorage;
   vars = config.clan.core.vars.generators;
 
-  # This node IS the metadata node, so the engine is local.
-  metaIp = "127.0.0.1";
+  metaIp = jfs.metaHost;
 
   loadCreds = jfs.loadCredentials (
     id:
@@ -50,22 +50,24 @@ let
   rclone = "${pkgs.rclone}/bin/rclone";
   jq = "${pkgs.jq}/bin/jq";
   gate = jfs.assertEncryptedSh jq juicefs;
-  psql = "${config.services.postgresql.package}/bin/psql";
+  psql = "${jfs.metaPgPackage pkgs config.system.stateVersion}/bin/psql";
+  mktemp = "${pkgs.coreutils}/bin/mktemp";
 
   # Through modules/storage-juicefs.nix's test seam, as every JuiceFS script is.
   script = name: text: pkgs.writeShellScript name (config.cluster.juicefs.scriptEdit name text);
 
-  # Not two states but six. The metadata engine lives on this node's LOCAL disk,
-  # so a reinstall of the juicefs-meta node wipes it while the bucket keeps every
-  # chunk and the metadata dumps JuiceFS writes to <volume>/meta/ (every
-  # `jfs.backupMeta`, by the mounts). `juicefs format` refuses a non-empty bucket,
+  # Not two states but six. The metadata database lives on the nodes' LOCAL disks,
+  # a copy on each. Losing every copy at once (or, with one node, that node) leaves
+  # it empty while the bucket keeps every chunk and the metadata dumps JuiceFS
+  # writes to <volume>/meta/ (every `jfs.backupMeta`, by the mounts). One reinstalled
+  # node is not this case: its member copies the database from the primary. `juicefs format` refuses a non-empty bucket,
   # which is right: formatting over it would orphan every file on the volume.
   #
   #   metadata knows the volume, encrypted  -> apply settings, put the S3
   #                                            credentials back if needed     exit 0
   #   metadata knows the volume, plaintext  -> REFUSE                         exit 3
   #   no metadata, a recent dump in the     -> RESTORE the newest dump, with
-  #     bucket                                 the key (the reinstall case;
+  #     bucket                                 the key (every copy lost;
   #                                            loses at most one interval)    exit 0, or 1
   #   no metadata, newest dump stale        -> refuse unless an override
   #                                            names that dump; a human decides exit 5
@@ -275,86 +277,34 @@ let
     printf '%s\n' "$want" > "$applied"
   '';
 
-  # md5 auth needs the role to actually have the password. Applying it from the
-  # vars file at activation keeps the password out of the Nix store, which
-  # `ensureUsers` cannot do.
-  setPasswordScript = pkgs.writeShellScript "juicefs-pg-password" ''
+  # The format script, under a session-level advisory lock in the metadata database:
+  # psql takes the lock, runs the script as a shell command of the same session, and
+  # the lock goes with the session. The script's own exit status comes back through a
+  # file, because psql doesn't pass a `\!` command's on. No connection, no lock and no
+  # verdict: exit 4, which systemd retries (the role and database may not exist yet
+  # on a cluster's first boot, and the primary may be changing hands).
+  lockedScript = script "juicefs-format-locked" ''
     set -euo pipefail
-    pw=$(cat "$CREDENTIALS_DIRECTORY/${jfs.credIds.pgpass}")
-    ${config.services.postgresql.package}/bin/psql -v ON_ERROR_STOP=1 --no-psqlrc \
-      -c "ALTER ROLE ${jfs.metaDb} WITH PASSWORD '$pw';"
+    pgpass=$(cat "$CREDENTIALS_DIRECTORY/${jfs.credIds.pgpass}")
+    JFS_FORMAT_RC=$(${mktemp})
+    export JFS_FORMAT_RC
+    trap 'rm -f "$JFS_FORMAT_RC"' EXIT
+    PGPASSWORD="$pgpass" ${psql} -X -q -o /dev/null -v ON_ERROR_STOP=1 \
+      -h ${metaIp} -p ${toString jfs.metaPort} -U ${jfs.metaDb} -d ${jfs.metaDb} \
+      -c "SELECT pg_advisory_lock(${toString jfs.formatLockId})" \
+      -c '\! ${formatScript}; echo $? > "$JFS_FORMAT_RC"' || true
+    rc=$(cat "$JFS_FORMAT_RC")
+    if [ -z "$rc" ]; then
+      echo "metadata unreachable at this engine; not a judgement on the volume. Nothing done." >&2
+      exit 4
+    fi
+    exit "$rc"
   '';
 in
 {
-  services.postgresql = {
-    enable = true;
-    enableTCPIP = true;
-    # Every address, whatever else sets it: see `authentication` below for why.
-    settings.listen_addresses = lib.mkForce "*";
-    # Collation owned by PostgreSQL, not glibc. With the default (libc,
-    # en_US.UTF-8) every glibc bump in nixpkgs changes the sort rules under the
-    # text indexes and logs "collation version mismatch" on every connection
-    # (2.42 -> 2.44 did, 2026-10). The builtin provider's C.UTF-8 is versioned
-    # by PostgreSQL itself, and JuiceFS's few text columns are internal keys
-    # (setting/counter/xattr names) that need byte order, not a language's.
-    # initdb reads this only when it creates the cluster: an existing one is
-    # moved over by dump -> re-init -> restore (see juicefs-format below).
-    initdbArgs = [
-      "--locale=C.UTF-8"
-      "--locale-provider=builtin"
-    ];
-    ensureDatabases = [ jfs.metaDb ];
-    ensureUsers = [
-      {
-        name = jfs.metaDb;
-        ensureDBOwnership = true;
-      }
-    ];
-    # Other nodes' JuiceFS clients reach it over the control mesh, so only from
-    # the mesh subnet, with the password.
-    #
-    # It listens on every address (enableTCPIP: listen_addresses = "*"), NOT on
-    # 127.0.0.1 plus the mesh address. PostgreSQL binds its listeners once, at start:
-    # if the mesh address is not up yet it warns, starts anyway on loopback alone,
-    # and never binds the mesh address when it appears, so every other node loses
-    # its metadata while the unit looks healthy [RAN, design 1.16]. What confines it
-    # instead is the host firewall (the weak-host rule; 5432 is accepted on the mesh
-    # interface only, `juicefs-pg-unreachable-on-vlan`) and this line.
-    authentication = lib.mkAfter ''
-      host ${jfs.metaDb} ${jfs.metaDb} ${topology.mesh.subnet} scram-sha-256
-    '';
-  };
-
-  # Set the role password from vars, then format. Ordered before the mount so a
-  # cold cluster comes up in one boot: password -> format -> mount.
-  systemd.services.juicefs-pg-password = {
-    description = "Apply the JuiceFS metadata role password from vars";
-    # postgresql-setup.service, NOT postgresql.service: `ensureUsers` creates
-    # the role in the SETUP unit, which runs after the server is up. Ordering
-    # only on postgresql.service raced it and failed with
-    #   ERROR:  role "juicefs" does not exist
-    after = [
-      "postgresql.service"
-      "postgresql-setup.service"
-    ];
-    requires = [
-      "postgresql.service"
-      "postgresql-setup.service"
-    ];
-    before = [ "juicefs-format.service" ];
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      User = "postgres";
-      ExecStart = "${setPasswordScript}";
-      LoadCredential = [ "${jfs.credIds.pgpass}:${vars.juicefs-pg.files.password.path}" ];
-    };
-  };
-
   # Age of the newest metadata dump JuiceFS wrote to the bucket (every
-  # `jfs.backupMeta`, by the mounts). A rebuilt juicefs-meta node restores from it, so
-  # its age is how much metadata a reinstall would lose. Written for alerting
+  # `jfs.backupMeta`, by the mounts). A cluster that lost every copy of the metadata
+  # database restores from it, so its age is how much metadata that would lose. Written for alerting
   # (JuiceFSMetaDumpStale). A new volume has no dump until the mounts write the first:
   # that is not a failure, and the metric then counts from the first time the bucket
   # was seen without one, so the alert still fires if none ever comes.
@@ -415,24 +365,35 @@ in
     };
   };
 
+  systemd.timers.juicefs-format = {
+    wantedBy = [ "timers.target" ];
+    timerConfig.OnActiveSec = 0;
+  };
+
   systemd.services.juicefs-format = {
-    description = "Format JuiceFS volume (idempotent, metadata node)";
+    description = "Format the JuiceFS volume, or restore it (idempotent, one node at a time)";
+    # Ordering only: whichever serves the metadata database on this node, if any does.
     after = [
       "postgresql.service"
-      "juicefs-pg-password.service"
+      "patroni.service"
+      "haproxy.service"
+      "juicefs-pg-setup.service"
       "network-online.target"
     ];
-    requires = [ "juicefs-pg-password.service" ];
     wants = [ "network-online.target" ];
-    before = [ "juicefs-mount.service" ];
-    wantedBy = [ "multi-user.target" ];
+    # Not wanted by multi-user.target, and not ordered before the mount: a oneshot
+    # that systemd is restarting (exit 4, for as long as there is no primary) keeps
+    # its start job, and whatever waits on that job waits with it. A node with no
+    # way to the database (no mesh key, no etcd quorum) then never finished booting
+    # (`missing-wg-key-boots`). The timer below starts it instead, and the mount
+    # waits for a formatted volume by itself (its gate's exit 4).
     # A new ovh-s3 value has to reach the volume's settings, where every mount reads it
     # (and picks it up while mounted): re-run on a switch that changes its ciphertext.
     restartTriggers = ciphertextHash "ovh-s3" "access-key" ++ ciphertextHash "ovh-s3" "secret-key";
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      ExecStart = "${formatScript}";
+      ExecStart = "${lockedScript}";
       LoadCredential = loadCreds;
       # The applied S3 pair's hash and an operator's stale-dump override.
       StateDirectory = "juicefs-format";

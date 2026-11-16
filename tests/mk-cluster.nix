@@ -133,13 +133,13 @@ let
 
   checks = [
     {
-      name = "module.input = self resolves with a self that exports no clan.modules";
-      # The three roles of the local service, assigned by tag, are what put these here.
+      name = "every node runs the whole of it: no service is one tagged node's";
       ok =
         c.systemd.services ? juicefs-format
         && c.systemd.services ? nomad-bootstrap
         && c.services.prometheus.enable
-        && !(node2.config.systemd.services ? juicefs-format);
+        && node2.config.systemd.services ? juicefs-format
+        && node2.config.services.haproxy.enable;
     }
     {
       name = "meta reaches clan";

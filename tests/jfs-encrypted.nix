@@ -9,7 +9,7 @@
 #            earlier run [RAN, design]. The test only READS the backing directory, to
 #            grep what the provider would see.
 #   node1    the fixture's node1, as far as JuiceFS goes: the REAL modules/vars.nix,
-#            modules/storage-juicefs.nix and modules/storage-juicefs-meta.nix under
+#            modules/storage-juicefs.nix and modules/storage-juicefs-format.nix under
 #            clanCore, with the cluster harness's fixture secrets at the paths clan's
 #            age backend uses. Its control-mesh address is on a dummy interface
 #            standing in for wg-ctrl (WireGuard is another test's business), and
@@ -178,7 +178,8 @@ pkgs.testers.runNixOSTest {
           clanCoreModule
           ../modules/vars.nix
           ../modules/storage-juicefs.nix
-          ../modules/storage-juicefs-meta.nix
+          ../modules/storage-juicefs-format.nix
+          ./lib/jfs-plain-pg.nix
           # Only the generators the JuiceFS units read: the rest are Nomad's and the
           # mesh's, whose owners (systemd-network) this VM doesn't have.
           (harness.secretsModuleFor (
@@ -207,7 +208,7 @@ pkgs.testers.runNixOSTest {
         clan.core.settings.directory = toString ./fixtures;
         clan.core.vars.settings.secretStore = "age";
 
-        # The control-mesh address the metadata URL names (lib/net.nix jfsMetaHost),
+        # The control-mesh address the metadata URL names (a test that asks the database by that address),
         # under the unit name every mesh-bound service waits for.
         systemd.services."${net.meshIf}-ready" = {
           wantedBy = [ "multi-user.target" ];
@@ -388,7 +389,7 @@ pkgs.testers.runNixOSTest {
           rescue.start()
 
           with subtest("metric-exported"):
-              for u in ["postgresql.service", "juicefs-pg-password.service", "juicefs-format.service",
+              for u in ["postgresql.service", "juicefs-pg-setup.service", "juicefs-format.service",
                         "juicefs-mount.service", "jfs-health.service"]:
                   node1.wait_for_unit(u)
               node1.wait_until_succeeds(f"mountpoint -q {MNT}", timeout=120)

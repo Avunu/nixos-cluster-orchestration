@@ -173,7 +173,6 @@
       tags = [
         "worker"
         "nomad-server"
-        "juicefs-meta"
       ];
       hostId = "00000000"; # ZFS: head -c4 /dev/urandom | od -A none -t x4
 

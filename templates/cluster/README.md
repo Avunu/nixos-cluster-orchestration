@@ -49,7 +49,7 @@ Off the cluster and away from your laptop: the offline age identity, a dated `gi
 
 ## Secrets policy
 
-`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
+`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`, `juicefs-patroni`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
 
 ## Nodes that already run an earlier library
 
