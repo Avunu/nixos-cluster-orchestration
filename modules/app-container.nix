@@ -246,7 +246,17 @@ let
         juicefsPaths = mkOption {
           type = types.attrsOf types.str;
           default = { };
-          description = "guestPath -> subpath under /mnt/jfs.";
+          description = "guestPath -> subpath in the app's own JuiceFS volume. Any entry gives the app a volume: a bucket, a key and a metadata database of its own.";
+        };
+        juicefsVolume = mkOption {
+          type = types.str;
+          default = config.preview.base;
+          defaultText = lib.literalExpression "the app's name";
+          description = ''
+            The JuiceFS volume `juicefsPaths` are in: the app's own, by default. Two
+            apps that name the same one share its files (a WordPress site's admin and
+            public faces); the volume, its bucket and its keys carry this name.
+          '';
         };
         localState = mkOption {
           type = types.attrsOf types.str;
@@ -441,7 +451,7 @@ let
             type = types.str;
             readOnly = true;
             internal = true;
-            default = if config.preview.of != null then "previews/${name}" else "clients/${name}";
+            default = if config.preview.of != null then "previews/${name}" else "data";
           };
         };
         network = mkOption {

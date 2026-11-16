@@ -149,7 +149,13 @@ let
     "github-token/nix.conf" = "# no GitHub token in the VM tests\n";
     "github-token/netrc" = "";
   };
-  fixtureFor = gen: file: fixtures."${gen}/${file}" or "ci-fixture-${gen}-${file}";
+  fixtureFor =
+    gen: file:
+    # An app volume's S3 pair (modules/storage-juicefs.nix): the stand-in's one pair.
+    if lib.hasSuffix "-jfs-s3" gen then
+      (if file == "access-key" then s3AccessKey else s3SecretKey)
+    else
+      fixtures."${gen}/${file}" or "ci-fixture-${gen}-${file}";
 
   # The file a node gets for one vars file: a path, installed as it is. Never read it
   # into a string at evaluation: the PKI is a build output, and reading one is
@@ -162,7 +168,12 @@ let
     }:
     if extraFixtureSources ? "${gen}/${file}" then
       extraFixtureSources."${gen}/${file}"
-    else if gen == "nomad-ca" || gen == "nomad-gossip" || gen == "nomad-jwt" || gen == "juicefs-rsa" then
+    else if
+      gen == "nomad-ca" || gen == "nomad-gossip" || gen == "nomad-jwt" || gen == "juicefs-rsa"
+    then
+      "${pki}/${file}"
+    # An app volume's key: the fixture's one PEM and its passphrase.
+    else if lib.hasSuffix "-jfs" gen && file != "pg-password" then
       "${pki}/${file}"
     else if gen == "nomad-tls" || gen == "nomad-login" then
       "${pki}/${node}/${file}"

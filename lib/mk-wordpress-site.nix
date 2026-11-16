@@ -353,7 +353,7 @@ in
       if isAdmin then
         {
           # The whole WP root: the docroot, the mutable wp-content and its .git.
-          "/var/lib/wordpress" = "clients/${slug}/wordpress";
+          "/var/lib/wordpress" = "data/wordpress";
         }
       else
         {
@@ -362,8 +362,11 @@ in
           # from the admin plane's tree so both faces see one media directory.
           # It stays writable: form-plugin attachments, generated PDFs and
           # builder CSS are all written by the public face.
-          "/var/lib/wordpress/www/wp-content/uploads" = "clients/${slug}/wordpress/www/wp-content/uploads";
+          "/var/lib/wordpress/www/wp-content/uploads" = "data/wordpress/www/wp-content/uploads";
         };
+
+    # One volume for the site: both faces read the same media directory.
+    juicefsVolume = slug;
 
     secrets = commonSecrets // lib.optionalAttrs isAdmin adminSecrets;
 
