@@ -50,6 +50,9 @@ elif name == "zfs":
     if argv[0] == "destroy":
         sets.discard(argv[-1])
     have.write_text("\n".join(sorted(sets)))
+elif name == "systemd-run":
+    import subprocess
+    sys.exit(subprocess.run(argv[argv.index("--") + 1:]).returncode)
 elif name == "juicefs":
     if argv[0] == "clone":
         shutil.copytree(argv[1], argv[2])
@@ -123,13 +126,13 @@ class AgentTest(unittest.TestCase):
         bin_.mkdir()
         (bin_ / "fake").write_text(FAKE.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
         (bin_ / "fake").chmod(0o755)
-        for c in ("nix", "nix-env", "zfs", "juicefs", "systemctl", "nixos-container", "findmnt"):
+        for c in ("nix", "nix-env", "zfs", "juicefs", "systemctl", "systemd-run", "nixos-container", "findmnt"):
             (bin_ / c).symlink_to("fake")
         self.fake = self.tmp / "fake"
         self.fake.mkdir()
         (self.tmp / "creds").mkdir()
         (self.tmp / "creds/token").write_text("t0ken\n")
-        files = self.tmp / "jfs/clients/shop/odoo"
+        files = self.tmp / "jfs/shop/data/odoo"
         files.mkdir(parents=True)
         (files / "filestore").write_text("production's")
 
@@ -141,10 +144,11 @@ class AgentTest(unittest.TestCase):
         base = f"http://127.0.0.1:{self.server.server_port}"
         self.cfg = {
             "node": "node1", "host": "node1", "url": f"{base}/agent/sync", "flake": "github:acme/cluster",
-            "stateMount": "/state", "cloneRoot": "/state-preview", "jfsMount": str(self.tmp / "jfs"),
+            "stateMount": "/state", "cloneRoot": "/state-preview",
             "probeBase": base, "probeSeconds": 1,
             "apps": {"shop": {
                 "repo": "acme/shop", "input": "shop-src", "inputUrl": "github:acme/shop/{rev}", "healthPath": "/web/health",
+                "volume": {"mount": str(self.tmp / "jfs/shop"), "unit": "juicefs-mount-shop.service"},
                 "slots": [{"name": "shop-pv1", "origin": "unix:/run/odoo-shop-pv1/nginx.sock"}],
             }},
         }  # fmt: skip
@@ -224,14 +228,14 @@ class AgentTest(unittest.TestCase):
             # The app's own dataset, at the newest snapshot replication made of it.
             "zfs clone -o mountpoint=/state-preview/shop-pv1/clients/shop -o readonly=off"
             " -o com.sun:auto-snapshot=false rpool/state/apps/shop@repl-200 rpool/preview/shop-pv1",
-            f"juicefs clone {self.tmp}/jfs/clients/shop {self.tmp}/jfs/previews/shop-pv1",
+            f"juicefs clone {self.tmp}/jfs/shop/data {self.tmp}/jfs/shop/previews/shop-pv1",
             f"nix-env -p {self.tmp}/profiles/shop-pv1/system --set /nix/store/built-aaaaaaaa",
             "systemctl restart container@shop-pv1.service",
             "nixos-container run shop-pv1 -- systemctl is-system-running --wait",
         ]
         at = [next(i for i, line in enumerate(ran) if line.startswith(step)) for step in order]
         self.assertEqual(at, sorted(at), ran)
-        self.assertEqual((self.tmp / "jfs/previews/shop-pv1/odoo/filestore").read_text(), "production's")
+        self.assertEqual((self.tmp / "jfs/shop/previews/shop-pv1/odoo/filestore").read_text(), "production's")
         run = self.tmp / "run/shop-pv1"
         self.assertEqual(
             json.loads((run / "credentials.json").read_text()),
@@ -255,13 +259,13 @@ class AgentTest(unittest.TestCase):
         self.assertFalse([line for line in ran if line.startswith(("zfs clone", "zfs destroy", "juicefs"))], ran)
 
         # /preview reset: the same commit on a fresh copy.
-        (self.tmp / "jfs/previews/shop-pv1/odoo/filestore").write_text("the preview's")
+        (self.tmp / "jfs/shop/previews/shop-pv1/odoo/filestore").write_text("the preview's")
         self.want(preview("feat-x", SHA_B, seed=2))
         self.until(lambda: (p := self.said("shop/feat-x")) and p["seed"] == 2 and p["state"] == "live")
         ran = self.ran(clear=True)
         self.assertIn("zfs destroy rpool/preview/shop-pv1", ran)
         self.assertFalse([line for line in ran if line.startswith("zfs snapshot")], ran)
-        self.assertEqual((self.tmp / "jfs/previews/shop-pv1/odoo/filestore").read_text(), "production's")
+        self.assertEqual((self.tmp / "jfs/shop/previews/shop-pv1/odoo/filestore").read_text(), "production's")
 
         # A second branch finds the app's one slot taken, and says so.
         self.want(preview("feat-x", SHA_B, seed=2), preview("feat-y", SHA_A))
@@ -283,7 +287,7 @@ class AgentTest(unittest.TestCase):
 
         self.want()
         self.until(lambda: Worker.reports[-1]["previews"] == [])
-        self.until(lambda: not (self.tmp / "jfs/previews/shop-pv1").exists() and not run.exists())
+        self.until(lambda: not (self.tmp / "jfs/shop/previews/shop-pv1").exists() and not run.exists())
         self.assertFalse((self.fake / "active-container@shop-pv1.service").exists())
         self.assertEqual((self.fake / "zfs").read_text().split(), ["rpool/preview"])
 

@@ -179,20 +179,32 @@ let
   # The roles, their passwords and the database, through the primary. Idempotent.
   # Passwords reach psql through `\set` from the credential files, never a command
   # line, and none of them has punctuation (modules/vars.nix).
-  setupSql = pkgs.writeText "juicefs-pg-setup.sql" ''
-    \set jfspw `cat "$CREDENTIALS_DIRECTORY/${jfs.credIds.pgpass}"`
-    \set supw `cat "$CREDENTIALS_DIRECTORY/superuser"`
-    \set replpw `cat "$CREDENTIALS_DIRECTORY/replication"`
-    SELECT 'CREATE ROLE ${jfs.metaDb} LOGIN'
-      WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${jfs.metaDb}') \gexec
-    SELECT 'CREATE ROLE ${replicator} REPLICATION LOGIN'
-      WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${replicator}') \gexec
-    ALTER ROLE ${jfs.metaDb} WITH LOGIN PASSWORD :'jfspw';
-    ALTER ROLE ${replicator} WITH REPLICATION LOGIN PASSWORD :'replpw';
-    ALTER ROLE ${superuser} WITH PASSWORD :'supw';
-    SELECT 'CREATE DATABASE ${jfs.metaDb} OWNER ${jfs.metaDb}'
-      WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${jfs.metaDb}') \gexec
-  '';
+  # Every volume's role and database (lib/juicefs.nix, "Volumes"): the cluster's,
+  # and one for each app that has a volume. A role and its database share a name.
+  volumes = [
+    (jfs.systemVolume os)
+  ]
+  ++ map (jfs.appVolume os) (jfs.volumeApps (config.clusterApps or { }));
+  pgCred = v: "pg${v.suffix}";
+
+  setupSql = pkgs.writeText "juicefs-pg-setup.sql" (
+    ''
+      \set supw `cat "$CREDENTIALS_DIRECTORY/superuser"`
+      \set replpw `cat "$CREDENTIALS_DIRECTORY/replication"`
+      SELECT 'CREATE ROLE ${replicator} REPLICATION LOGIN'
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${replicator}') \gexec
+      ALTER ROLE ${replicator} WITH REPLICATION LOGIN PASSWORD :'replpw';
+      ALTER ROLE ${superuser} WITH PASSWORD :'supw';
+    ''
+    + lib.concatMapStrings (v: ''
+      \set pw `cat "$CREDENTIALS_DIRECTORY/${pgCred v}"`
+      SELECT 'CREATE ROLE ${v.db} LOGIN'
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${v.db}') \gexec
+      ALTER ROLE ${v.db} WITH LOGIN PASSWORD :'pw';
+      SELECT 'CREATE DATABASE ${v.db} OWNER ${v.db}'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${v.db}') \gexec
+    '') volumes
+  );
 
   setupScript = pkgs.writeShellScript "juicefs-pg-setup" (
     ''
@@ -275,8 +287,9 @@ let
     # pg_rewind, from a former primary coming back as a replica; and
     # juicefs-pg-setup on a node that is not the primary.
     "host all ${superuser} ${topology.mesh.subnet} scram-sha-256"
-    "host ${jfs.metaDb} ${jfs.metaDb} ${topology.mesh.subnet} scram-sha-256"
-    "host ${jfs.metaDb} ${jfs.metaDb} 127.0.0.1/32 scram-sha-256"
+    # A volume's role, into the database of its own name and no other.
+    "host sameuser all ${topology.mesh.subnet} scram-sha-256"
+    "host sameuser all 127.0.0.1/32 scram-sha-256"
   ];
   initdbArgs = [
     "--encoding=UTF8"
@@ -433,7 +446,8 @@ in
         restartTriggers = [
           dcsFile
         ]
-        ++ ciphertextHash "juicefs-pg" "password"
+        ++ [ setupSql ]
+        ++ lib.concatMap (v: ciphertextHash (lib.head v.files.pgpass) (lib.last v.files.pgpass)) volumes
         ++ lib.concatMap (ciphertextHash "juicefs-patroni") [
           "superuser"
           "replication"
@@ -451,11 +465,11 @@ in
           User = "postgres";
           ExecStart = "${setupScript}";
           LoadCredential = [
-            "${jfs.credIds.pgpass}:${vars.juicefs-pg.files.password.path}"
             "superuser:${vars.juicefs-patroni.files.superuser.path}"
             "replication:${vars.juicefs-patroni.files.replication.path}"
             "restapi:${vars.juicefs-patroni.files.restapi.path}"
-          ];
+          ]
+          ++ map (v: "${pgCred v}:${jfs.volumeCredPath vars v "pgpass"}") volumes;
           # No primary yet, or it is changing hands: again, until there is one.
           Restart = "on-failure";
           RestartSec = 5;

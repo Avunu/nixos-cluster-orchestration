@@ -20,7 +20,7 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 - **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the TPM releases the disk key only to that signed boot. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
 - **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it. No entry names a node: Nomad places every app, and an app's data is where Nomad puts it ([Where an app runs](#where-an-app-runs)).
 - **Ingress is a tunnel per app, over a unix socket.** Each container runs its own `cloudflared` against a unix socket. See [Ingress](#ingress).
-- **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds shared files, the same on every node. Its metadata is a PostgreSQL database with a member on every node, which survives the loss of the node holding its primary ([The JuiceFS metadata database](#the-juicefs-metadata-database)). The volume is encrypted, and every mount refuses one that is not.
+- **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds files: each app has a volume of its own, in a bucket of its own, mounted on the node the app runs on ([An app's files](#an-apps-files)). Its metadata is a PostgreSQL database with a member on every node, which survives the loss of the node holding its primary ([The JuiceFS metadata database](#the-juicefs-metadata-database)). The volume is encrypted, and every mount refuses one that is not.
 - **Secrets are `clan vars`** on clan's plain `age` backend. Values are generated offline, committed encrypted, and decrypted on the host at activation. Containers never hold a key: the plaintext is bind-mounted in.
 - **No service belongs to one node.** A tag says what a node votes in (`nomad-server`, `etcd`) or that it runs apps (`worker`). Everything else, the JuiceFS metadata database, job registration, Prometheus, Alertmanager and Loki included, runs on every node or every Nomad server.
 - **The private network is not trusted.** Nomad speaks mTLS with a gossip key on the control VLAN. Everything else between nodes (etcd, Loki, Prometheus and its exporters, Vector, the JuiceFS metadata database) listens only on a WireGuard mesh, `wg-ctrl`, over that VLAN. See [The control plane](#the-control-plane).
@@ -232,7 +232,7 @@ Kept outside any repository, off the cluster, and away from the laptop that hold
 
 - the offline age identity, whose public key is in `recipients`;
 - a dated `git bundle` of the private repository (`git bundle create site-<date>.bundle --all`);
-- direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB);
+- direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB), and the same two files of every `<app>-jfs`: each app's volume has its own key;
 - `cloud-state/passphrase`, with `cloud`: without it OpenTofu's state is unreadable, and what it made has to be imported again by hand;
 - `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}` and `backup-state-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target`, `backup.state.target` and `backup.repoSalt`.
 
@@ -463,7 +463,8 @@ What the node held, and what replaces it:
 | `nomad-gossip` on a server, `nomad-acl` on a server, the alerting tokens on every node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
 | `juicefs-pg`, `juicefs-patroni` | By hand, in a window: every mount, every member and the roles change together. |
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
-| `juicefs-rsa`, `restic` | Bound to data. A new volume and new repositories: below. |
+| `juicefs-rsa`, every `<app>-jfs`, `restic` | Bound to data. New volumes and new repositories: below. |
+| every `<app>-jfs-s3` | As `ovh-s3`: a new pair from the provider (`avc cloud apply` after removing the old key there), then delete the old one. |
 | `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
 
 The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
@@ -604,7 +605,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
 | `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
 | `cloud` | Optional: what `avc cloud` makes at the providers ([Providers](#providers)). `cloud.ovh` is `{ endpoint; project; region; noncurrentDays; }`: the API endpoint (`ovh-us`, `ovh-eu`, `ovh-ca`), the Public Cloud project's id, the region its buckets are made in, and how long a hidden object version is kept (30). `cloud.cloudflare` is `{ accountId; zones; auditBucket; auditLockDays; }`: `zones` maps a zone's name to its id (`zones."example.com" = "<zone id>"`), and only hostnames in one of them get a DNS record; `auditBucket` is the audit trail's R2 bucket, locked for `auditLockDays` (365). Leave a provider out and nothing of its is touched. |
-| `objectStorage` | `{ endpoint; region; juicefsBucket; }`. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: each node's store is its own encrypted disk (`/var/lib/loki`). |
+| `objectStorage` | `{ endpoint; region; juicefsBucket; appBucketPrefix; }`. `juicefsBucket` is the cluster's own volume; each app's bucket is `<appBucketPrefix>-<app>`, and the prefix is `juicefsBucket` unless set. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: each node's store is its own encrypted disk (`/var/lib/loki`). |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
 | `alerting` | `{ cloudflareAccountId; from; to; heartbeatUrl; auditUrl; }`. `heartbeatUrl` is the watchdog Worker's `/heartbeat`; `auditUrl` its `/event`, for the [audit trail](#audit-trail). Only an opted-out node may leave `auditUrl` null. |
 | `backup.repoSalt` | This site's own string, at least 16 characters (`openssl rand -hex 16`). It salts each app's repository path (see [Backups and restore](#backups-and-restore)). Set it once, before the first backup, and never change it: a new salt moves every app to a new, empty repository, which is wanted only in [A node left your control](#a-node-left-your-control). |
@@ -691,6 +692,21 @@ The payload modules come from [wordpress-nix](https://github.com/Avunu/wordpress
 
 Beside the kind, every generic `clusterApps` option stays available (`modules/app-container.nix`): `tunnel.id`, `resources`, `startTimeout`, `network` ([Container networking](#container-networking)), `module` for extra guest config, and so on. `oidc = { idp = "<a FreeIPA app>"; }` makes any app a client of that provider's Authelia. `enable = false;` keeps a file without deploying it.
 
+### An app's files
+
+An app with `juicefsPaths` has a JuiceFS volume of its own: a bucket (`<appBucketPrefix>-<app>`), an S3 pair that opens that bucket and no other, an encryption key, and a database and role of its own in the [metadata database](#the-juicefs-metadata-database). Nothing of one app's files is in another's bucket or database.
+
+- **Mounted where the app runs.** The app's container starts its mount (`juicefs-mount-<app>`, at `/mnt/jfs-app/<app>`) and the mount goes when the container does. The first start anywhere formats the volume; every later one finds it formatted. A mount that dies takes its container with it, and Nomad starts the app again.
+- **A new app needs its bucket first.** `avc cloud apply` makes the bucket and writes the S3 pair into the site's vars ([Providers](#providers)); without `topology.cloud`, make the bucket and its key by hand and `clan vars generate` prompts for them. The key and role password are generated. Until the bucket exists the app's start fails and Nomad retries it.
+- **A preview's files are a clone inside the app's volume** (`previews/<slot>` beside `data`), so a preview needs no bucket and shares none of its writes with production.
+- **Two apps can share one volume** by naming it (`juicefsVolume`): a WordPress site's two faces do.
+- **Removing an app** leaves its bucket and database. The bucket carries `prevent_destroy`, so `avc cloud plan` fails on it and names it; delete it by hand once you are sure, and its database with `dropdb -p 5433 jfs_<app>` on the primary.
+- **Every node still holds every app's keys**, because any node may be the one an app runs on. A volume per app bounds a leaked S3 key, a mistake and a restore to one app; it does not bound a lost node.
+
+The cluster keeps one small volume for itself (`/mnt/jfs`, on every node): the deploy's canary marker, the write probe and the canary scan. No app's files are in it.
+
+Not watched per app: the age of a volume's metadata dump. `JuiceFSMetaDumpStale` is about the cluster's own volume. An app's dumps are written while it is mounted, and matter only if every copy of the metadata database is lost.
+
 ### The JuiceFS metadata database
 
 JuiceFS keeps file names, sizes and the map from files to objects in PostgreSQL. On a site with an etcd, every node runs a member of one PostgreSQL cluster (`modules/storage-juicefs-pg.nix`), and Patroni keeps one of them the primary by a lock in etcd.
@@ -753,7 +769,9 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `initrd-ssh/ssh_host_ed25519_key` | The initrd's SSH host key, per machine. Placed at install; the public half is what `avc boot unlock` expects. Rotation by hand (see [Recovery](#recovery)) | Generated |
 | `emergency-access/{password,hash}` | The initrd emergency shell, per machine. The password never leaves the repository; the hash is in every signed initrd | Generated |
 | `ovh-s3/{access-key,secret-key}` | JuiceFS on all nodes. The volume keeps its own copy in its settings, which every mount reads; `juicefs-format` puts a new pair there when the vars change, and running mounts pick it up | Prompt, from your S3 provider |
-| `juicefs-rsa/{rsa.pem,rsa-passphrase}` | The JuiceFS volume's encryption key. Never regenerate it: the volume's data can't be read without it, and `avc` refuses to rotate it | Generated |
+| `juicefs-rsa/{rsa.pem,rsa-passphrase}` | The cluster's own JuiceFS volume's encryption key. Never regenerate it: the volume's data can't be read without it, and `avc` refuses to rotate it | Generated |
+| `<app>-jfs/{rsa.pem,rsa-passphrase,pg-password}` | One app's JuiceFS volume: its encryption key and its metadata role's password. Never regenerate it, as above, for that app's files | Generated |
+| `<app>-jfs-s3/{access-key,secret-key}` | The S3 pair that opens that app's bucket and no other | Prompt, or written by `avc cloud apply` |
 | `juicefs-pg/password` | The JuiceFS metadata database's role for the mounts. Manual: every mount and the role change together | Generated |
 | `juicefs-patroni/{superuser,replication,restapi}` | The metadata database's own: its superuser, the role its members replicate as, and what Patroni's API wants for anything that changes the cluster. Manual: restart `patroni` on each node afterwards, replicas first | Generated |
 | `nomad-acl/token` | Nomad's management token: the ACL bootstrap and `nomad-acl-init`, on the Nomad servers only | Generated |
@@ -907,7 +925,7 @@ avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and 
 
 | Provider | What is made | From |
 | --- | --- | --- |
-| OVH | A bucket, a user of its own, that user's S3 key pair, and a policy that reaches that bucket and no other | `objectStorage.juicefsBucket`; `backup.state.target.bucket` when it is on the same endpoint |
+| OVH | A bucket, a user of its own, that user's S3 key pair, and a policy that reaches that bucket and no other | `objectStorage.juicefsBucket`; one for each app with `juicefsPaths`; `backup.state.target.bucket` when it is on the same endpoint |
 | OVH | The same for the binary cache's bucket, unversioned | an app of kind `attic`, its `attic.bucket` |
 | OVH | Versioning on the state backup's bucket, and hidden versions expired after `noncurrentDays` | `backup.state.target.bucket` |
 | Cloudflare | A tunnel per app, locally configured | every app with a hostname |
@@ -917,7 +935,7 @@ avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and 
 
 No user may delete an object version, so on the versioned bucket a node that is taken over can hide backups and not destroy them.
 
-**What comes back goes where the site reads it.** An S3 key pair into its var (`ovh-s3`, `backup-state-target`, `cache-s3`), written only when it differs. A new tunnel's id into `apps/<app>.json`, which merges with the app's `.nix`, and its credentials file into the app's `<app>-cf/cloudflared`. So a new app with a hostname needs no `cloudflared tunnel create` and no `tunnel.id`: `avc cloud apply` makes the tunnel and writes both. The apply ends in the same pull request every change does.
+**What comes back goes where the site reads it.** An S3 key pair into its var (`ovh-s3`, `<app>-jfs-s3`, `backup-state-target`, `cache-s3`), written only when it differs. A new tunnel's id into `apps/<app>.json`, which merges with the app's `.nix`, and its credentials file into the app's `<app>-cf/cloudflared`. So a new app with a hostname needs no `cloudflared tunnel create` and no `tunnel.id`: `avc cloud apply` makes the tunnel and writes both. The apply ends in the same pull request every change does.
 
 **A tunnel made by hand is adopted.** An app that already has a `tunnel.id` gets an import of it, and its secret and its name stay as they are. A DNS record made by hand is not known to the topology by any id: delete it first, or `avc cloud tofu "import cloudflare_dns_record.<name> <zone id>/<record id>"`. A bucket made by hand likewise (`import ovh_cloud_project_storage.juicefs <project>/<region>/<name>`); its old user and key are then yours to remove once the new pair is deployed.
 
@@ -1229,7 +1247,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
 | `cluster-single` | `node1`'s real machine module boots and walks the whole cold start, twice: secrets, networking, the mesh, etcd, encrypted JuiceFS on S3, Nomad with TLS and scoped tokens, every app's job, monitoring, the audit producers. Jobs register but aren't placed. About 5 GB of RAM. |
-| `cluster` | Three voters form quorums, share one JuiceFS volume whose metadata database loses its primary and a replica's disk and carries on, and run probe containers with cross-node reachability, an app held to one node by a constraint, and fencing. About 9 GB of RAM. |
+| `cluster` | Three voters form quorums, share the cluster's JuiceFS volume whose metadata database loses its primary and a replica's disk and carries on, give an app its own volume (bucket, database, role), and run probe containers with cross-node reachability, an app held to one node by a constraint, and fencing. About 9 GB of RAM. |
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 

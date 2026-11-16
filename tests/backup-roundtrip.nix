@@ -75,6 +75,10 @@ let
                   type = lib.types.attrsOf lib.types.str;
                   default = { };
                 };
+                juicefsVolume = lib.mkOption {
+                  type = lib.types.str;
+                  default = name;
+                };
                 backup = lib.mkOption {
                   type = import ../lib/app-backup-type.nix { inherit lib; };
                   default = { };
@@ -267,9 +271,9 @@ pkgs.testers.runNixOSTest {
         my("create table t (v int); insert into t values (1)")
         for app in ["pgapp", "myapp", "filesonly", "elsewhere"]:
             machine.succeed(
-                f"mkdir -p /mnt/jfs/clients/{app}/files/sessions"
-                f" && echo one > /mnt/jfs/clients/{app}/files/a.txt"
-                f" && echo keep > /mnt/jfs/clients/{app}/files/sessions/s1"
+                f"mkdir -p /mnt/jfs-app/{app}/clients/{app}/files/sessions"
+                f" && echo one > /mnt/jfs-app/{app}/clients/{app}/files/a.txt"
+                f" && echo keep > /mnt/jfs-app/{app}/clients/{app}/files/sessions/s1"
             )
 
     with subtest("zfs-backed local state"):
@@ -321,8 +325,8 @@ pkgs.testers.runNixOSTest {
         my("update t set v = 2; create table junk (x int)")
         for app in ["pgapp", "myapp", "filesonly"]:
             machine.succeed(
-                f"rm /mnt/jfs/clients/{app}/files/a.txt"
-                f" && echo two > /mnt/jfs/clients/{app}/files/b.txt"
+                f"rm /mnt/jfs-app/{app}/clients/{app}/files/a.txt"
+                f" && echo two > /mnt/jfs-app/{app}/clients/{app}/files/b.txt"
             )
 
     with subtest("no --yes is a dry run"):
@@ -340,23 +344,23 @@ pkgs.testers.runNixOSTest {
         machine.succeed("cluster-restore pgapp --yes")
         assert pg("select v from t") == "1"
         assert pg("select count(*) from information_schema.tables where table_name = 'junk'") == "0"
-        machine.succeed("grep -qx one /mnt/jfs/clients/pgapp/files/a.txt")
-        machine.fail("test -e /mnt/jfs/clients/pgapp/files/b.txt")
+        machine.succeed("grep -qx one /mnt/jfs-app/pgapp/clients/pgapp/files/a.txt")
+        machine.fail("test -e /mnt/jfs-app/pgapp/clients/pgapp/files/b.txt")
         # Excluded from the backup, so protected from --delete.
-        machine.succeed("grep -qx keep /mnt/jfs/clients/pgapp/files/sessions/s1")
+        machine.succeed("grep -qx keep /mnt/jfs-app/pgapp/clients/pgapp/files/sessions/s1")
         machine.wait_until_succeeds("nixos-container run pgapp -- systemctl is-active pgapp-web.service")
 
     with subtest("restore MariaDB app"):
         machine.succeed("cluster-restore myapp --yes")
         assert my("select v from t") == "1"
         assert my("select count(*) from information_schema.tables where table_schema = 'myapp' and table_name = 'junk'") == "0"
-        machine.succeed("grep -qx one /mnt/jfs/clients/myapp/files/a.txt")
+        machine.succeed("grep -qx one /mnt/jfs-app/myapp/clients/myapp/files/a.txt")
         machine.wait_until_succeeds("nixos-container run myapp -- systemctl is-active myapp-web.service")
 
     with subtest("restore a files-only app"):
         machine.succeed("cluster-restore filesonly --yes")
-        machine.succeed("grep -qx one /mnt/jfs/clients/filesonly/files/a.txt")
-        machine.fail("test -e /mnt/jfs/clients/filesonly/files/b.txt")
+        machine.succeed("grep -qx one /mnt/jfs-app/filesonly/clients/filesonly/files/a.txt")
+        machine.fail("test -e /mnt/jfs-app/filesonly/clients/filesonly/files/b.txt")
 
     with subtest("restore local state, container running"):
         exported = machine.succeed("cat /state/clients/zfsapp/data/export.txt").strip()

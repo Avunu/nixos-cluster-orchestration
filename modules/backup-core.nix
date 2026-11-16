@@ -73,7 +73,10 @@ let
   bcfg = topology.backup;
   target = bcfg.target;
   bt = clusterLib.backupTarget;
-  jfsMount = clusterLib.juicefs.mountPoint;
+  # An app's files are in its own JuiceFS volume, mounted where the app runs: which
+  # is where its backup and its restore run.
+  jfsMountOf =
+    app: (clusterLib.juicefs.appVolume topology.objectStorage app.juicefsVolume).mountPoint;
 
   # Every node has every app's profile and units; which node uses them is decided
   # when they run (`runs_here`, below).
@@ -83,7 +86,10 @@ let
   # modules/app-state.nix, where it is imported and on: a restore into a stopped
   # app's local state has to mount the app's dataset first, and hand it back after.
   stateTool =
-    if (config.cluster.state.enable or false) then "${config.cluster.state.package}/bin/cluster-state" else "";
+    if (config.cluster.state.enable or false) then
+      "${config.cluster.state.package}/bin/cluster-state"
+    else
+      "";
 
   guest = n: config.containers.${n}.config;
 
@@ -227,7 +233,7 @@ let
     n: app:
     let
       engine = engineOf n app;
-      jfsPaths = map (sub: "${jfsMount}/${sub}") (lib.attrValues app.juicefsPaths);
+      jfsPaths = map (sub: "${jfsMountOf app}/${sub}") (lib.attrValues app.juicefsPaths);
       localPaths = lib.attrValues app.localState;
       guestDataDir =
         if engine == "postgresql" then
@@ -682,7 +688,7 @@ let
     Runs on the node the app is running on, or on any node while it runs on
     none. Pull-deploys are held for the duration. A ZFS
     snapshot of the app's local state is taken first; the JuiceFS files it
-    replaces stay in /mnt/jfs/.trash for the trash period. A localSnapshot
+    replaces stay in the volume's .trash for the trash period. A localSnapshot
     app's local state can be restored with its container stopped (a node
     rebuilt from nothing); while it runs, backup.appUnits are stopped first.
     EOF

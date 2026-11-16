@@ -109,7 +109,100 @@ rec {
   # Keeping the expansion at the call site makes that mistake impossible to
   # repeat silently — an unset $pgpass yields an obviously empty password
   # rather than a URL containing shell source.
-  metaUrl = metaIp: "postgres://${metaDb}:$pgpass@${metaIp}:${toString metaPort}/${metaDb}";
+  volumeUrl = v: "postgres://${v.db}:$pgpass@${metaHost}:${toString metaPort}/${v.db}";
+
+  # ── Volumes ───────────────────────────────────────────────────────────────
+  # One for the cluster itself, mounted on every node: the deploy's canary marker,
+  # the write probe, the canary scan. No app's files are in it.
+  #
+  # One for each app that has files on JuiceFS (`juicefsPaths`): its own bucket, its
+  # own S3 pair that opens only that bucket, its own key, its own database (and
+  # role, of the same name) in the metadata cluster. Mounted where the app runs,
+  # for as long as it runs there. A preview slot has no volume: its files are a
+  # `juicefs clone` inside the volume of the app it previews.
+  #
+  # A volume is this record. `files` says where each credential is: generator and file.
+  systemVolume = os: {
+    app = null;
+    name = jfsName;
+    db = metaDb;
+    inherit mountPoint;
+    bucket = os.juicefsBucket;
+    suffix = "";
+    files = {
+      s3ak = [
+        "ovh-s3"
+        "access-key"
+      ];
+      s3sk = [
+        "ovh-s3"
+        "secret-key"
+      ];
+      pgpass = [
+        "juicefs-pg"
+        "password"
+      ];
+      rsaPem = [
+        "juicefs-rsa"
+        "rsa.pem"
+      ];
+      rsaPass = [
+        "juicefs-rsa"
+        "rsa-passphrase"
+      ];
+    };
+  };
+  appMountRoot = "/mnt/jfs-app";
+  # Bucket names are the provider's namespace, shared with its every customer, so an
+  # app's carries the site's: `objectStorage.appBucketPrefix`, or the cluster
+  # volume's bucket name.
+  appBucket = os: app: "${os.appBucketPrefix or os.juicefsBucket}-${app}";
+  appS3Generator = app: "${app}-jfs-s3";
+  appKeyGenerator = app: "${app}-jfs";
+  appVolume = os: app: {
+    inherit app;
+    name = app;
+    # A PostgreSQL identifier written without quotes.
+    db = "jfs_" + lib.replaceStrings [ "-" "." ] [ "_" "_" ] app;
+    mountPoint = "${appMountRoot}/${app}";
+    bucket = appBucket os app;
+    suffix = "-${app}";
+    files = {
+      s3ak = [
+        (appS3Generator app)
+        "access-key"
+      ];
+      s3sk = [
+        (appS3Generator app)
+        "secret-key"
+      ];
+      pgpass = [
+        (appKeyGenerator app)
+        "pg-password"
+      ];
+      rsaPem = [
+        (appKeyGenerator app)
+        "rsa.pem"
+      ];
+      rsaPass = [
+        (appKeyGenerator app)
+        "rsa-passphrase"
+      ];
+    };
+  };
+  # The volumes `clusterApps` asks for, by name: one for each `juicefsVolume` an app
+  # with files on JuiceFS names (its own name, unless it says otherwise). A preview
+  # slot names the volume of the app it previews.
+  volumeApps =
+    apps:
+    lib.unique (
+      lib.mapAttrsToList (_: a: a.juicefsVolume) (lib.filterAttrs (_: a: a.juicefsPaths != { }) apps)
+    );
+  # Where a volume's credential is on a node, by its key in `credIds`.
+  volumeCredPath =
+    vars: v: key:
+    vars.${lib.head v.files.${key}}.files.${lib.last v.files.${key}}.path;
+  volumeLoadCredentials = vars: v: loadCredentials (volumeCredPath vars v);
 
   # LoadCredential entries given a resolver from credential id -> host path.
   # Stage 2 swapped these from agenix paths to clan vars paths by changing only

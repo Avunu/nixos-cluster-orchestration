@@ -77,6 +77,21 @@ BOUND_TO_DATA = {
 # What must not be generated anew on an installed node, by any command.
 NOT_ON_INSTALLED = BOUND_TO_DISKS | HELD_ON_THE_NODE | BOUND_TO_DATA
 
+# One app's JuiceFS volume key (<volume>-jfs): as juicefs-rsa, for that app's files.
+APP_VOLUME_KEY = "-jfs"
+APP_VOLUME_KEY_WHY = (
+    "one app's JuiceFS volume key: its PEM is in the volume's metadata, encrypted with this passphrase, and a "
+    "new one reads none of the app's files. Changing it means a new volume for that app"
+)
+
+
+def bound_to_data(name: str) -> str | None:
+    return APP_VOLUME_KEY_WHY if name.endswith(APP_VOLUME_KEY) else BOUND_TO_DATA.get(name)
+
+
+def not_on_installed(name: str) -> str | None:
+    return APP_VOLUME_KEY_WHY if name.endswith(APP_VOLUME_KEY) else NOT_ON_INSTALLED.get(name)
+
 
 @dataclass(frozen=True)
 class Scoped:
@@ -194,7 +209,7 @@ def inventory(ctx: Ctx) -> None:
         scope = "shared" if s.gen.share else f"per machine ({len(s.machines)})"
         if name in BOUND_TO_DISKS:
             verdict = "[red]never[/] (bound to the disks)"
-        elif name in BOUND_TO_DATA:
+        elif bound_to_data(name):
             verdict = "[red]never[/] (bound to existing data)"
         elif name in HELD_ON_THE_NODE:
             verdict = "[yellow]manual[/] (held on the node)"
@@ -221,7 +236,7 @@ def provision(ctx: Ctx) -> None:
     # machine anew, so one of these on an installed node means nothing is generated there:
     # a lost var file comes back from git, and a library change to one of these
     # generators has its own procedure.
-    held = {m: sorted(_needing(st) & NOT_ON_INSTALLED.keys()) for m, st in statuses.items() if m in ctx.installed}
+    held = {m: sorted(g for g in _needing(st) if not_on_installed(g)) for m, st in statuses.items() if m in ctx.installed}
     held = {m: g for m, g in held.items() if g}
     todo = [m for m, st in statuses.items() if (st.missing or st.outdated) and m not in held]
     if not todo and not held and not any(st.unfixed for st in statuses.values()):
@@ -239,7 +254,7 @@ def provision(ctx: Ctx) -> None:
             gens |= _needing(st)
     for m, names in held.items():
         for g in names:
-            ui.err(f"{m} is installed, and {g} is {NOT_ON_INSTALLED[g]}")
+            ui.err(f"{m} is installed, and {g} is {not_on_installed(g)}")
         ui.say(f"{m}: nothing generated there. Restore a lost var file from git; anything else is by hand.")
     if todo:
         if not ui.confirm(
@@ -273,8 +288,8 @@ def rotate(ctx: Ctx, generator: str) -> None:
 
     ui.header(f"Rotate {generator}")
     for name in closure:
-        if name in NOT_ON_INSTALLED:
-            ui.err(f"{name} is {NOT_ON_INSTALLED[name]}" + (" (regenerated as a dependent)" if name != generator else ""))
+        if not_on_installed(name):
+            ui.err(f"{name} is {not_on_installed(name)}" + (" (regenerated as a dependent)" if name != generator else ""))
             raise AvcError(f"refusing to regenerate {generator}")
         v = pol.verdict(name, ctx.index)
         if v.via:
@@ -316,8 +331,8 @@ def rotate(ctx: Ctx, generator: str) -> None:
 def set_var(ctx: Ctx, var: str) -> None:
     machine, var_id = parse_var(ctx, var)
     generator, _, file = var_id.partition("/")
-    if generator in NOT_ON_INSTALLED:
-        ui.err(f"{generator} is {NOT_ON_INSTALLED[generator]}")
+    if not_on_installed(generator):
+        ui.err(f"{generator} is {not_on_installed(generator)}")
         ui.type_to_confirm(f"Overwrite {var} anyway", file)
     v = policy_mod.load(ctx.root).verdict(generator, ctx.index)
     if file in v.never:

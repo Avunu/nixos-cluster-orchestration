@@ -58,12 +58,24 @@ let
     flake = topology.deploy.flakeUrl;
     stateMount = "/state";
     cloneRoot = "/state-preview";
-    jfsMount = clusterLib.juicefs.mountPoint;
     # What a built preview is pushed with, when the site has a binary cache
     # (modules/kinds/attic.nix).
     cachePush = config.cluster.cache.pushCommand or null;
     apps = lib.mapAttrs (name: a: {
       inherit (a.preview) repo input healthPath;
+      # The app's JuiceFS volume, where a slot's copy of its files is made: mounted
+      # only while something needs it (modules/storage-juicefs.nix).
+      volume =
+        if a.juicefsPaths == { } then
+          null
+        else
+          let
+            v = clusterLib.juicefs.appVolume topology.objectStorage a.juicefsVolume;
+          in
+          {
+            mount = v.mountPoint;
+            unit = "juicefs-mount${v.suffix}.service";
+          };
       inputUrl =
         if a.preview.inputUrl != null then a.preview.inputUrl else "github:${a.preview.repo}/{rev}";
       slots = lib.mapAttrsToList (slot: s: {

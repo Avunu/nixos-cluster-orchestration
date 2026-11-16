@@ -52,56 +52,73 @@ let
 
   # A resource name: letters, digits and underscores.
   slug = s: lib.replaceStrings [ "." "-" "/" ":" ] [ "_" "_" "_" "_" ] s;
-  ref = type: name: attr: "\${${type}.${name}.${attr}}";
+  ref =
+    type: name: attr:
+    "\${${type}.${name}.${attr}}";
 
   # ── OVH object storage ─────────────────────────────────────────────────────
   os = topology.objectStorage;
   state = topology.backup.state or null;
-  buckets =
-    lib.optionalAttrs (ovh != null) (
-      {
-        juicefs = {
-          name = os.juicefsBucket;
-          versioned = false;
-          # JuiceFS's own key pair, on every node (modules/storage-juicefs.nix).
-          vars = {
-            access = "ovh-s3/access-key";
-            secret = "ovh-s3/secret-key";
-          };
-          description = "${clusterName}: the JuiceFS volume";
+  buckets = lib.optionalAttrs (ovh != null) (
+    {
+      juicefs = {
+        name = os.juicefsBucket;
+        versioned = false;
+        # JuiceFS's own key pair, on every node (modules/storage-juicefs.nix).
+        vars = {
+          access = "ovh-s3/access-key";
+          secret = "ovh-s3/secret-key";
         };
-      }
-      # The state backup's, when it is on this provider. One elsewhere is not ours to make.
-      //
-        lib.optionalAttrs
-          (state != null && (state.target.type or "") == "s3" && state.target.endpoint == os.endpoint)
-          {
-            state_backup = {
-              name = state.target.bucket;
-              versioned = true;
-              vars = {
-                access = "backup-state-target/access-key";
-                secret = "backup-state-target/secret-key";
-              };
-              description = "${clusterName}: the state backup";
-            };
-          }
-      # The binary cache's (modules/kinds/attic.nix), when an app is one.
-      // lib.concatMapAttrs (
-        _: a:
-        lib.optionalAttrs ((a.attic or null) != null && (a.attic.storage.type or "") == "s3") {
-          cache = {
-            name = a.attic.bucket;
-            versioned = false;
+        description = "${clusterName}: the cluster's own JuiceFS volume";
+      };
+    }
+    # Each app's own volume (lib/juicefs.nix, "Volumes"): a bucket, and a pair that
+    # opens that bucket and no other.
+    // lib.listToAttrs (
+      map (
+        volume:
+        lib.nameValuePair "jfs_${slug volume}" {
+          name = clusterLib.juicefs.appBucket os volume;
+          versioned = false;
+          vars = {
+            access = "${clusterLib.juicefs.appS3Generator volume}/access-key";
+            secret = "${clusterLib.juicefs.appS3Generator volume}/secret-key";
+          };
+          description = "${clusterName}: ${volume}'s JuiceFS volume";
+        }
+      ) (clusterLib.juicefs.volumeApps cfg.clusterApps)
+    )
+    # The state backup's, when it is on this provider. One elsewhere is not ours to make.
+    //
+      lib.optionalAttrs
+        (state != null && (state.target.type or "") == "s3" && state.target.endpoint == os.endpoint)
+        {
+          state_backup = {
+            name = state.target.bucket;
+            versioned = true;
             vars = {
-              access = "cache-s3/access-key";
-              secret = "cache-s3/secret-key";
+              access = "backup-state-target/access-key";
+              secret = "backup-state-target/secret-key";
             };
-            description = "${clusterName}: the binary cache";
+            description = "${clusterName}: the state backup";
           };
         }
-      ) apps
-    );
+    # The binary cache's (modules/kinds/attic.nix), when an app is one.
+    // lib.concatMapAttrs (
+      _: a:
+      lib.optionalAttrs ((a.attic or null) != null && (a.attic.storage.type or "") == "s3") {
+        cache = {
+          name = a.attic.bucket;
+          versioned = false;
+          vars = {
+            access = "cache-s3/access-key";
+            secret = "cache-s3/secret-key";
+          };
+          description = "${clusterName}: the binary cache";
+        };
+      }
+    ) apps
+  );
 
   # What a user may do, in its one bucket. Everything restic and JuiceFS need, deleting
   # an object included (a prune, a file removed), and not `s3:DeleteObjectVersion`: on
@@ -205,7 +222,9 @@ let
   cfResources =
     lib.optionalAttrs (tunneled != { }) {
       # A new tunnel's secret. One made by hand keeps its own: see ignore_changes.
-      random_bytes = lib.mapAttrs' (app: _: lib.nameValuePair "tunnel_${slug app}" { length = 32; }) tunneled;
+      random_bytes = lib.mapAttrs' (
+        app: _: lib.nameValuePair "tunnel_${slug app}" { length = 32; }
+      ) tunneled;
       cloudflare_zero_trust_tunnel_cloudflared = lib.mapAttrs' (
         app: _:
         lib.nameValuePair (slug app) {

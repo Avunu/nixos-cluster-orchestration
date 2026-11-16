@@ -316,15 +316,30 @@ class Agent:
         parent = f"{src.split('/')[0]}/preview"
         return (f"{src}/apps/{self.slot_cfg[name]['app']}", parent, f"{parent}/{name}")
 
+    def in_volume(self, name: str, script: str) -> None:
+        """A shell line with the app's JuiceFS volume mounted: $1 the app's files, $2 the
+        slot's copy of them, inside the same volume. The volume is mounted only while
+        a unit needs it, so the line runs as one that does. Nothing where the app has
+        no files there."""
+        volume = CFG["apps"][self.slot_cfg[name]["app"]].get("volume")
+        if not volume:
+            return
+        run(
+            "systemd-run", "--wait", "--collect", "--quiet", "--pipe",
+            f"--property=Requires={volume['unit']}", f"--property=After={volume['unit']}",
+            f"--setenv=PATH={os.environ.get('PATH', '')}",
+            "--", "/bin/sh", "-c", script, "sh",
+            f"{volume['mount']}/data", f"{volume['mount']}/previews/{name}",
+            timeout=3600,
+        )  # fmt: skip
+
     def unseed(self, name: str) -> None:
         """The slot's copy of everything, gone. The container is stopped first."""
         run("systemctl", "stop", f"container@{name}.service", timeout=START_TIMEOUT)
         _state, _parent, clone = self.clone_names(name)
         if run("zfs", "list", "-H", "-o", "name", clone, check=False).returncode == 0:
             run("zfs", "destroy", clone)
-        files = pathlib.Path(CFG["jfsMount"], "previews", name)
-        if files.exists():
-            run("juicefs", "rmr", str(files), timeout=3600)
+        self.in_volume(name, 'test -e "$2" || exit 0; exec juicefs rmr "$2"')
         # The guest's own root: its journal and whatever else it wrote outside its mounts.
         shutil.rmtree(ROOTS / name, ignore_errors=True)
 
@@ -351,11 +366,7 @@ class Agent:
             "-o", "com.sun:auto-snapshot=false",
             snaps[-1], clone,
         )  # fmt: skip
-        base = pathlib.Path(CFG["jfsMount"], "clients", app)
-        if base.exists():
-            dst = pathlib.Path(CFG["jfsMount"], "previews", name)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            run("juicefs", "clone", str(base), str(dst), timeout=3600)
+        self.in_volume(name, 'test -d "$1" || exit 0; mkdir -p "$(dirname "$2")"; exec juicefs clone "$1" "$2"')
 
     def start(self, name: str, t: tuple[str, int] | None = None) -> None:
         with self.lock:

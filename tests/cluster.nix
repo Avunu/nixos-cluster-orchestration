@@ -305,7 +305,27 @@ pkgs.testers.runNixOSTest {
         with subtest("each replica wrote to the shared volume, and every node sees all three"):
             for n in NODES:
                 for ip in ips.values():
-                    n.wait_until_succeeds(f"grep -qx {ip} /mnt/jfs/probe/{ip}", timeout=120)
+                    n.wait_until_succeeds(f"grep -qx {ip} /mnt/jfs-app/probe/probe/{ip}", timeout=120)
+
+        with subtest("app-volume-own-bucket: probe's files are in its own volume, bucket and database"):
+            mounted = {n.name: n.succeed("findmnt -n -o FSTYPE,SOURCE -M /mnt/jfs-app/probe").strip() for n in NODES}
+            own = wan.execute("find /srv/s3/${topology.objectStorage.juicefsBucket}-probe/probe/chunks -type f | grep -q .")[0] == 0
+            in_shared = node1.execute("test -e /mnt/jfs/probe")[0] == 0
+            dbs = node1.succeed(
+                "PGPASSWORD=$(cat /run/secrets/shared/juicefs-patroni/superuser) psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -Atc"
+                " \"SELECT datname FROM pg_database WHERE datname LIKE 'jfs_%' OR datname = 'juicefs' ORDER BY 1\"").split()
+            # Its role opens its own database and not the cluster volume's.
+            crossed = node1.execute(
+                "PGPASSWORD=$(cat /run/secrets/shared/probe-jfs/pg-password) psql -h 127.0.0.1 -p 5432 -U jfs_probe -d juicefs -Atc 'select 1'")[0] == 0
+            unlabelled = node1.succeed("cat /var/lib/prometheus-node-exporter-text/jfs_encrypted-probe.prom").strip()
+            detail = (f"mounts {mounted}; objects in the app's bucket={own}; a probe directory in the cluster volume={in_shared};"
+                      f" databases {dbs}; probe's role opens the cluster volume's database={crossed}; metric {unlabelled!r}")
+            print(f"app-volume-own-bucket: {detail}")
+            control("app-volume-own-bucket",
+                    all(m.startswith("fuse.juicefs") for m in mounted.values()) and own and not in_shared
+                    and "jfs_probe" in dbs and "juicefs" in dbs and not crossed
+                    and unlabelled == 'cluster_jfs_encrypted{volume="probe"} 1',
+                    detail)
 
         with subtest("containers on different nodes reach each other over the app VLAN"):
             node1.wait_until_succeeds(

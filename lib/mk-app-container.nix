@@ -22,6 +22,7 @@ let
     optionals
     ;
   net = import ./net.nix { inherit lib; };
+  jfs = import ./juicefs.nix { inherit lib; };
   inherit (import ./nomad.nix)
     maxKillTimeoutSeconds
     stopOnClientAfterSeconds
@@ -222,11 +223,18 @@ let
     }
   ) appSecrets;
 
-  # JuiceFS paths: guestPath -> /mnt/jfs/<sub>  (read-write, shared)
+  # The app's own JuiceFS volume, mounted on this node for as long as the container
+  # runs here (modules/storage-juicefs.nix). A preview slot's files are in the
+  # volume of the app it previews, and two apps can name one volume (a WordPress
+  # site's two faces).
+  jfsVolume = jfs.appVolume topology.objectStorage app.juicefsVolume;
+  jfsUnit = "juicefs-mount${jfsVolume.suffix}.service";
+
+  # JuiceFS paths: guestPath -> <the volume's mount>/<sub>  (read-write)
   jfsMounts = mapAttrs' (
     guest: sub:
     nameValuePair guest {
-      hostPath = "/mnt/jfs/${sub}";
+      hostPath = "${jfsVolume.mountPoint}/${sub}";
       isReadOnly = false;
     }
   ) app.juicefsPaths;
@@ -252,7 +260,7 @@ let
   # Bind-mount sources must exist before nspawn starts. tmpfiles can't order
   # after the JuiceFS service mount, so create them in ExecStartPre instead.
   bindSources =
-    (map (sub: "/mnt/jfs/${sub}") (builtins.attrValues app.juicefsPaths))
+    (map (sub: "${jfsVolume.mountPoint}/${sub}") (builtins.attrValues app.juicefsPaths))
     ++ optionals (!isPreview) (builtins.attrValues app.localState)
     # A slot's local state is a ZFS clone the agent mounts. Made here instead, it
     # would be an empty directory on the root dataset that the database then
@@ -624,11 +632,11 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
       config.containers.${n}.path
       config.environment.etc."nixos-containers/${n}.conf".source
     ];
-    after = optionals usesJfs [ "jfs-health.service" ];
-    requires = optionals usesJfs [ "jfs-health.service" ];
-    # A client that ends leaves a dead mount under the container's binds: the
-    # container goes with it, and Nomad starts the app again.
-    bindsTo = optionals usesJfs [ "juicefs-mount.service" ];
+    # BindsTo, not Requires: a client that ends leaves a dead mount under the
+    # container's binds, and the container has to go with it (Nomad starts the app
+    # again, and with it the mount).
+    after = optionals usesJfs [ jfsUnit ];
+    bindsTo = optionals usesJfs [ jfsUnit ];
     serviceConfig = {
       ExecStartPre = [
         "${pkgs.coreutils}/bin/rm -f ${degradedMarker}"
