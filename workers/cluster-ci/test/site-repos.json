@@ -1,5 +1,5 @@
 {
-  "comment": "One site, and the repositories it uses. The Worker (src/access.js, siteRepos) and avc (tools/avc/avc/flows/ci.py, site_repos) are both held to `expect`, so the operator's listing and the Worker's tokens name the same set.",
+  "comment": "One site, and the repositories it uses. The Worker (src/access.ts, siteRepos) and avc (tools/avc/avc/flows/ci.py, site_repos) are both held to `expect`, so the operator's listing and the Worker's tokens name the same set.",
   "site": "acme/cluster",
   "lock": {
     "root": "root",

@@ -1,6 +1,6 @@
 # cluster-ci — deploy: see README "Previews and continuous deployment".
 name = "cluster-ci"
-main = "src/index.js"
+main = "src/index.ts"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
@@ -27,7 +27,7 @@ GITHUB_APP_ID = "REPLACE_WITH_THE_APP_ID"
 # The site's repository, exactly as topology.deploy.flakeUrl: `github:OWNER/name`, or
 # `github:OWNER/name/branch`. The App is public, so this, and not what installs it or
 # what a node reports, says whose pushes deploy and which repositories the nodes may
-# read (src/access.js). Without it nothing deploys and no node gets a token.
+# read (src/access.ts). Without it nothing deploys and no node gets a token.
 SITE_FLAKE = "github:OWNER/my-cluster"
 # The workflow in the site's repository that updates flake.lock (templates/cluster).
 FLAKE_UPDATE_WORKFLOW = "flake-update.yml"

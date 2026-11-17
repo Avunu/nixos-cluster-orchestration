@@ -1,18 +1,20 @@
-// What a node may read at GitHub (src/access.js), and what a stranger's installation of
+// What a node may read at GitHub (src/access.ts), and what a stranger's installation of
 // the public App causes: nothing.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { FLOOR_LEFT_MS, MIN_LEFT_MS, PERMISSIONS, githubRepo, siteRepos } from "../src/access.js";
-import { GitHub } from "../src/github.js";
-import { handle } from "../src/http.js";
-import { SITE, harness } from "./harness.js";
+import { FLOOR_LEFT_MS, MIN_LEFT_MS, PERMISSIONS, githubRepo, siteRepos } from "../src/access.ts";
+import type { FlakeLock, TokensAnswer } from "../src/access.ts";
+import { GitHub } from "../src/github.ts";
+import { handle } from "../src/http.ts";
+import { SITE, harness } from "./harness.ts";
+import type { Harness } from "./harness.ts";
 
 const MIN = 60 * 1000;
 const ENV = { AGENT_TOKENS: JSON.stringify({ "tok-1": "node1" }), GITHUB_WEBHOOK_SECRET: "hook" };
 
-const ask = (h, { token = "tok-1", body = {} } = {}) =>
+const ask = (h: Harness, { token = "tok-1", body = {} }: { token?: string | null; body?: unknown } = {}) =>
   handle(
     new Request("https://ci.example.com/agent/token", {
       method: "POST",
@@ -30,7 +32,7 @@ test("only a node's own bearer token is answered, and nothing it says is read", 
   assert.deepEqual(h.calls, []);
   const res = await ask(h, { body: { repositories: ["mallory/secret"], site: "mallory/cluster", permissions: { contents: "write" } } });
   assert.equal(res.status, 200);
-  const got = await res.json();
+  const got = (await res.json()) as TokensAnswer;
   assert.equal(got.site, SITE);
   assert.deepEqual(
     got.tokens.map((t) => t.repositories),
@@ -71,7 +73,12 @@ test("the token is narrowed by GitHub: read-only, and the site's repositories of
 });
 
 test("the set is the site, its lock's github.com repositories and its github-repos.json", () => {
-  const f = JSON.parse(readFileSync(new URL("./site-repos.json", import.meta.url)));
+  const f = JSON.parse(readFileSync(new URL("./site-repos.json", import.meta.url))) as {
+    site: string;
+    lock: FlakeLock;
+    extra: string[];
+    expect: string[];
+  };
   assert.deepEqual(siteRepos(f.site, f.lock, f.extra), f.expect);
   assert.deepEqual(siteRepos("acme/cluster", {}, undefined), ["acme/cluster"]);
   assert.equal(githubRepo({ type: "github", owner: "a", repo: "b" }), "a/b");
@@ -120,7 +127,7 @@ test("a stranger's installation of the public App causes nothing", async () => {
   await h.agent();
   assert.equal(await h.push("mallory/secret"), "ignored: not a repository of this site");
   assert.equal(await h.pr("opened", { repo: "mallory/secret" }), "ignored: no app previews this repository");
-  const hook = (event, extra) => h.pipeline.webhook(event, { repository: { full_name: "mallory/secret" }, ...extra });
+  const hook = (event: string, extra: object) => h.pipeline.webhook(event, { repository: { full_name: "mallory/secret" }, ...extra });
   assert.equal(await hook("delete", { ref_type: "branch", ref: "feat-x" }), "ignored");
   assert.equal(
     await hook("issue_comment", { action: "created", issue: { number: 7, pull_request: {} }, comment: { body: "/preview reset", author_association: "OWNER" } }),
@@ -128,8 +135,8 @@ test("a stranger's installation of the public App causes nothing", async () => {
   );
   assert.equal(await h.pipeline.webhook("installation_repositories", { action: "added", installation: { id: 66 } }), "noted");
   assert.deepEqual(h.calls, []);
-  assert.deepEqual(h.stored.state.previews, {});
-  assert.equal(h.stored.state.deploySeq, 0);
+  assert.deepEqual(h.stored.state!.previews, {});
+  assert.equal(h.stored.state!.deploySeq, 0);
 
   // Even when a node says one of its apps previews the stranger's repository: what
   // the site uses is read from the site, not from a node.
@@ -138,7 +145,7 @@ test("a stranger's installation of the public App causes nothing", async () => {
   assert.deepEqual(h.of("tunnel"), []);
   assert.deepEqual(h.of("comment"), []);
   assert.deepEqual(h.of("dispatch"), []);
-  assert.deepEqual(h.stored.state.previews, {});
+  assert.deepEqual(h.stored.state!.previews, {});
 });
 
 test("a node's report of its flake does not say which repository is the site's", async () => {
@@ -157,26 +164,26 @@ test("a node's report of its flake does not say which repository is the site's",
   assert.equal(await bare.push(SITE), "ignored: SITE_FLAKE is not set");
   const res = await ask(bare);
   assert.equal(res.status, 502);
-  assert.match((await res.json()).error, /SITE_FLAKE/);
+  assert.match(((await res.json()) as { error: string }).error, /SITE_FLAKE/);
   assert.deepEqual(bare.calls, []);
 });
 
 test("a token is minted once and handed out until it has under half an hour left", async () => {
   const h = harness();
-  const first = (await h.pipeline.tokens()).tokens[0];
+  const first = (await h.pipeline.tokens()).tokens[0]!;
   h.clock.t += 20 * MIN;
-  assert.deepEqual((await h.pipeline.tokens()).tokens[0], first);
+  assert.deepEqual((await h.pipeline.tokens()).tokens[0]!, first);
   h.clock.t += 10 * MIN - 1;
-  assert.deepEqual((await h.pipeline.tokens()).tokens[0], first);
+  assert.deepEqual((await h.pipeline.tokens()).tokens[0]!, first);
   assert.equal(h.of("mint").length, 1);
   // Thirty minutes left is the last it is handed out with.
   h.clock.t += 2;
-  const second = (await h.pipeline.tokens()).tokens[0];
+  const second = (await h.pipeline.tokens()).tokens[0]!;
   assert.equal(second.token, "ghs_1_2");
   assert.equal(h.of("mint").length, 2);
   for (const t of [first, second]) assert.ok(Date.parse(t.expires_at) - h.clock.t >= MIN_LEFT_MS - 2);
   // Kept in storage, so a Durable Object that was put to sleep does not mint again.
-  assert.equal(h.stored.access.tokens["acme#1"].token, "ghs_1_2");
+  assert.equal(h.stored.access!.tokens["acme#1"]!.token, "ghs_1_2");
 });
 
 test("GitHub refusing a new token leaves the old one, down to a quarter of an hour", async () => {
@@ -185,36 +192,36 @@ test("GitHub refusing a new token leaves the old one, down to a quarter of an ho
   h.fail.mint = true;
   h.clock.t += 60 * MIN - FLOOR_LEFT_MS;
   const held = await h.pipeline.tokens();
-  assert.equal(held.tokens[0].token, "ghs_1_1");
+  assert.equal(held.tokens[0]!.token, "ghs_1_1");
   assert.deepEqual(held.errors.map((e) => e.owner), ["acme"]);
   h.clock.t += 1;
   const gone = await h.pipeline.tokens();
   assert.deepEqual(gone.tokens, []);
-  assert.match(gone.errors[0].error, /HTTP 500/);
+  assert.match(gone.errors[0]!.error, /HTTP 500/);
   h.fail.mint = false;
-  assert.equal((await h.pipeline.tokens()).tokens[0].token, "ghs_1_2");
+  assert.equal((await h.pipeline.tokens()).tokens[0]!.token, "ghs_1_2");
 });
 
 test("the set follows the site's branch: at its push, and every few minutes without one", async () => {
   const h = harness();
   await h.pipeline.tokens();
   const more = structuredClone(h.state.lock);
-  more.nodes.extra = { locked: { type: "github", owner: "acme", repo: "addons" } };
+  more.nodes!.extra = { locked: { type: "github", owner: "acme", repo: "addons" } };
   h.state.lock = more;
   // Not read again on every question.
   h.calls.length = 0;
-  assert.deepEqual((await h.pipeline.tokens()).tokens[0].repositories, ["acme/cluster", "acme/other", "acme/shop"]);
+  assert.deepEqual((await h.pipeline.tokens()).tokens[0]!.repositories, ["acme/cluster", "acme/other", "acme/shop"]);
   assert.deepEqual(h.calls, []);
   // The merge is a push to the site's branch.
   assert.equal(await h.push(SITE), "deploy");
   const got = await h.pipeline.tokens();
-  assert.deepEqual(got.tokens[0].repositories, ["acme/addons", "acme/cluster", "acme/other", "acme/shop"]);
+  assert.deepEqual(got.tokens[0]!.repositories, ["acme/addons", "acme/cluster", "acme/other", "acme/shop"]);
   // A token names its repositories, so a new set is a new token.
-  assert.equal(got.tokens[0].token, "ghs_1_2");
+  assert.equal(got.tokens[0]!.token, "ghs_1_2");
   // A repository that left the site leaves the next token, with no push heard of.
   h.state.lock = { root: "root", nodes: {} };
   h.clock.t += 5 * MIN;
-  assert.deepEqual((await h.pipeline.tokens()).tokens[0].repositories, ["acme/cluster"]);
+  assert.deepEqual((await h.pipeline.tokens()).tokens[0]!.repositories, ["acme/cluster"]);
 });
 
 test("GitHub being away keeps the set that was read, and a set never read is an error", async () => {
@@ -222,14 +229,14 @@ test("GitHub being away keeps the set that was read, and a set never read is an 
   h.fail.site = true;
   const res = await ask(h);
   assert.equal(res.status, 502);
-  assert.match((await res.json()).error, /could not be read/);
+  assert.match(((await res.json()) as { error: string }).error, /could not be read/);
   assert.equal(await h.push("acme/shop"), "error");
   h.fail.site = false;
   await h.pipeline.tokens();
   h.fail.site = true;
   h.clock.t += 10 * MIN;
-  const got = await (await ask(h)).json();
-  assert.deepEqual(got.tokens[0].repositories, ["acme/cluster", "acme/other", "acme/shop"]);
+  const got = (await (await ask(h)).json()) as TokensAnswer;
+  assert.deepEqual(got.tokens[0]!.repositories, ["acme/cluster", "acme/other", "acme/shop"]);
 });
 
 test("what the App asks of GitHub for a narrowed token", async () => {
@@ -239,7 +246,7 @@ test("what the App asks of GitHub for a narrowed token", async () => {
     ["sign"],
   );
   const pem = `-----BEGIN PRIVATE KEY-----\n${Buffer.from(await crypto.subtle.exportKey("pkcs8", privateKey)).toString("base64")}\n-----END PRIVATE KEY-----`;
-  const seen = [];
+  const seen: [string, string, unknown, string][] = [];
   const gh = new GitHub({
     appId: 42,
     privateKey: pem,
@@ -272,5 +279,5 @@ test("what the App asks of GitHub for a narrowed token", async () => {
   );
   // As the App, with one signature for all of it.
   assert.equal(new Set(seen.map((s) => s[3])).size, 1);
-  assert.equal(seen[0][3].split(".").length, 3);
+  assert.equal(seen[0]![3].split(".").length, 3);
 });

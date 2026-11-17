@@ -1,0 +1,23 @@
+{
+  // Type-checking only: wrangler bundles the sources itself, and the tests run on them
+  // directly (Node strips the types), so nothing here is ever emitted.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    // What a Worker has. No DOM, and no @types/* (the check has no npm): the Workers
+    // runtime is src/workers.d.ts and what the tests use of Node is test/node.d.ts.
+    "lib": ["ES2022", "WebWorker"],
+    "types": [],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    // Only syntax that disappears when the types are removed: no enums, namespaces or
+    // parameter properties, since Node runs these files by removing the types.
+    "erasableSyntaxOnly": true
+  },
+  "include": ["src", "test"]
+}

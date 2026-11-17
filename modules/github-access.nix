@@ -7,7 +7,7 @@
 # Worker, with the per-node bearer token of the pipeline's agent (`ci/token`), and is
 # handed installation tokens that GitHub itself has narrowed: read-only, the
 # repositories the site uses, one hour. Which repositories those are is read by the
-# Worker from the site's repository, never from the node (src/access.js there, and
+# Worker from the site's repository, never from the node (src/access.ts there, and
 # lib/github-repos.nix for the ones no lock names).
 #
 # So what a stolen node can reach at GitHub is what it could already read, for at most

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { nodeFor } from "../src/auth.js";
-import { parseFlakeUrl, renderComment, trackingInputs } from "../src/core.js";
-import { GitHub, pemToPkcs8, verifySignature } from "../src/github.js";
-import { previewHost, previewLabel } from "../src/slug.js";
+import { nodeFor } from "../src/auth.ts";
+import { parseFlakeUrl, renderComment, trackingInputs } from "../src/core.ts";
+import { GitHub, pemToPkcs8, verifySignature } from "../src/github.ts";
+import { previewHost, previewLabel } from "../src/slug.ts";
 
-import { REPO, SITE, harness } from "./harness.js";
+import { handle } from "../src/http.ts";
+import { REPO, SITE, harness } from "./harness.ts";
 
 test("a pull request becomes one preview with its own tunnel, hostname, comment and status", async () => {
   const h = harness();
@@ -14,7 +15,7 @@ test("a pull request becomes one preview with its own tunnel, hostname, comment 
   assert.deepEqual(h.of("tunnel"), [["tunnel", "preview-feat-x-shop"]]);
   assert.deepEqual(h.of("dns"), [["dns", "feat-x-shop.preview.example.com", "t1"]]);
   assert.deepEqual(h.of("status").at(-1), ["status", REPO, "a".repeat(40), "pending", "preview/shop"]);
-  assert.match(h.of("comment")[0][4], /https:\/\/feat-x-shop\.preview\.example\.com/);
+  assert.match(h.of("comment")[0]![4], /https:\/\/feat-x-shop\.preview\.example\.com/);
 
   const want = await h.agent();
   assert.deepEqual(want.previews, [
@@ -32,11 +33,11 @@ test("a push to the branch moves the same preview, and edits the same comment", 
   await h.pr("opened");
   await h.pr("synchronize", { sha: "b".repeat(40) });
   assert.equal(h.of("tunnel").length, 1);
-  assert.equal(Object.keys(h.stored.state.previews).length, 1);
+  assert.equal(Object.keys(h.stored.state!.previews).length, 1);
   const [first, second] = h.of("comment");
-  assert.equal(first[3], null);
-  assert.equal(second[3], 101);
-  assert.equal((await h.agent()).previews[0].sha, "b".repeat(40));
+  assert.equal(first![3], null);
+  assert.equal(second![3], 101);
+  assert.equal((await h.agent()).previews[0]!.sha, "b".repeat(40));
 });
 
 test("every node offers the app, and each branch goes to the node with fewer previews", async () => {
@@ -46,7 +47,7 @@ test("every node offers the app, and each branch goes to the node with fewer pre
   await h.pr("opened", { number: 1, ref: "one" });
   await h.pr("opened", { number: 2, ref: "two" });
   await h.pr("synchronize", { number: 1, ref: "one", sha: "b".repeat(40) });
-  const on = async (node) => (await h.agent([], 0, node)).previews.map((p) => `${p.branch}@${p.sha[0]}`);
+  const on = async (node: string) => (await h.agent([], 0, node)).previews.map((p) => `${p.branch}@${p.sha[0]}`);
   // A tie goes to the first name; the second branch to the other node; a push moves nothing.
   assert.deepEqual(await on("node1"), ["one@b"]);
   assert.deepEqual(await on("node2"), ["two@a"]);
@@ -71,7 +72,7 @@ test("the node's report reaches the pull request, but not one about an earlier c
   assert.deepEqual(h.calls, []);
   await h.agent([{ id: "shop/feat-x", sha: "b".repeat(40), seed: 1, state: "failed", detail: "error: build ```failed" }]);
   assert.deepEqual(h.of("status"), [["status", REPO, "b".repeat(40), "failure", "preview/shop"]]);
-  assert.match(h.of("comment")[0][4], /Failed[\s\S]*error: build '''failed/);
+  assert.match(h.of("comment")[0]![4], /Failed[\s\S]*error: build '''failed/);
   // The same report again changes nothing.
   h.calls.length = 0;
   await h.agent([{ id: "shop/feat-x", sha: "b".repeat(40), seed: 1, state: "failed", detail: "error: build ```failed" }]);
@@ -93,7 +94,7 @@ test("closing the last pull request removes the preview once the node has let go
   await h.agent([]);
   assert.deepEqual(h.of("undns"), [["undns", "d-t1"]]);
   assert.deepEqual(h.of("untunnel"), [["untunnel", "t1"]]);
-  assert.deepEqual(h.stored.state.previews, {});
+  assert.deepEqual(h.stored.state!.previews, {});
 });
 
 test("deleting the branch releases it whatever pull requests it had", async () => {
@@ -108,7 +109,7 @@ test("a hostname that could not be made fails the preview, and the next push tri
   const h = harness({ failTunnel: true });
   await h.agent();
   await h.pr("opened");
-  assert.equal(h.of("status").at(-1)[3], "failure");
+  assert.equal(h.of("status").at(-1)![3], "failure");
   assert.deepEqual((await h.agent()).previews, []);
 });
 
@@ -116,7 +117,7 @@ test("/preview reset asks for a fresh copy, from a collaborator only", async () 
   const h = harness();
   await h.agent();
   await h.pr("opened");
-  const say = (author_association, body = " /preview reset\n") =>
+  const say = (author_association: string, body = " /preview reset\n") =>
     h.pipeline.webhook("issue_comment", {
       action: "created",
       repository: { full_name: REPO },
@@ -126,13 +127,13 @@ test("/preview reset asks for a fresh copy, from a collaborator only", async () 
   assert.equal(await say("NONE"), "ignored: not a collaborator");
   assert.equal(await say("MEMBER", "please /preview reset"), "ignored");
   assert.equal(await say("COLLABORATOR"), "reset");
-  assert.equal((await h.agent()).previews[0].seed, 2);
+  assert.equal((await h.agent()).previews[0]!.seed, 2);
 });
 
 test("a push to the branch the nodes rebuild from tells them at once", async () => {
   const h = harness();
   const first = await h.agent();
-  const push = (repo, ref) =>
+  const push = (repo: string, ref: string) =>
     h.pipeline.webhook("push", { ref, repository: { full_name: repo, default_branch: "main" } });
   assert.equal(await push(SITE, "refs/heads/topic"), "ignored");
   assert.equal(await push(SITE, "refs/tags/v1"), "ignored");
@@ -145,7 +146,7 @@ test("a push to the branch the nodes rebuild from tells them at once", async () 
 test("a push to a branch the site's lock follows starts the site's lock update", async () => {
   const h = harness();
   await h.agent();
-  const push = (ref) => h.pipeline.webhook("push", { ref, repository: { full_name: REPO, default_branch: "main" } });
+  const push = (ref: string) => h.pipeline.webhook("push", { ref, repository: { full_name: REPO, default_branch: "main" } });
   assert.equal(await push("refs/heads/feat-x"), "ignored");
   assert.equal(await push("refs/heads/main"), "update shop");
   assert.deepEqual(h.of("dispatch"), [["dispatch", SITE, "flake-update.yml", "main", { inputs: "shop" }]]);
@@ -222,7 +223,7 @@ test("the App signs in with the key as GitHub hands it out, and keeps the token"
   const pem1 = createPrivateKey(pem8).export({ type: "pkcs1", format: "pem" });
   assert.deepEqual(Buffer.from(pemToPkcs8(pem1)), pkcs8);
 
-  const seen = [];
+  const seen: [string, string, string][] = [];
   const gh = new GitHub({
     appId: 42,
     privateKey: pem1.replace(/\n/g, "\\n"),
@@ -241,9 +242,67 @@ test("the App signs in with the key as GitHub hands it out, and keeps the token"
     "POST /repos/acme/shop/issues/7/comments",
     "POST /repos/acme/shop/statuses/abc",
   ]);
-  assert.equal(seen[2][2], "Bearer ghs_x");
-  const [head, claims, sig] = seen[0][2].slice("Bearer ".length).split(".");
-  const fromB64 = (s) => Buffer.from(s, "base64url");
-  assert.deepEqual(JSON.parse(fromB64(claims)), { iat: 1_700_000_000 - 60, exp: 1_700_000_000 + 540, iss: "42" });
-  assert.ok(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", publicKey, fromB64(sig), Buffer.from(`${head}.${claims}`)));
+  assert.equal(seen[2]![2], "Bearer ghs_x");
+  const [head, claims, sig] = seen[0]![2].slice("Bearer ".length).split(".");
+  const fromB64 = (s: string) => Buffer.from(s, "base64url");
+  assert.deepEqual(JSON.parse(fromB64(claims!)), { iat: 1_700_000_000 - 60, exp: 1_700_000_000 + 540, iss: "42" });
+  assert.ok(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", publicKey, fromB64(sig!), Buffer.from(`${head}.${claims}`)));
+});
+
+test("a node's report of a state that is not one of ours changes nothing", async () => {
+  const h = harness();
+  await h.agent();
+  await h.pr("opened");
+  const before = h.calls.length;
+  // Names every object answers `in` for, which are no state of a preview.
+  for (const state of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    await h.agent([{ id: "shop/feat-x", sha: "a".repeat(40), seed: 1, state, detail: "x" }]);
+  }
+  assert.equal(h.stored.state!.previews["shop/feat-x"]!.state, "queued");
+  assert.equal(h.calls.length, before);
+});
+
+test("a delivery without the fields its event is read by is passed over", async () => {
+  const h = harness();
+  await h.agent();
+  for (const event of ["pull_request", "push", "delete", "issue_comment"]) {
+    for (const payload of [null, 7, "x", [], {}, { repository: null }, { repository: {} }, { repository: { full_name: 7 } }]) {
+      assert.equal(await h.pipeline.webhook(event, payload), "ignored: malformed", `${event} ${JSON.stringify(payload)}`);
+    }
+  }
+  const repository = { full_name: REPO, default_branch: "main" };
+  assert.equal(await h.pipeline.webhook("pull_request", { action: "opened", repository }), "ignored: malformed");
+  assert.equal(await h.pipeline.webhook("pull_request", { action: "opened", repository, pull_request: {} }), "ignored: malformed");
+  assert.equal(await h.pipeline.webhook("issue_comment", { action: "created", repository, issue: {} }), "ignored: malformed");
+  assert.deepEqual(h.of("tunnel"), []);
+  // And a well-formed one still does what it did.
+  assert.equal(await h.pr("opened"), "preview");
+});
+
+test("a body that is not what its endpoint reads is refused, not thrown on", async () => {
+  const h = harness();
+  const env = { AGENT_TOKENS: JSON.stringify({ "tok-1": "node1" }), GITHUB_WEBHOOK_SECRET: "hook" };
+  const post = (path: string, body: string, headers: Record<string, string>) =>
+    handle(new Request(`https://ci.example.com${path}`, { method: "POST", headers, body }), env, h.pipeline);
+  for (const body of ["null", "7", '"x"', "[]", "{", ""]) {
+    const res = await post("/agent/sync", body, { Authorization: "Bearer tok-1" });
+    assert.equal(res.status, 400, `sync ${body}`);
+  }
+  const ok = await post("/agent/sync", JSON.stringify({ version: 0, flake: `github:${SITE}`, apps: [], previews: [] }), { Authorization: "Bearer tok-1" });
+  assert.equal(ok.status, 200);
+
+  const sign = async (body: string) => {
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode("hook"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
+    return "sha256=" + [...mac].map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
+  const bad = await post("/webhook/github", "{", { "X-GitHub-Event": "push", "X-Hub-Signature-256": await sign("{") });
+  assert.equal(bad.status, 400);
+  const empty = await post("/webhook/github", "{}", { "X-GitHub-Event": "push", "X-Hub-Signature-256": await sign("{}") });
+  assert.deepEqual(await empty.json(), { ok: true, result: "ignored: malformed" });
+});
+
+test("a Worker without the App's key says which secret is missing", async () => {
+  const gh = new GitHub({ appId: 42, privateKey: undefined as unknown as string, fetch: async () => { throw new Error("not reached"); } });
+  await assert.rejects(gh.appJwt(), /GITHUB_APP_PRIVATE_KEY is not set/);
 });
