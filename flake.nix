@@ -38,12 +38,10 @@
     # TPM identity and hands over the partitioning secrets. Not part of what a node
     # boots, so not in the boot stack.
     #
-    # LOCAL PATH: the branch with `hostAttr`, `diskName = null`, `questionnaire` and
-    # `preInstall` is not pushed yet. Once it is, this becomes
-    # github:Avunu/nixos-install-helper (pinned by rev, like the inputs above) and the
-    # lock is updated; until then this flake only locks on the machine that has it.
+    # Pinned to the feat/cluster-install branch (Avunu/nixos-install-helper#22) until
+    # it merges; then pin a rev of its main.
     nixos-install-helper = {
-      url = "git+file:///home/batonac/Development/nix-dev/projects/nixos-install-helper?ref=feat/cluster-install";
+      url = "github:Avunu/nixos-install-helper/98fa82e98815d64ac6f19322d799cec830108a8a";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.disko.follows = "disko";
     };

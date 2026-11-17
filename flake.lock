@@ -1433,16 +1433,16 @@
       "locked": {
         "lastModified": 1794884833,
         "narHash": "sha256-Gnd7Qr1JOV+2HUbPtTwXQnreFmBZwo+pNy9WhAnoee8=",
-        "ref": "feat/cluster-install",
+        "owner": "Avunu",
+        "repo": "nixos-install-helper",
         "rev": "98fa82e98815d64ac6f19322d799cec830108a8a",
-        "revCount": 64,
-        "type": "git",
-        "url": "file:///home/batonac/Development/nix-dev/projects/nixos-install-helper"
+        "type": "github"
       },
       "original": {
-        "ref": "feat/cluster-install",
-        "type": "git",
-        "url": "file:///home/batonac/Development/nix-dev/projects/nixos-install-helper"
+        "owner": "Avunu",
+        "repo": "nixos-install-helper",
+        "rev": "98fa82e98815d64ac6f19322d799cec830108a8a",
+        "type": "github"
       }
     },
     "nixpkgs": {
