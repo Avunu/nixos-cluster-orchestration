@@ -14,7 +14,7 @@ It runs here and nowhere else:
     removed when the script ends, however it ends. A machine with neither is refused:
     plaintext is never written to a disk.
   * under bubblewrap: no network, a new PID, IPC and user namespace, an empty
-    environment, the Nix store read-only, $in and $prompts read-only, and $out the one
+    environment, a user of its own, the Nix store read-only, $in and $prompts read-only, and $out the one
     place it can write that outlives it.
   * and then held to its declaration: every declared file, as a regular file, and
     nothing else.
@@ -215,6 +215,9 @@ def _replace(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+SANDBOX_UID = 1000
+
+
 def sandbox_argv(script: str, work: Path) -> list[str]:
     """A generator's command line: its script, with nothing of this machine but the Nix
     store, and no network."""
@@ -222,7 +225,11 @@ def sandbox_argv(script: str, work: Path) -> list[str]:
     if os.environ.get(SANDBOX_ENV) == "none":
         return ["env", "-i", *(f"{k}={v}" for k, v in env.items()), "HOME=/var/empty", script]
     argv = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv"]
+    argv += ["--uid", str(SANDBOX_UID), "--gid", str(SANDBOX_UID)]
     argv += ["--ro-bind", "/nix/store", "/nix/store", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    # ssh-keygen and its like ask who they are.
+    for name in ("passwd", "group"):
+        argv += ["--ro-bind", str(work / name), f"/etc/{name}"]
     if not script.startswith("/nix/store/"):
         argv += ["--ro-bind", script, script]
     argv += ["--dir", str(work)]
@@ -632,6 +639,8 @@ class Store:
             out, inputs, prompts = work / "out", work / "in", work / "prompts"
             for d in (out, inputs, prompts):
                 d.mkdir(mode=0o700)
+            (work / "passwd").write_text(f"generator:x:{SANDBOX_UID}:{SANDBOX_UID}::/tmp:/bin/sh\n")
+            (work / "group").write_text(f"generator:x:{SANDBOX_UID}:\n")
             for name, value in answers.items():
                 _private(prompts / name, value.encode())
             for dep in deps:

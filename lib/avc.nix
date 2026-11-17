@@ -49,6 +49,7 @@ python.pkgs.buildPythonApplication {
     pkgs.git
     pkgs.age
     pkgs.bubblewrap
+    pkgs.openssh
   ];
 
   # A site with real ciphertext and what agenix-rekey made of it: the runner's names for

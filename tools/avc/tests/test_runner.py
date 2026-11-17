@@ -388,11 +388,12 @@ def test_the_sandbox_has_no_network_no_environment_and_one_place_to_write(site, 
     monkeypatch.setenv("LEAKED", "from-the-operators-shell")
     body = "\n".join([
         'grep -c : /proc/net/dev > "$out/interfaces"',
+        'id -u > "$out/uid"; ssh-keygen -q -t ed25519 -N "" -f /tmp/k 2>/dev/null && echo yes > "$out/has-a-name" || echo no > "$out/has-a-name"',
         'echo "${LEAKED:-unset}" > "$out/env"',
         '(echo x > "$in/ca/cert") 2>/dev/null && echo yes > "$out/wrote-in" || echo no > "$out/wrote-in"',
         '(ls /home /root /etc) >/dev/null 2>&1 && echo yes > "$out/sees-host" || echo no > "$out/sees-host"',
     ])
-    files = {n: {"secret": False} for n in ("interfaces", "env", "wrote-in", "sees-host")}
+    files = {n: {"secret": False} for n in ("interfaces", "env", "wrote-in", "sees-host", "uid", "has-a-name")}
     export = site.export()
     for m in export:
         export[m]["generators"]["probe"] = declare(site.root, m, "probe", files, deps=["ca"], body=body)
@@ -400,8 +401,10 @@ def test_the_sandbox_has_no_network_no_environment_and_one_place_to_write(site, 
     with ui.scripted([]):
         store.run(store.plan([("node1", "ca"), ("node1", "probe")], regenerate=True))
     got = {n: (site.root / f"secrets/per-machine/node1/probe/{n}").read_text().strip() for n in files}
-    # Loopback and nothing else; nothing of the operator's shell; $in read-only; no host files.
-    assert got == {"interfaces": "1", "env": "unset", "wrote-in": "no", "sees-host": "no"}
+    # Loopback and nothing else; nothing of the operator's shell; $in read-only; no host
+    # files; a user of its own, with a passwd entry (ssh-keygen refuses to run without one).
+    has_name = "yes" if shutil.which("ssh-keygen") else "no"
+    assert got == {"interfaces": "1", "env": "unset", "wrote-in": "no", "sees-host": "no", "uid": "1000", "has-a-name": has_name}
 
 
 # ── values ───────────────────────────────────────────────────────────────────
