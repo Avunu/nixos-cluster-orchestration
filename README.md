@@ -198,7 +198,7 @@ Other exports:
 
 Three things are easy to get wrong:
 
-- **`nix flake check --no-build` evaluates read-only.** agenix-rekey reads a node's rekeyed files through a copy of their directory in the store, which a read-only run never makes (`error: path '/nix/store/…' is not valid`), so that command fails on a flake whose rekeyed files no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures have no recipients and pass `directory` as a string to stay clear of it.
+- **`nix flake check --no-build` evaluates read-only.** agenix-rekey reads a node's rekeyed files through a copy of their directory in the store, which a read-only run never makes (`error: path '/nix/store/…' is not valid`), so that command fails on a flake whose rekeyed files no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures have no recipients and pass `directory` as a string to stay clear of it; `checks.secrets-tpm` and `checks.secrets` read a site that does have them.
 - **Flakes only see tracked files.** Run `git add` on new apps, secrets and rekeyed files before you evaluate.
 - **A rekeyed file that is missing stops the build.** A node with a recipient whose secret was added or changed and not rekeyed fails to evaluate, with agenix-rekey's "please run `agenix rekey`". A node with no recipient yet evaluates with placeholders that decrypt nowhere, and a warning.
 
@@ -879,7 +879,7 @@ The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (
 
 **New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, agenix, agenix-rekey, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
 
-Bump `agenix` and `agenix-rekey` alone, each as one reviewable commit: they decide what every node decrypts at activation. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
+Bump `agenix` and `agenix-rekey` alone, each as one reviewable commit: they decide what every node decrypts at activation, and `checks.secrets-tpm` is what runs them for real. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
 
 ### Previews and continuous deployment
 
@@ -1218,7 +1218,7 @@ This version is written for fresh installs. A cluster running an earlier version
 
 Everything runs against the **fixture cluster** in [`tests/fixtures`](tests/fixtures), which is built through `mkCluster` the way a consumer's is. Its public addresses are documentation-only (RFC 5737, RFC 3849) and its names are under `example.com` and `example.net`. Its internal VLANs are RFC 1918, because the documentation ranges have no /16 to split into per-node subnets. It has `node1` with every role, placeholders `node2` and `node3`, and neutral apps of every kind, with stub packages for Odoo and Frappe. Every fixture node opts out of boot security, because a VM test of a cluster has no TPM; the `boot-*` checks install and boot the encrypted layout themselves, and `tests/fixtures/secure` is node1 with boot security on, evaluated by `security-policy` and `boot-closure`.
 
-No secret is committed. `tests/fixtures/secrets` holds placeholders that are not ciphertext, because a secret with no file is not given to a node and `lib/mk-app-container.nix` asserts that every secret an app mounts exists. `tests/fixtures/update-secrets.sh` regenerates them after you add a fixture app or change a generator.
+No secret is committed. `tests/fixtures/secrets` holds placeholders that are not ciphertext, because a secret with no file is not given to a node and `lib/mk-app-container.nix` asserts that every secret an app mounts exists. `tests/fixtures/agenix` is the exception that proves nothing: real ciphertext for `checks.secrets-tpm`, with its master key and its software TPM's state beside it in the clear. `tests/fixtures/update-secrets.sh` regenerates them after you add a fixture app or change a generator.
 
 ```sh
 nix build -L .#checks.x86_64-linux.<name>        # one check
@@ -1262,6 +1262,8 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `jfs-encrypted` | The JuiceFS volume is encrypted; a plaintext one is refused at format and at mount; restore works with the key, only with the key, and from the offline kit alone; stale dumps, interrupted loads, S3 key rotation. |
 | `canary-scan` | Per class: plant the canary, scan, found; remove it, scan, not found. Swap plain against dm-crypt, a plaintext bucket against an encrypted one, a real compressed core a grep can't see into. |
 | `container-tunnel` | The generated container, tunnel and firewall wiring. |
+| `secrets` | What a node is given of the site's secrets and what it is not (an operator's, an install-time one), each at the path the modules read; what the gate holds and what it must not; a node with a recipient and an unrekeyed secret does not evaluate. Evaluation only. |
+| `secrets-tpm` | The real path, in VMs with a software TPM: agenix-rekey's own app rekeys two master-encrypted secrets to a node's TPM recipient, the node decrypts them at boot at their paths and with their owners, a secret removed on the running node is counted and comes back with an activation, and the same system on another TPM decrypts nothing, fails `cluster-secrets`, starts no Nomad and says so in its metric, with SSH up. |
 | `backup` | What the fixture apps generate: engine detection, units, salted repository paths, target URLs. |
 | `freeipa` | FreeIPA's wiring, and Authelia's own `validate-config` over its generated config. |
 | `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool). |
@@ -1278,7 +1280,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 
-The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths agenix would decrypt to, NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
+The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths agenix would decrypt to (`checks.secrets-tpm` is the one test that decrypts), NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
 
 ### Continuous integration
 

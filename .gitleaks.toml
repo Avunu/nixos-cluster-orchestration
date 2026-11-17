@@ -7,6 +7,9 @@ useDefault = true
 description = "test fixtures, not secrets"
 paths = [
   '''tests/lib/fixture-wg\.nix''',
+  # A master key that protects nothing, beside the two fixture values it encrypts
+  # (tests/fixtures/agenix/default.nix explains why it is in a file).
+  '''tests/fixtures/agenix/master-identity\.txt''',
 ]
 
 # The boot harness's volume identity secret: a sequential-hex placeholder that only the

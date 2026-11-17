@@ -561,6 +561,40 @@
             }
           );
 
+          # What a node is given of the site's secrets and what it is not, where each
+          # lands, what the gate holds, and what agenix-rekey says of a node whose
+          # secrets were never rekeyed. Evaluation only (tests/secrets.nix).
+          checks.secrets = detach (
+            _:
+            import ./tests/secrets.nix {
+              inherit
+                pkgs
+                lib
+                mkCluster
+                fixtureCluster
+                fixtureTopology
+                ;
+              mkSecure = import ./tests/fixtures/secure { inherit self mkCluster; };
+            }
+          );
+
+          # The real path, with a software TPM: a master-encrypted secret, rekeyed by
+          # agenix-rekey's own app to a node's TPM recipient, decrypted at boot by that
+          # TPM and by no other, and what a node that could not decrypt looks like
+          # (tests/secrets-tpm.nix).
+          checks.secrets-tpm = detach (
+            _:
+            import ./tests/secrets-tpm.nix {
+              inherit
+                pkgs
+                lib
+                mkCluster
+                fixtureTopology
+                ;
+              harness = fixtureHarness;
+            }
+          );
+
           # Boots the fixture node1 (its real machine module, fixture secrets, a
           # stand-in internet) twice and requires the whole cold-start chain to
           # converge: network, etcd, JuiceFS on S3, Nomad + ACLs + every app's job,
@@ -753,6 +787,18 @@
                 ;
             }
           );
+
+          # What a fixture is made by, when it is a build (tests/fixtures/agenix).
+          legacyPackages.fixtures.secrets-tpm-rekeyed =
+            (import ./tests/secrets-tpm.nix {
+              inherit
+                pkgs
+                lib
+                mkCluster
+                fixtureTopology
+                ;
+              harness = fixtureHarness;
+            }).rekeyed;
 
           # Named mutants: one control removed, and the assertion that must flip
           # (tests/lib/control.py). Not in `checks`, so they add nothing to `nix flake
