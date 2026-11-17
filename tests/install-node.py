@@ -40,24 +40,47 @@ def plaintext_on_the_operator():
     ).split()
 
 
-def install():
-    """`avc boot install target root@<rescue>`, less its evaluation: the site's installer,
-    with the environment it is given."""
-    env = (
-        "IH_ASSUME_YES=1 "
-        f"IH_STORE_PATHS='{DISKO} {TOPLEVEL}' "
-        f"AVC_AGE={AGE} AVC_AGE_PLUGIN_TPM={AGE_PLUGIN_TPM} "
-        f"AVC_INSTALL_SSH={shlex.quote(OPERATOR_SSH)} "
-    )
+def install(fingerprint, someone_else=None):
+    """`avc boot install target root@<rescue> --host-key-fingerprint <fingerprint>`, less
+    its evaluation: the host key pinned, and the site's installer under the pin."""
+    env = f"IH_STORE_PATHS='{DISKO} {TOPLEVEL}' AVC_AGE={AGE} AVC_AGE_PLUGIN_TPM={AGE_PLUGIN_TPM} "
+    if someone_else:
+        env += f"INSTALL_TEST_SOMEONE_ELSE={shlex.quote(someone_else)} "
     # The installer's own account of itself goes to this machine's console as it happens
     # (the log of this test), and to a file the controls below read. No stdin: this shell's
     # is the test driver's channel, which looks like a terminal, and nixos-anywhere would
     # hand it to ssh as one (`-t`) and wait on it for ever. An operator's is a terminal.
     return peer.execute(
-        f"cd {SITE} && {env} {DEPLOY} root@{WAN_ADDRESS} -i /root/id --kexec {KEXEC} "
+        f"cd {SITE} && {env} {INSTALL_RUN} {shlex.quote(fingerprint)} root@{WAN_ADDRESS} "
+        f"{DEPLOY} root@{WAN_ADDRESS} -i /root/id --kexec {KEXEC} "
         "--no-substitute-on-destination < /dev/null 2>&1 | tee /tmp/install.log >&2; rc=${PIPESTATUS[0]}; "
         "tail -n 60 /tmp/install.log; exit $rc",
         timeout=2400,
+    )
+
+
+def rescue_state():
+    """What an install changes first on the machine it reaches: logins (nixos-anywhere's
+    key, the kexec's files), then the disks. And the boot it is in."""
+    return rescue.succeed(
+        "cat /proc/sys/kernel/random/boot_id; "
+        "journalctl -u sshd -o cat | grep -c '^Accepted' || true; "
+        "ls -d /root/kexec 2>&1 || true; grep -c nixos-anywhere /root/.ssh/authorized_keys 2>/dev/null || true; "
+        "lsblk -nro NAME,TYPE,SIZE,FSTYPE,PTTYPE"
+    )
+
+
+def refused_untouched(name, said, rc, out, state, site):
+    """A refused install: it says why, and the machine, its disks and the site are as they were."""
+    log = peer.succeed("cat /tmp/install.log")
+    now = rescue_state()
+    files = peer.succeed(f"cd {SITE} && find secrets -type f | sort").split()
+    left = peer.succeed("ls -d /dev/shm/avc-install-* /run/user/*/avc-install-* 2>/dev/null || true").split()
+    control(
+        name,
+        rc != 0 and all(s in log for s in said) and now == state and files == site and left == []
+        and "staged for age1" not in log,
+        f"rc={rc}; rescue before:\n{state}\nafter:\n{now}\nsite {files}; pins left {left}\n{out}",
     )
 
 
@@ -129,10 +152,49 @@ def main():
     rescue.wait_for_unit("sshd.service")
     peer.wait_until_succeeds(f"ssh {OPERATOR_SSH} root@{WAN_ADDRESS} true", timeout=120)
     before = peer.succeed(f"cd {SITE} && find secrets -type f | sort").split()
+    # What the operator reads at the machine's console, in the rescue system.
+    host_key = rescue.succeed("cat /etc/ssh/ssh_host_ed25519_key.pub").strip()
+    fingerprint = rescue.succeed("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub").split()[1]
+    state = rescue_state()
+
+    # ── a host key that is not the machine's ───────────────────────────────
+    # The fingerprint given is another machine's: refused at the first read of the host
+    # key, before any connection that logs in.
+    peer.succeed("ssh-keygen -q -t ed25519 -N '' -C someone-else -f /root/someone-else")
+    someone_else = " ".join(peer.succeed("cat /root/someone-else.pub").split()[:2])
+    wrong = peer.succeed("ssh-keygen -lf /root/someone-else.pub").split()[1]
+    rc, out = install(wrong)
+    refused_untouched(
+        "wrong-fingerprint-is-refused-with-the-machine-untouched",
+        [f"does not present the host key {wrong}", fingerprint, "Nothing was sent to it"],
+        rc, out, state, before,
+    )
+    # The right fingerprint, and then a far end whose key is not the pinned one: the
+    # installer's own first connection is refused, and the installer stopped.
+    rc, out = install(fingerprint, someone_else=someone_else)
+    refused_untouched(
+        "installers-connections-are-held-to-the-pinned-key",
+        ["not one verified for this install", "before `avc boot stage`", "no secret was sent"],
+        rc, out, state, before,
+    )
 
     # ── the install ────────────────────────────────────────────────────────
-    rc, out = install()
-    control("install-through-the-installer", rc == 0 and "staged for age1" in peer.succeed("cat /tmp/install.log"), f"rc={rc}\n{out}")
+    rc, out = install(fingerprint)
+    log = peer.succeed("cat /tmp/install.log")
+    control("install-through-the-installer", rc == 0 and "staged for age1" in log, f"rc={rc}\n{out}")
+    # Every connection was checked against the one verified key: nixos-anywhere's went
+    # through the pin (it asks ssh for no checking, and ssh then says "Permanently
+    # added" at each), and the installer answered with the key the rescue system had.
+    pinned = re.search(r"pinned: (\d+) connections before the hook, (\d+) keys", log)
+    control(
+        "install-is-held-to-the-verified-host-key",
+        pinned is not None and int(pinned.group(1)) >= 3 and pinned.group(2) == "2"
+        and f"installer host key: {' '.join(host_key.split()[:2])}" in log
+        and "Permanently added" not in log and "Host key verification failed" not in log,
+        f"{pinned and pinned.groups()}; rescue host key {host_key}\n{out}",
+    )
+    # The new recipient was shown before anything was rekeyed to it.
+    control("recipient-shown-before-the-rekey", re.search(r"new recipient shown: age1\S+ from root@\S+; rekeyed by then: 0", log) is not None, out)
     control("installer-reboots-the-machine", rescue_gone(), "the rescue VM never went down")
     for letter in "ab":
         (BASE / f"{letter}.qcow2").chmod(stat.S_IRUSR)

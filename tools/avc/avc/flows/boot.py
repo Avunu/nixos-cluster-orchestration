@@ -273,7 +273,8 @@ def carry_host_key(pin: hostpin.Pin, target: str, identity: str | None = None, p
     if p.returncode == 255:
         raise AvcError(
             f"no verified SSH connection to {target} (ssh's message is above): if it names the host key, the machine that "
-            f"answers now is not the one whose key was just verified. {NOTHING_SENT}"
+            f"answers now is not the one whose key was just verified; if the connection was reset, its sshd may be holding off an "
+            f"address that has just made several connections without logging in (wait a minute, and run this again). {NOTHING_SENT}"
         )
     keys = hostpin.parse_keys(p.stdout, hosted=False)
     for key in keys:
