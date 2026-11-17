@@ -8,7 +8,7 @@ import json
 import pytest
 
 from avc import actions
-from avc.core import vars as clanvars
+from avc.core import secretstore
 from avc.errors import AvcError
 from avc.flows import audit
 
@@ -29,7 +29,7 @@ def fleet(ctx, index, monkeypatch):
         asked.append((machine, var_id))
         return f"tok-{machine}\n"
 
-    monkeypatch.setattr(clanvars, "get_value", get_value)
+    monkeypatch.setattr(secretstore, "get_value", get_value)
     return ctx, asked
 
 
@@ -59,13 +59,13 @@ def test_tokens_is_the_only_audit_command():
 
 def test_two_nodes_with_one_token_are_refused(fleet, monkeypatch):
     ctx, _ = fleet
-    monkeypatch.setattr(clanvars, "get_value", lambda root, m, v: "same")
+    monkeypatch.setattr(secretstore, "get_value", lambda root, m, v: "same")
     with pytest.raises(AvcError, match="same audit/token"):
         audit.audit_tokens(ctx)
 
 
 def test_an_empty_token_is_refused(fleet, monkeypatch):
     ctx, _ = fleet
-    monkeypatch.setattr(clanvars, "get_value", lambda root, m, v: "\n")
+    monkeypatch.setattr(secretstore, "get_value", lambda root, m, v: "\n")
     with pytest.raises(AvcError, match="empty"):
         audit.audit_tokens(ctx)

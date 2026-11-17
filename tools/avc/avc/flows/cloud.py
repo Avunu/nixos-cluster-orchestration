@@ -2,16 +2,17 @@
 made by OpenTofu from the flake's `cloud` output (lib/cloud.nix).
 
 It runs here, on the operator's machine, and nowhere else: the providers' API
-credentials are vars no node holds (`cloud-ovh`, `cloudflare/provision-token`), and
+credentials are secrets no node is given (`cloud-ovh`, `cloudflare/provision-token`), and
 they reach OpenTofu in its environment for the length of one command. Its state is
 `cloud/terraform.tfstate` in the repository, encrypted with `cloud-state/passphrase`,
 because it holds every key the providers issued; it is committed like any other change.
 
     avc cloud plan      what would change, and nothing done
     avc cloud apply     the same, then done, and what the providers handed back put
-                        where the site reads it: S3 key pairs into their vars, a new
+                        where the site reads it: S3 key pairs into their secrets, a new
                         tunnel's id into apps/<app>.json and its credentials into the
-                        app's var. Then shipped, like every change.
+                        app's secret, each rekeyed for the nodes that read it. Then
+                        shipped, like every change.
     avc cloud tofu "…"  OpenTofu itself, with the same configuration, state and
                         credentials: `import`, `state list`, `output`.
 
@@ -29,8 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from avc import ui
 from avc.actions import Arg, action
-from avc.core import proc, ship
-from avc.core import vars as clanvars
+from avc.core import proc, secretstore, ship
 from avc.errors import AvcError
 
 if TYPE_CHECKING:
@@ -66,13 +66,13 @@ def encryption(passphrase: str) -> str:
 
 def environment(ctx: Ctx, cloud: dict[str, Any]) -> dict[str, str]:
     """The process environment for OpenTofu: this one's, and the secrets, which are
-    read from the vars each time and written nowhere."""
+    decrypted in memory (once per run each) and written nowhere."""
     machine = cloud["writeback"]["machine"]
 
     def var(var_id: str) -> str:
-        value = clanvars.get_value(ctx.root, machine, var_id).strip()
+        value = secretstore.get_value(ctx.root, machine, var_id).strip()
         if not value:
-            raise AvcError(f"{var_id} has no value; `clan vars generate {machine}` asks for it")
+            raise AvcError(f"{var_id} has no value; `avc secrets provision` asks for it")
         return value
 
     env = dict(os.environ)
@@ -170,16 +170,21 @@ def write_back(ctx: Ctx, cloud: dict[str, Any], outputs: dict[str, Any]) -> list
             continue  # adopted: its id and its secret are the ones it already had
         made = outputs[t["output"]]["value"]
         path = set_tunnel_id(ctx.root, app, made["id"])
-        # clan evaluates the flake as git has it.
+        # The app's credentials generator exists once the flake, as git has it, has the id.
         proc.run(["git", "add", "--", str(path.relative_to(ctx.root))], cwd=ctx.root)
-        clanvars.set_value(ctx.root, machine, t["credentials"], credentials_file(t["accountId"], made["id"], made["secret"]))
+        secretstore.set_value(ctx.root, machine, t["credentials"], credentials_file(t["accountId"], made["id"], made["secret"]))
         done.append(f"{app}: tunnel {made['id']}, in apps/{app}.json and {t['credentials']}")
     for output, var_id in sorted(wb["vars"].items()):
         value = outputs[output]["value"]
-        current = proc.run(["clan", "vars", "get", machine, var_id], cwd=ctx.root, check=False).stdout or ""
+        try:
+            current = secretstore.get_value(ctx.root, machine, var_id)
+        except AvcError:
+            current = ""  # not stored yet
         if current.strip() != value:
-            clanvars.set_value(ctx.root, machine, var_id, value)
+            secretstore.set_value(ctx.root, machine, var_id, value)
             done.append(f"{var_id}: the key the provider issued")
+    if done:
+        secretstore.rekey(ctx.root)
     return done
 
 
@@ -227,7 +232,7 @@ def apply(ctx: Ctx, destroy: str | None) -> None:
     outputs = json.loads(tofu(d, env, "output", "-json", capture=True) or "{}")
     for line in write_back(ctx, cloud, outputs):
         ui.ok(line)
-    ship.ship(ctx, "chore(cloud): what the providers hold, and what they issued", paths=[f"{DIR}/", "apps/", "vars/", "secrets/"])
+    ship.ship(ctx, "chore(cloud): what the providers hold, and what they issued", paths=[f"{DIR}/", "apps/", "secrets/"])
 
 
 @action("cloud", "tofu", "Run OpenTofu itself (import, state, output)", Arg("args", 'Arguments, as one string: "state list"'))

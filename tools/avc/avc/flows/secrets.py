@@ -1,20 +1,27 @@
 """Secrets: one inventory, and provisioning and rotation that know what each
 secret feeds.
 
-Every secret here is a clan var. A rotation is gated by secrets/policy.toml,
-shows what else regenerates with it (clan's dependent closure), and ends in
+Every secret here is a file of a generator the flake declares (modules/secrets.nix),
+made and kept by avc/core/secretstore.py. A rotation is gated by secrets/policy.toml,
+shows what else regenerates with it (the generators that read its files), and ends in
 the ship pipeline with a restart of every app that consumes any of it — a new
 value reaches a container as a bind mount, which a reload does not refresh.
+
+Whatever changes a source ends in `rekey`: a node is given the files under
+secrets/rekeyed/<node>/ and nothing else, so a new value that was not rekeyed is a
+value no node has. `avc secrets check` says whether a deploy of this tree would give
+every node everything it declares.
 
 Shared generators have one value for the fleet, read and written through one
 machine. Per-machine ones (the boot secrets, a node's own certificates and
 keys) have one value per node, so every command that touches them goes machine
-by machine. A per-machine var is named `<machine>:<generator>/<file>`.
+by machine. A per-machine value is named `<machine>:<generator>/<file>`.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,13 +29,12 @@ from typing import TYPE_CHECKING
 from avc import ui
 from avc.actions import Arg, action
 from avc.core import policy as policy_mod
-from avc.core import repo, ship
-from avc.core import vars as clanvars
+from avc.core import repo, secretstore, ship
 from avc.errors import AvcError
 
 if TYPE_CHECKING:
     from avc.context import Ctx
-    from avc.core.vars import GeneratorInfo
+    from avc.core.secretstore import GeneratorInfo
 
 # Bound to an installed node's disks: the LUKS passphrase opens them and the identity check
 # compares the secret on them with the hash in the signed initrd. Regenerating either locks
@@ -47,13 +53,14 @@ HELD_ON_THE_NODE = {
     "initrd-ssh": (
         "the initrd's SSH host key, placed on each node at install and never again: a new one changes only the "
         "repository's copy, and `avc boot unlock` then refuses every node's initrd as the wrong host. By hand: "
-        "`clan vars generate <node> --generator initrd-ssh --regenerate`, then "
-        "`clan vars get <node> initrd-ssh/ssh_host_ed25519_key | ssh root@<node> install -m 0400 /dev/stdin "
+        "a new pair from `ssh-keygen -t ed25519`, each half stored with "
+        "`avc secrets set <node>:initrd-ssh/ssh_host_ed25519_key` (and `.pub`), which asks you to confirm, then "
+        "`avc -y secrets reveal <node>:initrd-ssh/ssh_host_ed25519_key | ssh root@<node> install -m 0400 /dev/stdin "
         "/var/lib/initrd-ssh/ssh_host_ed25519_key`, then deploy. Generations already on the ESP keep the old key"
     ),
     "emergency-access": (
         "the initrd emergency shell's password, whose hash is in every signed initrd: generations already on the "
-        "ESP keep the old hash, and `clan vars get` then gives only the new password. By hand, keeping the old "
+        "ESP keep the old hash, and `avc secrets reveal` then gives only the new password. By hand, keeping the old "
         "password until those generations are gone"
     ),
 }
@@ -109,7 +116,7 @@ def _machine(ctx: Ctx) -> str:
 
 
 def _machines(ctx: Ctx) -> list[str]:
-    # Placeholders too: their per-machine vars are generated before they are installed.
+    # Placeholders too: their per-machine secrets are generated before they are installed.
     return list(ctx.index.nodes)
 
 
@@ -118,7 +125,7 @@ def _scoped(ctx: Ctx) -> dict[str, Scoped]:
         found: dict[str, tuple[GeneratorInfo, list[str]]] = {}
         with ui.spin("reading generators"):
             for m in _machines(ctx):
-                for g in clanvars.generators(ctx.root, m):
+                for g in secretstore.generators(ctx.root, m):
                     found.setdefault(g.name, (g, []))[1].append(m)
         out = {}
         for name, (g, machines) in sorted(found.items()):
@@ -168,10 +175,12 @@ def parse_var(ctx: Ctx, var: str) -> tuple[str, str]:
 def _age_days(root: Path, s: Scoped) -> int | None:
     dates = []
     for m in s.machines:
-        for f in s.gen.files:
-            d = repo.last_change(root, str(s.gen.path(root, f, m).relative_to(root)))
-            if d:
-                dates.append(d)
+        # Each machine's own declaration: a per-machine file is kept under its name.
+        for g in secretstore.generators(root, m):
+            for f in g.files if g.name == s.gen.name else ():
+                d = repo.last_change(root, f.stored_as)
+                if d:
+                    dates.append(d)
     if not dates:
         return None
     newest = max(dt.datetime.fromisoformat(d) for d in dates)
@@ -186,9 +195,14 @@ def _restarts(ctx: Ctx, generators: list[str]) -> list[ship.PostAction]:
     return list(seen.values())
 
 
-def _statuses(ctx: Ctx, machines: list[str]) -> dict[str, clanvars.VarsSummary]:
-    with ui.spin("checking vars status"):
-        return {m: clanvars.status(ctx.root, m) for m in machines}
+def _statuses(ctx: Ctx, machines: list[str]) -> dict[str, secretstore.Summary]:
+    with ui.spin("checking what is generated"):
+        return {m: secretstore.status(ctx.root, m) for m in machines}
+
+
+def _stored(ctx: Ctx) -> None:
+    """After anything that wrote a source: what the nodes are given must follow it."""
+    secretstore.rekey(ctx.root)
 
 
 @action("secrets", "inventory", "Inventory (age, consumers, rotation policy)")
@@ -218,31 +232,42 @@ def inventory(ctx: Ctx) -> None:
         rows.append([name, scope, kind, users, age_s, verdict, state])
     ui.table("secrets", ["generator", "scope", "source", "used by", "age", "rotation", "state"], rows)
 
-    known = set(scoped)
-    for base in (ctx.root / "secrets" / "clan-vars" / "shared", ctx.root / "vars" / "shared"):
+    bases = {ctx.root / "secrets" / "shared": {n for n, s in scoped.items() if s.gen.share}}
+    for m in _machines(ctx):
+        bases[ctx.root / "secrets" / "per-machine" / m] = {n for n, s in scoped.items() if not s.gen.share and m in s.machines}
+    for base, known in bases.items():
         for d in sorted(base.iterdir()) if base.exists() else []:
             if d.is_dir() and d.name not in known:
                 ui.say(f"orphaned: {d.relative_to(ctx.root)} (no generator declares it any more)")
 
 
-def _needing(st: clanvars.VarsSummary) -> set[str]:
-    return {v.split("/")[0] for v in st.missing} | set(st.outdated)
+def _needing(ctx: Ctx, machine: str, st: secretstore.Summary) -> set[str]:
+    """The generators a provision would run on `machine`: those with a file missing or
+    made from other inputs, and those that read their files."""
+    names = {v.split("/")[0] for v in st.missing} | set(st.outdated)
+    gens = secretstore.generators(ctx.root, machine)
+    return names | {d for n in names for d in secretstore.dependents(gens, n)}
 
 
 @action("secrets", "provision", "Provision missing secrets")
 def provision(ctx: Ctx) -> None:
     statuses = _statuses(ctx, _machines(ctx))
-    # `clan vars generate <machine>` makes every missing or outdated generator on that
-    # machine anew, so one of these on an installed node means nothing is generated there:
-    # a lost var file comes back from git, and a library change to one of these
-    # generators has its own procedure.
-    held = {m: sorted(g for g in _needing(st) if not_on_installed(g)) for m, st in statuses.items() if m in ctx.installed}
+    needing = {m: _needing(ctx, m, st) for m, st in statuses.items()}
+    # One of these on an installed node is never made anew, whether it is missing, was
+    # made from other inputs, or reads a generator that is: a lost file comes back from
+    # git, and a library change to one of these generators has its own procedure.
+    # Nothing else is generated for that node either, so that what is wrong with it is
+    # looked at before anything about it changes.
+    held = {m: sorted(g for g in needing[m] if not_on_installed(g)) for m in statuses if m in ctx.installed}
     held = {m: g for m, g in held.items() if g}
-    todo = [m for m, st in statuses.items() if (st.missing or st.outdated) and m not in held]
+    # A shared one is every node's: an installed node holding it keeps the others from
+    # making a new one for the fleet.
+    shared = {n for n, s in _scoped(ctx).items() if s.gen.share}
+    held_shared = {g for names in held.values() for g in names if g in shared}
+    todo = [m for m in statuses if needing[m] - held_shared and m not in held]
     if not todo and not held and not any(st.unfixed for st in statuses.values()):
         ui.ok("every secret is present and current, on every machine")
         return
-    gens: set[str] = set()
     for m, st in statuses.items():
         for v in st.missing:
             ui.info(f"{m}: missing {v}")
@@ -250,21 +275,23 @@ def provision(ctx: Ctx) -> None:
             ui.info(f"{m}: outdated {g}")
         if st.unfixed:
             ui.warn(f"{m}: {len(st.unfixed)} need re-encryption — `avc secrets fix`")
-        if m not in held:
-            gens |= _needing(st)
     for m, names in held.items():
         for g in names:
             ui.err(f"{m} is installed, and {g} is {not_on_installed(g)}")
-        ui.say(f"{m}: nothing generated there. Restore a lost var file from git; anything else is by hand.")
+        ui.say(
+            f"{m}: nothing of its own is generated (what reads a shared secret that is made again still follows it). "
+            "Restore a lost file from git; anything else is by hand."
+        )
     if todo:
         if not ui.confirm(
             f"Generate them now, on {', '.join(todo)}? Prompted values (issued tokens) are asked for.", default=True
         ):
             return
-        for m in todo:
-            clanvars.generate(ctx.root, m)
-        names = sorted(gens)
-        ship.ship(ctx, f"feat(secrets): provision {', '.join(names)}", paths=["vars/", "secrets/"], post=_restarts(ctx, names))
+        targets = sorted((m, g) for m in todo for g in needing[m] - held_shared)
+        secretstore.generate(ctx.root, targets, reference=_machine(ctx))
+        _stored(ctx)
+        names = sorted({g for _, g in targets})
+        ship.ship(ctx, f"feat(secrets): provision {', '.join(names)}", paths=["secrets/"], post=_restarts(ctx, names))
     if held:
         raise AvcError(f"not provisioned on {', '.join(held)}: see above")
 
@@ -284,7 +311,7 @@ def rotate(ctx: Ctx, generator: str) -> None:
     by_name = {g.name: g for g in gens}
     targets = rotation_targets(ctx, generator)
     pol = policy_mod.load(ctx.root)
-    closure = [generator, *clanvars.dependents(gens, generator)]
+    closure = [generator, *secretstore.dependents(gens, generator)]
 
     ui.header(f"Rotate {generator}")
     for name in closure:
@@ -312,18 +339,19 @@ def rotate(ctx: Ctx, generator: str) -> None:
     g = by_name[generator]
     files = ", ".join(f.name for f in g.files)
     ui.say(f"files: {files}")
+    prompts = ", ".join(p.name for p in g.prompts)
     if not g.share:
         ui.say(f"one value per machine, regenerated on each: {', '.join(targets)}")
     if g.prompts:
-        ui.say(f"you will be asked for: {', '.join(g.prompts)} (issue the new value first; the old one stays valid until you revoke it)")
+        ui.say(f"you will be asked for: {prompts} (issue the new value first; the old one stays valid until you revoke it)")
     post = _restarts(ctx, closure)
     for p in post:
         ui.say(f"then: {p.label}")
     if not ui.confirm(f"Regenerate {generator}?"):
         return
-    for m in targets:
-        clanvars.generate(ctx.root, m, generator, regenerate=True)
-    if ship.ship(ctx, f"chore(secrets): rotate {generator}", paths=["vars/", "secrets/"], post=post) and g.prompts:
+    secretstore.generate(ctx.root, [(m, generator) for m in targets], regenerate=True, reference=_machine(ctx))
+    _stored(ctx)
+    if ship.ship(ctx, f"chore(secrets): rotate {generator}", paths=["secrets/"], post=post) and g.prompts:
         ui.info("deployed and restarted — now revoke the old credential at its issuer")
 
 
@@ -346,9 +374,10 @@ def set_var(ctx: Ctx, var: str) -> None:
         value = path.read_text()
     else:
         value = ui.secret(f"New value for {var}")
-    clanvars.set_value(ctx.root, machine, var_id, value)
-    ui.ok(f"{var} stored (encrypted)")
-    ship.ship(ctx, f"chore(secrets): set {var}", paths=["vars/", "secrets/"], post=_restarts(ctx, [generator]))
+    secretstore.set_value(ctx.root, machine, var_id, value)
+    ui.ok(f"{var} stored")
+    _stored(ctx)
+    ship.ship(ctx, f"chore(secrets): set {var}", paths=["secrets/"], post=_restarts(ctx, [generator]))
 
 
 @action("secrets", "reveal", "Reveal a value", Arg("var", "Secret (generator/file, or machine:generator/file)", choices=_var_ids))
@@ -356,24 +385,77 @@ def reveal(ctx: Ctx, var: str) -> None:
     machine, var_id = parse_var(ctx, var)
     if not ui.confirm(f"Print {var} in clear on this terminal?"):
         return
-    ui.out(clanvars.get_value(ctx.root, machine, var_id))
+    value = secretstore.get_value(ctx.root, machine, var_id)
+    # The bytes as they are, so that a pipe gets the key and not the key and a newline.
+    sys.stdout.write(value)
+    if sys.stdout.isatty() and not value.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
-@action("secrets", "fix", "Re-encrypt for the current recipients")
+@action("secrets", "fix", "Re-encrypt for the current master recipients")
 def fix(ctx: Ctx) -> None:
-    """After an operator key is added to or removed from
-    vars.settings.recipients (flake.nix), every secret is re-encrypted."""
+    """After an operator's key is added to or removed from masterIdentities or
+    extraRecipients (flake.nix), every source is encrypted again, and rekeyed: a node's
+    files are named by the source they came from."""
     statuses = _statuses(ctx, _machines(ctx))
-    todo = {m: st.unfixed for m, st in statuses.items() if st.unfixed}
+    todo = sorted({f"{m}: {v}" if ":" not in v else v for m, st in statuses.items() for v in st.unfixed})
     if not todo:
-        ui.ok("every secret is encrypted for the current recipients")
+        ui.ok("every secret is encrypted for the current master recipients")
         return
-    for m, unfixed in todo.items():
-        for v in unfixed:
-            ui.info(f"{m}: re-encrypt {v}")
-    ui.warn("re-encrypting grants every listed recipient access — check flake.nix recipients first")
-    if not ui.confirm(f"Re-encrypt {sum(len(u) for u in todo.values())} secret(s)?"):
+    ui.info(f"{len(todo)} declared secret(s) are not known to be encrypted for the flake's master recipients")
+    ui.warn("re-encrypting grants every listed recipient access — check masterIdentities and extraRecipients in flake.nix first")
+    ui.say("every source is decrypted once: with a YubiKey, one touch for each")
+    if not ui.confirm("Re-encrypt every secret in the repository?"):
         return
-    for m in todo:
-        clanvars.fix(ctx.root, m)
-    ship.ship(ctx, "chore(secrets): re-encrypt for current recipients", paths=["vars/", "secrets/"])
+    count = secretstore.fix(ctx.root)
+    ui.ok(f"{count} file(s) re-encrypted")
+    _stored(ctx)
+    ship.ship(ctx, "chore(secrets): re-encrypt for current recipients", paths=["secrets/"])
+
+
+@action("secrets", "rekey", "Rekey: give each node what it reads, encrypted to its own key")
+def rekey(ctx: Ctx) -> None:
+    """After a node's recipient is added (an install), or a source changed outside avc."""
+    _stored(ctx)
+    ship.ship(ctx, "chore(secrets): rekey", paths=["secrets/"])
+
+
+def readiness_problems(ctx: Ctx, machines: list[str], strict: bool) -> list[str]:
+    """Why a deploy of this tree would leave a node short of a secret, one line each.
+    `strict`: a node with no recipient is one, too; otherwise it is a node not installed
+    yet (Ctx.installed), which needs its secrets generated and nothing rekeyed."""
+    problems = []
+    for m in machines:
+        r = secretstore.readiness(ctx.root, m)
+        problems += [f"{m}: {v} is not generated (`avc secrets provision`)" for v in r.missing]
+        problems += [f"{m}: {g} was made from other inputs than it declares now (`avc secrets provision`)" for g in r.outdated]
+        problems += [f"{m}: {v} is not rekeyed for it, or was rekeyed from an older value (`avc secrets rekey`)" for v in r.unrekeyed]
+        if not r.recipient and strict:
+            problems.append(f"{m}: no recipient (secrets/recipients/{m}.pub): nothing can be rekeyed for it, and it would decrypt nothing")
+        elif not r.recipient:
+            ui.say(f"{m}: no recipient yet (not installed): nothing is rekeyed for it")
+        for rel in r.orphaned:
+            ui.warn(f"{m}: secrets/rekeyed/{m}/{rel} is named by nothing (`avc secrets rekey` removes it)")
+    return problems
+
+
+@action(
+    "secrets",
+    "check",
+    "Check that a deploy would give every node its secrets",
+    Arg("node", "Node (every node when left out)", choices=lambda ctx: list(ctx.index.nodes), optional=True),
+)
+def check(ctx: Ctx, node: str | None = None) -> None:
+    """A node builds and switches without a secret that was never generated or never
+    rekeyed, and then runs short of it. So this is asked before a deploy, and refuses."""
+    if node is not None and node not in ctx.index.nodes:
+        raise AvcError(f"unknown node {node!r} (known: {', '.join(ctx.index.nodes)})")
+    machines = [node] if node else _machines(ctx)
+    with ui.spin("checking sources and rekeyed files"):
+        problems = readiness_problems(ctx, machines, strict=node is not None)
+    for p in problems:
+        ui.err(p)
+    if problems:
+        raise AvcError(f"{len(problems)} secret(s) would not reach their node: do not deploy this tree")
+    ui.ok(f"{', '.join(machines)}: every declared secret is generated, and rekeyed where there is a recipient")

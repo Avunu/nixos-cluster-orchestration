@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from avc import ui
 from avc.actions import action
-from avc.core import vars as clanvars
+from avc.core import secretstore
 from avc.errors import AvcError
 
 if TYPE_CHECKING:
@@ -27,7 +27,7 @@ def audit_tokens(ctx: Ctx) -> dict[str, dict[str, object]]:
         audit = node.get("audit") or {}
         if not audit.get("enabled"):
             continue
-        token = clanvars.get_value(ctx.root, name, "audit/token").strip()
+        token = secretstore.get_value(ctx.root, name, "audit/token").strip()
         if not token:
             raise AvcError(f"{name}: audit/token is empty; run `avc secrets provision`")
         if token in out:

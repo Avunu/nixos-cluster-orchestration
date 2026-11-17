@@ -326,7 +326,7 @@
 
           # The operations tool: status, sites, apps, secrets, deploys.
           # `.override { siteProvisioner = …; }` enables `avc site …` (lib/avc.nix).
-          packages.avc = pkgs.callPackage ./lib/avc.nix { };
+          packages.avc = pkgs.callPackage ./lib/avc.nix { agenixRekey = self'.packages.agenix; };
 
           # `nix run .#agenix -- rekey | edit | view`: agenix-rekey's command, which reads
           # the flake it is run in (its `agenix-rekey` output, from mkCluster).

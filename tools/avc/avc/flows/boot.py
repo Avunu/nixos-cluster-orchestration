@@ -21,8 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from avc import ui
 from avc.actions import Arg, action
-from avc.core import deploy_state, proc, repo
-from avc.core import vars as clanvars
+from avc.core import deploy_state, proc, repo, secretstore
 from avc.core.node import HOLD_DIR, Node, NothingAfter
 from avc.errors import AvcError
 
@@ -61,8 +60,8 @@ def _boot_info(ctx: Ctx, node: str) -> dict[str, Any]:
 # ── preflight ───────────────────────────────────────────────────────────────
 
 
-def _changed_vars(root: Path) -> list[str]:
-    return sorted(c.path for c in repo.changes(root) if c.path.startswith(("vars/", "secrets/")))
+def _changed_secrets(root: Path) -> list[str]:
+    return sorted(c.path for c in repo.changes(root) if c.path.startswith("secrets/"))
 
 
 PREFLIGHT_APPLY = (
@@ -72,16 +71,14 @@ PREFLIGHT_APPLY = (
 
 
 def preflight_facts(ctx: Ctx, node: str) -> dict[str, Any]:
-    """What preflight checks, without printing. Refuses on vars that are not committed, since
-    an install uploads what is committed and a node built from anything else will not match
-    it. Forcing both drvPaths is what makes every posture assertion fire here rather than on
+    """What preflight checks, without printing. Refuses on secrets that are not committed,
+    since an install uploads what is committed and a node built from anything else will not
+    match it. Forcing both drvPaths is what makes every posture assertion fire here rather than on
     the server."""
     boot = _boot_info(ctx, node)
-    changed = _changed_vars(ctx.root)
+    changed = _changed_secrets(ctx.root)
     if changed:
-        raise AvcError(
-            "vars or secrets are not committed (git add vars secrets, then commit):\n  " + "\n  ".join(changed)
-        )
+        raise AvcError("secrets are not committed (git add secrets, then commit):\n  " + "\n  ".join(changed))
     with ui.spin(f"evaluating {node}: toplevel and disko script"):
         out = proc.out(
             ["nix", "eval", "--json", f".#nixosConfigurations.{node}.config", "--apply", PREFLIGHT_APPLY],
@@ -95,7 +92,7 @@ def preflight_facts(ctx: Ctx, node: str) -> dict[str, Any]:
 
 def _fingerprint(pub: str | None) -> str:
     if not pub:
-        return "(none: run clan vars generate)"
+        return "(none: run `avc secrets provision`)"
     p = proc.run(["ssh-keygen", "-lf", "-"], input=pub + "\n", check=False)
     return p.stdout.strip() if p.returncode == 0 else "(unreadable)"
 
@@ -112,9 +109,13 @@ def preflight(ctx: Ctx, node: str) -> None:
 # ── install ─────────────────────────────────────────────────────────────────
 
 
-def install_argv(node: str, target: str) -> list[str]:
-    host = target if "@" in target else f"root@{target}"
-    return ["clan", "machines", "install", node, "--target-host", host, "--yes"]
+# The installer is not here yet. Besides partitioning and installing, it is what will make the node's age identity on its TPM, commit the recipient
+# (secrets/recipients/<node>.pub), and set up LUKS. Until it lands, this step refuses, after
+# the preflight, and every other step of the flow works as before.
+INSTALLER_MISSING = (
+    "installing a node is not implemented until the installer (nixos-install-helper) lands: it partitions, "
+    "makes the node's TPM identity and its recipient, and installs. Nothing was changed on {target}."
+)
 
 
 @action(
@@ -126,10 +127,7 @@ def install_argv(node: str, target: str) -> list[str]:
 )
 def install(ctx: Ctx, node: str, target: str) -> None:
     preflight(ctx, node)
-    ui.warn(f"this wipes every disk of {target} and installs {node} on it")
-    ui.type_to_confirm(f"Type the node's name to install {node} on {target}", node)
-    proc.run(install_argv(node, target), cwd=ctx.root, capture=False)
-    ui.ok(f"installed. Next: `avc boot unlock {node}` (Setup Mode, passphrase typed), then `avc boot enroll {node}`")
+    raise AvcError(INSTALLER_MISSING.format(target=target))
 
 
 # ── unlock ──────────────────────────────────────────────────────────────────
@@ -165,10 +163,10 @@ def unlock(ctx: Ctx, node: str) -> None:
     boot = _boot_info(ctx, node)
     pub = boot.get("hostKeyPub")
     if not pub:
-        raise AvcError(f"{node} has no initrd host key in the repository: run clan vars generate {node}")
+        raise AvcError(f"{node} has no initrd host key in the repository: run `avc secrets provision`")
     host = ctx.index.nodes[node]["deployHost"]
     port = int(boot["sshPort"])
-    ui.say(f"the passphrase is `clan vars get {node} luks/passphrase`. A typo puts the prompts out of step, so it may ask again.")
+    ui.say(f"the passphrase is `avc secrets reveal {node}:luks/passphrase`. A typo puts the prompts out of step, so it may ask again.")
     with tempfile.NamedTemporaryFile("w", prefix="avc-initrd-", suffix=".known_hosts") as f:
         f.write(known_hosts_line(host, port, pub))
         f.flush()
@@ -235,8 +233,9 @@ def bind_script(replace: bool, device: str | None, marker: str = BOUND_MARKER) -
 )
 def bind(ctx: Ctx, node: str, replace: bool = False, device: str | None = None) -> None:
     command = bind_script(replace, device)
-    # On stdin, from clan's store to the node, and nowhere in between that prints.
-    passphrase = clanvars.get_value(ctx.root, node, "luks/passphrase")
+    # On stdin, from the repository (decrypted in memory) to the node, and nowhere in between
+    # that prints.
+    passphrase = secretstore.get_value(ctx.root, node, "luks/passphrase")
     p = ctx.node(node).pipe(command, passphrase, check=False, timeout=600)
     ui.out(p.stdout)
     if p.returncode != 0:

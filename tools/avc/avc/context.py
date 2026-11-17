@@ -4,7 +4,6 @@ access to the things that cost an eval or a round trip."""
 from __future__ import annotations
 
 import functools
-import json
 import os
 import subprocess
 from collections.abc import Callable
@@ -12,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from pathlib import Path
 
+from avc.core import secretstore
 from avc.core.index import Index, load_index
 from avc.core.node import Node
 from avc.errors import AvcError
@@ -51,6 +51,7 @@ class Ctx:
     def forget(self) -> None:
         """Drop everything derived from the repository; a flow may have changed it."""
         self._memo.clear()
+        secretstore.forget()
         for cached in ("index", "installed"):
             self.__dict__.pop(cached, None)
 
@@ -65,14 +66,12 @@ class Ctx:
 
     @functools.cached_property
     def installed(self) -> list[str]:
-        """Nodes that actually exist: clan records an install in inventory.json.
-        topology.nix also carries placeholders (node2, node3) that must never be
-        ssh'd into or waited on."""
-        try:
-            machines = json.loads((self.root / "inventory.json").read_text()).get("machines", {})
-        except FileNotFoundError:
-            machines = {}
-        return [n for n in self.index.nodes if machines.get(n, {}).get("installedAt")]
+        """Nodes that actually exist: an install makes the node's age identity on its TPM
+        and commits the recipient, secrets/recipients/<node>.pub (lib/secrets-layout.nix),
+        without which the node could decrypt nothing. topology.nix also carries
+        placeholders (node2, node3) that must never be ssh'd into or waited on."""
+        recipients = self.root / "secrets" / "recipients"
+        return [n for n in self.index.nodes if (recipients / f"{n}.pub").exists()]
 
     def contact(self) -> Node:
         """A node to ask Nomad through: any node will do, so the first that answers.

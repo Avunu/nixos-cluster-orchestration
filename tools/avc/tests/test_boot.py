@@ -140,7 +140,7 @@ def test_unrollback_sends_nothing_for_a_bad_name(ctx, ssh, closure):
 # ── install, unlock, bind, reboot ───────────────────────────────────────────
 
 from avc.core import repo  # noqa: E402
-from avc.core import vars as clanvars  # noqa: E402
+from avc.core import secretstore  # noqa: E402
 from avc.core.repo import Change  # noqa: E402
 from avc.flows import boot as boot_flow  # noqa: E402
 
@@ -155,11 +155,12 @@ def test_every_boot_command_is_registered():
 @pytest.mark.parametrize(
     "change",
     [
-        Change("??", "vars/per-machine/node1/volume-identity/hash/value"),
-        Change(" M", "secrets/clan-vars/per-machine/node1/luks/passphrase/passphrase.age"),
+        Change("??", "secrets/per-machine/node1/volume-identity/hash"),
+        Change(" M", "secrets/per-machine/node1/luks/passphrase.age"),
+        Change("??", "secrets/rekeyed/node1/0a6b3fd375141137c563ac0eb80eed1f-per-machine/node1/wg-ctrl/private.age"),
     ],
 )
-def test_preflight_refuses_vars_that_are_not_committed(ctx, monkeypatch, change):
+def test_preflight_refuses_secrets_that_are_not_committed(ctx, monkeypatch, change):
     evaluated = []
     monkeypatch.setattr(repo, "changes", lambda root: [Change(" M", "topology.nix"), change])
     monkeypatch.setattr(boot_flow.proc, "out", lambda *a, **k: evaluated.append(a) or "{}")
@@ -232,11 +233,17 @@ def test_unlock_pins_the_repositorys_host_key(ctx, monkeypatch):
     assert argv[-3:] == ["root@192.0.2.1", "systemd-tty-ask-password-agent", "--query"]
 
 
-def test_install_argv():
-    assert boot_flow.install_argv("node1", "192.0.2.9") == [
-        "clan", "machines", "install", "node1", "--target-host", "root@192.0.2.9", "--yes",
-    ]
-    assert boot_flow.install_argv("node1", "root@192.0.2.9")[5] == "root@192.0.2.9"
+def test_install_says_the_installer_is_not_here_and_runs_nothing(ctx, monkeypatch):
+    # The installer (TPM identity, recipient, LUKS) is a stage of its own. Until it lands the
+    # step still runs its preflight, and then refuses without touching the target.
+    ran = []
+    monkeypatch.setattr(repo, "changes", lambda root: [])
+    monkeypatch.setattr(boot_flow.proc, "out", lambda *a, **k: '{"toplevel": "t", "disko": "d", "identity": "i"}')
+    monkeypatch.setattr(boot_flow.proc, "run", lambda cmd, **k: ran.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    with pytest.raises(AvcError, match="not implemented until the installer"):
+        run(ctx, "boot", "install", node="node1", target="192.0.2.9")
+    # ssh-keygen prints the host key's fingerprint for the preflight; nothing else ran.
+    assert [c[0] for c in ran] == ["ssh-keygen"]
 
 
 @pytest.fixture
@@ -267,14 +274,14 @@ def test_bind_asks_for_nothing_but_the_node(ctx, monkeypatch, piped):
     # From the menu, where nothing is given: the node is chosen, and the rest is left out.
     from avc import ui
 
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: PASSPHRASE)
     with ui.scripted(["node1"]):
         run(ctx, "boot", "bind")
     assert piped == [(boot_flow.bind_script(False, None), PASSPHRASE)]
 
 
 def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, piped, ssh, capsys):
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: PASSPHRASE)
     run(ctx, "boot", "bind", node="node1", replace=False, device=None)
     # One pipe to the node, and the passphrase is all it carries.
     assert piped == [(boot_flow.bind_script(False, None), PASSPHRASE)]
@@ -287,7 +294,7 @@ def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, piped, ssh, c
 
 
 def test_bind_replace_and_device(ctx, monkeypatch, piped):
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: PASSPHRASE)
     run(ctx, "boot", "bind", node="node1", replace=True, device="/dev/disk/by-partlabel/disk-nvme1-luks")
     assert piped[-1][0].startswith(
         "rc=0; cluster-boot-seal bind --replace --device /dev/disk/by-partlabel/disk-nvme1-luks || rc=$?; "
@@ -342,7 +349,7 @@ def test_a_failed_bind_after_a_good_one_keeps_the_good_ones_marker(tmp_path):
 
 
 def test_bind_reports_a_failed_bind(ctx, monkeypatch):
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: PASSPHRASE)
     monkeypatch.setattr(
         Node,
         "pipe",

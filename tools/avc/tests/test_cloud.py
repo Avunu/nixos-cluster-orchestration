@@ -6,8 +6,7 @@ import json
 
 import pytest
 
-from avc.core import proc
-from avc.core import vars as clanvars
+from avc.core import proc, secretstore
 from avc.errors import AvcError
 from avc.flows import cloud
 
@@ -103,15 +102,25 @@ def test_what_the_providers_issue_goes_where_the_site_reads_it(ctx, monkeypatch)
 
         class P:
             returncode = 0
-            stdout = have.get(cmd[-1], "") if cmd[:3] == ["clan", "vars", "get"] else ""
+            stdout = ""
 
         return P()
 
-    monkeypatch.setattr(proc, "run", run)
-    monkeypatch.setattr(clanvars, "set_value", lambda root, machine, var_id, value: written.__setitem__(var_id, (machine, value)))
-    done = cloud.write_back(ctx, writeback(), OUTPUTS)
+    def get_value(root, machine, var_id):
+        if var_id not in have:
+            raise AvcError(f"{var_id} has no value")
+        return have[var_id]
 
-    # The new tunnel: its id where the app is declared, staged so that clan's
+    rekeyed = []
+    monkeypatch.setattr(proc, "run", run)
+    monkeypatch.setattr(secretstore, "get_value", get_value)
+    monkeypatch.setattr(secretstore, "set_value", lambda root, machine, var_id, value: written.__setitem__(var_id, (machine, value)))
+    monkeypatch.setattr(secretstore, "rekey", lambda root: rekeyed.append(sorted(written)))
+    done = cloud.write_back(ctx, writeback(), OUTPUTS)
+    # Once, after everything was written: the nodes are given the new values.
+    assert rekeyed == [["ovh-s3/secret-key", "shop-cf/cloudflared"]]
+
+    # The new tunnel: its id where the app is declared, staged so that the flake's
     # evaluation sees the app's credentials generator, then the credentials.
     assert json.loads((ctx.root / "apps" / "shop.json").read_text()) == {"tunnel": {"id": "tid-shop"}}
     assert ["git", "add", "--", "apps/shop.json"] in ran

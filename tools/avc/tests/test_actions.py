@@ -4,7 +4,7 @@ import pytest
 
 from avc import actions, ui
 from avc.cli import build_parser
-from avc.core.vars import GeneratorInfo, dependents
+from avc.core.secretstore import GeneratorInfo, dependents
 
 
 def test_every_action_is_a_subcommand():

@@ -1,8 +1,7 @@
 """Every prompt and every line of output goes through here.
 
 Flows never import questionary or rich directly, so the interaction style can
-change in one place, and tests can script the answers (`scripted`) the way
-clan's MOCK_PROMPT_RESPONSE does.
+change in one place, and tests can script the answers (`scripted`).
 """
 
 from __future__ import annotations
@@ -166,6 +165,28 @@ def secret(question: str) -> str:
         if first == str(_ask(questionary.password("Again, to confirm"))):
             return first
         warn("the two entries differ; try again")
+
+
+def multiline(question: str, hidden: bool = False) -> str:
+    """Several lines, read to end of input (Ctrl-D on a line of its own). Hidden: not echoed."""
+    if _script is not None:
+        return str(_scripted_answer(question))
+    _interactive(question)
+    console.print(f"[bold]?[/] {question} [dim](paste, then Ctrl-D on an empty line{'; not echoed' if hidden else ''})[/]")
+    if not hidden:
+        return sys.stdin.read()
+    import termios
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    quiet = termios.tcgetattr(fd)
+    quiet[3] &= ~termios.ECHO
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
+        return sys.stdin.read()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        console.print()
 
 
 def type_to_confirm(what: str, word: str) -> None:
