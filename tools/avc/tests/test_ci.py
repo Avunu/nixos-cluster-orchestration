@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from avc.core import vars as clanvars
+from avc.core import secretstore
 from avc.errors import AvcError
 from avc.flows import ci
 
@@ -22,7 +22,7 @@ def fleet(ctx, index, monkeypatch, enabled, value=lambda machine: f"tok-{machine
         asked.append((machine, var_id))
         return value(machine)
 
-    monkeypatch.setattr(clanvars, "get_value", get_value)
+    monkeypatch.setattr(secretstore, "get_value", get_value)
     return asked
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import shlex
 import subprocess
 
 import pytest
@@ -140,7 +141,7 @@ def test_unrollback_sends_nothing_for_a_bad_name(ctx, ssh, closure):
 # ── install, unlock, bind, reboot ───────────────────────────────────────────
 
 from avc.core import repo  # noqa: E402
-from avc.core import vars as clanvars  # noqa: E402
+from avc.core import secretstore  # noqa: E402
 from avc.core.repo import Change  # noqa: E402
 from avc.flows import boot as boot_flow  # noqa: E402
 
@@ -155,11 +156,12 @@ def test_every_boot_command_is_registered():
 @pytest.mark.parametrize(
     "change",
     [
-        Change("??", "vars/per-machine/node1/volume-identity/hash/value"),
-        Change(" M", "secrets/clan-vars/per-machine/node1/luks/passphrase/passphrase.age"),
+        Change("??", "secrets/per-machine/node1/volume-identity/hash"),
+        Change(" M", "secrets/per-machine/node1/luks/passphrase.age"),
+        Change("??", "secrets/rekeyed/node1/0a6b3fd375141137c563ac0eb80eed1f-per-machine/node1/wg-ctrl/private.age"),
     ],
 )
-def test_preflight_refuses_vars_that_are_not_committed(ctx, monkeypatch, change):
+def test_preflight_refuses_secrets_that_are_not_committed(ctx, monkeypatch, change):
     evaluated = []
     monkeypatch.setattr(repo, "changes", lambda root: [Change(" M", "topology.nix"), change])
     monkeypatch.setattr(boot_flow.proc, "out", lambda *a, **k: evaluated.append(a) or "{}")
@@ -232,11 +234,90 @@ def test_unlock_pins_the_repositorys_host_key(ctx, monkeypatch):
     assert argv[-3:] == ["root@192.0.2.1", "systemd-tty-ask-password-agent", "--query"]
 
 
-def test_install_argv():
-    assert boot_flow.install_argv("node1", "192.0.2.9") == [
-        "clan", "machines", "install", "node1", "--target-host", "root@192.0.2.9", "--yes",
-    ]
-    assert boot_flow.install_argv("node1", "root@192.0.2.9")[5] == "root@192.0.2.9"
+@pytest.fixture
+def installer_runs(ctx, monkeypatch):
+    """`avc boot install` with its preflight answered and the site's installer recorded:
+    (argv, env) per run, the exit status it is given, and what was shipped after."""
+    state = {"runs": [], "rc": 0, "shipped": []}
+    monkeypatch.setattr(repo, "changes", lambda root: [])
+    monkeypatch.setattr(boot_flow.proc, "out", lambda *a, **k: '{"toplevel": "t", "disko": "d", "identity": "i"}')
+    monkeypatch.setattr(boot_flow.proc, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", ""))
+
+    def fake_run(argv, cwd=None, env=None, **k):
+        state["runs"].append((list(argv), dict(env or {}), cwd))
+        return subprocess.CompletedProcess(argv, state["rc"])
+
+    monkeypatch.setattr(boot_flow.subprocess, "run", fake_run)
+    monkeypatch.setattr(boot_flow.ship, "ship", lambda ctx, message, **k: state["shipped"].append((message, k.get("paths"))) or True)
+    monkeypatch.delenv(boot_flow.INSTALL_ARGS_ENV, raising=False)
+    return state
+
+
+def test_install_asks_then_runs_the_sites_installer_and_ships_the_identity(ctx, installer_runs):
+    from avc import ui
+
+    with ui.scripted(["node1"]):
+        run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity="/keys/rescue")
+    ((argv, env, cwd),) = installer_runs["runs"]
+    # The site's own app for this node (lib/mk-cluster.nix); what follows the target is nixos-anywhere's.
+    assert argv == ["nix", "run", ".#install-node1", "--", "root@192.0.2.9", "-i", "/keys/rescue"]
+    assert cwd == ctx.root
+    # Asked here, once, by name; the installer does not ask again.
+    assert env["IH_ASSUME_YES"] == "1"
+    # The hook is this program, and reaches the installer the way nixos-anywhere does.
+    assert os.path.isabs(env[boot_flow.SELF_ENV])
+    assert shlex.split(env[boot_flow.INSTALL_SSH_ENV]) == [*boot_flow.EPHEMERAL_HOST, "-i", "/keys/rescue"]
+    # What the hook wrote is the node's recipient and what was rekeyed to it.
+    assert installer_runs["shipped"] == [("feat(secrets): node1's age identity, and what it reads rekeyed to it", ["secrets/"])]
+
+
+def test_install_passes_a_sites_extra_arguments_to_nixos_anywhere(ctx, installer_runs, monkeypatch):
+    from avc import ui
+
+    monkeypatch.setenv(boot_flow.INSTALL_ARGS_ENV, "--kexec /tmp/kexec.tar.gz --ssh-option Port=2200")
+    with ui.scripted(["node1"]):
+        run(ctx, "boot", "install", node="node1", target="root@192.0.2.9", identity=None)
+    assert installer_runs["runs"][0][0][4:] == ["root@192.0.2.9", "--kexec", "/tmp/kexec.tar.gz", "--ssh-option", "Port=2200"]
+
+
+def test_install_runs_nothing_unless_the_nodes_name_is_typed(ctx, installer_runs):
+    from avc import ui
+    from avc.errors import Aborted
+
+    with ui.scripted(["node2"]), pytest.raises(Aborted):
+        run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity=None)
+    assert installer_runs["runs"] == [] and installer_runs["shipped"] == []
+
+
+def test_a_failed_install_ships_nothing(ctx, installer_runs):
+    from avc import ui
+
+    installer_runs["rc"] = 1
+    with ui.scripted(["node1"]), pytest.raises(AvcError, match="ended with status 1"):
+        run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity=None)
+    assert installer_runs["shipped"] == []
+
+
+def test_install_of_an_opted_out_node_skips_what_it_does_not_have(ctx, installer_runs, monkeypatch):
+    # insecurePlaintextBoot: no identity hash and no initrd key to print, plain disks. Its
+    # secrets are still its TPM's, so the installer and its hook run all the same.
+    from avc import ui
+
+    ctx.index.nodes["node1"]["boot"] = {"enabled": False}
+    evaluated = []
+    monkeypatch.setattr(boot_flow.proc, "out", lambda cmd, **k: evaluated.append(cmd[-1]) or "{}")
+    with ui.scripted(["node1"]):
+        run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity=None)
+    assert evaluated == [boot_flow.PLAIN_PREFLIGHT_APPLY]
+    assert installer_runs["runs"][0][0][:4] == ["nix", "run", ".#install-node1", "--"]
+    assert len(installer_runs["shipped"]) == 1
+
+
+def test_stage_is_the_installers_hook_and_says_so_when_run_by_hand(ctx, monkeypatch):
+    for v in ("IH_TARGET", "IH_EXTRA_FILES", "IH_DISK_KEYS"):
+        monkeypatch.delenv(v, raising=False)
+    with pytest.raises(AvcError, match="avc boot install node1"):
+        run(ctx, "boot", "stage", node="node1")
 
 
 @pytest.fixture
@@ -257,26 +338,33 @@ def test_bind_parses_a_node_and_two_switches():
     args = parser.parse_args(["boot", "bind", "node1", "--replace", "--device", "/dev/disk/by-partlabel/disk-nvme1-luks"])
     assert (args.node, args.replace, args.device) == ("node1", True, "/dev/disk/by-partlabel/disk-nvme1-luks")
     args = parser.parse_args(["boot", "bind", "node1"])
-    assert (args.node, args.replace, args.device) == ("node1", False, None)
+    assert (args.node, args.replace, args.device, args.recovery_key) == ("node1", False, None, False)
+    assert parser.parse_args(["boot", "bind", "node1", "--recovery-key"]).recovery_key is True
     # The node is the only positional: a file or a device after it is an error, not a guess.
     with pytest.raises(SystemExit):
         parser.parse_args(["boot", "bind", "node1", "/dev/disk/by-partlabel/disk-nvme1-luks"])
 
 
-def test_bind_asks_for_nothing_but_the_node(ctx, monkeypatch, piped):
+def test_bind_asks_for_nothing_but_the_node_and_reads_no_secret(ctx, monkeypatch, piped):
     # From the menu, where nothing is given: the node is chosen, and the rest is left out.
+    # Each leg's own TPM slot authorises its new one, so the recovery key is not decrypted:
+    # no YubiKey is touched, and nothing is sent.
     from avc import ui
 
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    read = []
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: read.append(var) or PASSPHRASE)
     with ui.scripted(["node1"]):
         run(ctx, "boot", "bind")
-    assert piped == [(boot_flow.bind_script(False, None), PASSPHRASE)]
+    assert piped == [(boot_flow.bind_script(False, None), "")]
+    assert read == []
 
 
-def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, piped, ssh, capsys):
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
-    run(ctx, "boot", "bind", node="node1", replace=False, device=None)
-    # One pipe to the node, and the passphrase is all it carries.
+def test_bind_sends_the_recovery_key_on_stdin_only_and_only_when_asked(ctx, monkeypatch, piped, ssh, capsys):
+    read = []
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: read.append((machine, var)) or PASSPHRASE)
+    run(ctx, "boot", "bind", node="node1", replace=False, device=None, recovery_key=True)
+    assert read == [("node1", "luks/passphrase")]
+    # One pipe to the node, and the key is all it carries.
     assert piped == [(boot_flow.bind_script(False, None), PASSPHRASE)]
     assert piped[0][0].startswith("rc=0; cluster-boot-seal bind || rc=$?; ")
     # Never on a command line, and never printed.
@@ -287,7 +375,7 @@ def test_bind_sends_the_passphrase_on_stdin_only(ctx, monkeypatch, piped, ssh, c
 
 
 def test_bind_replace_and_device(ctx, monkeypatch, piped):
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: PASSPHRASE)
     run(ctx, "boot", "bind", node="node1", replace=True, device="/dev/disk/by-partlabel/disk-nvme1-luks")
     assert piped[-1][0].startswith(
         "rc=0; cluster-boot-seal bind --replace --device /dev/disk/by-partlabel/disk-nvme1-luks || rc=$?; "
@@ -342,7 +430,7 @@ def test_a_failed_bind_after_a_good_one_keeps_the_good_ones_marker(tmp_path):
 
 
 def test_bind_reports_a_failed_bind(ctx, monkeypatch):
-    monkeypatch.setattr(clanvars, "get_value", lambda root, machine, var: PASSPHRASE)
+    monkeypatch.setattr(secretstore, "get_value", lambda root, machine, var: PASSPHRASE)
     monkeypatch.setattr(
         Node,
         "pipe",

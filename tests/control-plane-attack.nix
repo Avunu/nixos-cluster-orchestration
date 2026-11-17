@@ -103,13 +103,13 @@
 {
   pkgs,
   lib,
-  clan,
+  site,
   harness,
   mutant ? "",
   extraModule ? { },
 }:
 let
-  machine = clan.config.nixosConfigurations.node1;
+  machine = site.nixosConfigurations.node1;
   inherit (machine._module.specialArgs) topology;
   net = import ../lib/net.nix { inherit lib; };
   nomadPki = import ../lib/nomad-pki.nix { inherit lib; };
@@ -267,7 +267,7 @@ let
   # ── raw_exec lockdown (WS7) ─────────────────────────────────────────────────────
   inherit (import ../lib/nomad.nix) appsUser appsUid;
   # The management token's file on node1: what a template or an artifact would steal.
-  mgmtTokenPath = machine.config.clan.core.vars.generators.nomad-acl.files.token.path;
+  mgmtTokenPath = machine.config.cluster.secrets.generators.nomad-acl.files.token.path;
   # A declared container, and one that is not: the polkit rule tells them apart.
   declaredUnit = "container@${lib.head (lib.attrNames machine.config.clusterApps)}.service";
   # Somewhere each kind of network answers, from node1: loopback (sshd), the control
@@ -356,7 +356,7 @@ pkgs.testers.runNixOSTest {
 
     node1 = {
       imports = [
-        clan.config.nixosModules."clan-machine-node1"
+        site.machineModules.node1
         (harness.nodeModule { memoryMB = 4096; })
         extraModule
       ];
@@ -412,7 +412,7 @@ pkgs.testers.runNixOSTest {
     # Any registered job: the registrar plans it, the others read it.
     A_JOB = "app-${lib.head (lib.attrNames machine.config.clusterApps)}"
     METRIC = "/var/lib/prometheus-node-exporter-text/nomad_fence.prom"
-    JWT_FENCE = "${machine.config.clan.core.vars.generators.nomad-login.files."jwt-fence".path}"
+    JWT_FENCE = "${machine.config.cluster.secrets.generators.nomad-login.files."jwt-fence".path}"
     UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     # How long each negative case is watched. The documented limit must be promoted
     # inside it, which is what makes "never a voter" in the others mean something.

@@ -56,7 +56,7 @@ let
   cfg = config.cluster.canary;
   jfs = clusterLib.juicefs;
   os = topology.objectStorage;
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
 
   # The scan. Bash, as the listing ran; `set -u` without -e, because a class's failure
   # is handled per class and must not skip the others. Edited only by a mutant
@@ -343,7 +343,7 @@ in
         METRICS_DIR = "/var/lib/prometheus-node-exporter-text";
         LC_ALL = "C";
         # The name the Worker knows this node's token by (modules/audit-ship.nix sets it
-        # to the clan machine name), and the planted file's name.
+        # to the machine's name), and the planted file's name.
         NODE = config.cluster.audit.node;
         SPOOL_DIR = lib.optionalString config.cluster.audit.enable config.cluster.audit.spoolDir;
         SWAP_DEVICES = lib.concatStringsSep " " cfg.swapDevices;

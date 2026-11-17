@@ -142,9 +142,9 @@ let
   # so prompted, and apart from any generated generator of the app's (filling
   # it must not re-run that one's script). Declared once the tunnel id is set:
   #   cloudflared tunnel create <name>
-  #   clan vars set <node> <name>-cf/cloudflared < ~/.cloudflared/<id>.json
+  #   agenix edit -i ~/.cloudflared/<id>.json secrets/shared/<name>-cf/cloudflared.age
   #   cloudflared tunnel route dns <name> <hostname>
-  # then commit the id and the var together.
+  # then commit the id and the secret together.
   defaultCreds = n: {
     generator = "${n}-cf";
     file = "cloudflared";
@@ -157,7 +157,7 @@ in
   config = {
     clusterApps = lib.mkMerge (fromNix ++ fromJson);
 
-    clan.core.vars.generators = lib.mapAttrs' (
+    cluster.secrets.generators = lib.mapAttrs' (
       n: _:
       lib.nameValuePair "${n}-cf" {
         share = true;

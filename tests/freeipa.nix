@@ -9,10 +9,10 @@
   lib,
   clusterLib,
   topology,
-  clanSystem,
+  nodeSystem,
 }:
 let
-  c = clanSystem.config;
+  c = nodeSystem.config;
   app = c.clusterApps.demo-idm;
   guest = c.containers.demo-idm.config;
   ipa = guest.virtualisation.oci-containers.containers.freeipa;
@@ -20,7 +20,7 @@ let
   fw = guest.networking.firewall;
   authelia = guest.systemd.services.authelia-demo-idm;
   pinnedIpa =
-    (clanSystem.extendModules {
+    (nodeSystem.extendModules {
       modules = [
         {
           clusterApps.demo-idm.freeipa.image = {

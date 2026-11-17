@@ -5,6 +5,7 @@
 # Disks live outside the VMs. One provisioning gives a frozen base, and each case boots
 # copy-on-write overlays of it, so one install serves many independent cases. `target`
 # and `installer` share those disks and never run at once.
+import json
 import os
 import re
 import shlex
@@ -39,6 +40,7 @@ HALTED = re.compile(r"System halted|alting\.")
 WRONG = "this-is-not-the-passphrase"
 
 _cases = 0
+_installer_tpms = 0
 _firmwares = 0
 
 
@@ -100,17 +102,33 @@ def new_firmware(source=None):
 # ── provisioning ──────────────────────────────────────────────────────────
 
 
-def installer_up(disks):
+def installer_up(disks, firmware=None):
+    """The installer on these disks. Its TPM is that machine's (`firmware`) when the
+    installer stands for the node's own rescue boot, as at an install; otherwise one of its
+    own, so that nothing an attacker's or a repairer's boot does here has the node's TPM."""
+    global _installer_tpms
     use_disks(disks)
+    if firmware is None:
+        _installer_tpms += 1
+        tpm = TPM / f"i{_installer_tpms}"
+        tpm.mkdir(parents=True)
+    else:
+        tpm = firmware / "t"
+    os.environ["NIX_SWTPM_DIR"] = str(tpm)
     installer.start()
     installer.wait_for_unit("multi-user.target")
 
 
-def seed_secrets(identity=True):
-    """/run/partitioning-secrets, at the paths clan would upload to."""
+def seed_secrets(identity=True, recovery=True):
+    """/run/partitioning-secrets, at the paths an install puts them."""
+    if recovery:
+        installer.succeed(
+            f"install -D -m 0400 /dev/null {PASSWORD_FILE}",
+            f"printf %s '{PASSPHRASE}' > {PASSWORD_FILE}",
+        )
+    else:
+        installer.succeed(f"rm -f {PASSWORD_FILE}")
     installer.succeed(
-        f"install -D -m 0400 /dev/null {PASSWORD_FILE}",
-        f"printf %s '{PASSPHRASE}' > {PASSWORD_FILE}",
         f"mkdir -p $(dirname {HOST_KEY_FILE})",
         f"[ -e {HOST_KEY_FILE} ] || ssh-keygen -q -t ed25519 -N '' -C initrd-host -f {HOST_KEY_FILE}",
     )
@@ -160,16 +178,84 @@ def esp_differences(machine, a, b):
     ).strip()
 
 
-def provision(inspect=None):
-    """The real disko script, from an empty disk, then nixos-install, as `clan machines
-    install` does. Only the secrets' upload is the test's own. `inspect` runs with the new
-    system still mounted at /mnt."""
+INSTALL_KEYS = "/run/cluster-install"
+
+
+def luks_header(machine, device):
+    return json.loads(machine.succeed(f"cryptsetup luksDump --dump-json-metadata {device}"))
+
+
+def tpm2_tokens(header):
+    return [t for t in header["tokens"].values() if t["type"] == "systemd-tpm2"]
+
+
+def installed_slots():
+    """What an install leaves on each leg, read from the installer before anything boots:
+    two key slots and no more, one of them a TPM slot bound to no PCR, which opens on this
+    TPM; the other the recovery key's. The key the leg was formatted with opens nothing and
+    is not in the installer's memory any more."""
+    problems = []
+    for name, device in sorted(LUKS_DEVICES.items()):
+        header = luks_header(installer, device)
+        tokens = tpm2_tokens(header)
+        if len(header["keyslots"]) != 2:
+            problems.append(f"{name}: {len(header['keyslots'])} key slots, not 2")
+        if len(tokens) != 1 or tokens[0].get("tpm2-pcrs") != []:
+            problems.append(f"{name}: TPM tokens {[t.get('tpm2-pcrs') for t in tokens]}, not one bound to no PCR")
+        rc, out = installer.execute(f"{tpm_opens(device)} 2>&1 < /dev/null")
+        if rc != 0:
+            problems.append(f"{name}: its TPM slot does not open on the TPM it was installed on: {out.strip()[-200:]}")
+        rc, out = installer.execute(
+            f"printf %s {shlex.quote(PASSPHRASE)} | cryptsetup open --test-passphrase --key-file - {device} 2>&1"
+        )
+        if rc != 0:
+            problems.append(f"{name}: the recovery key does not open it: {out.strip()[-200:]}")
+        rc, out = installer.execute(
+            f"printf %s {shlex.quote(WRONG)} | cryptsetup open --test-passphrase --key-file - {device} 2>&1"
+        )
+        if rc == 0:
+            problems.append(f"{name}: a key that is not the recovery key opens it")
+    left = installer.succeed(f"ls -A {INSTALL_KEYS} 2>/dev/null || true").strip()
+    if left:
+        problems.append(f"install keys left in {INSTALL_KEYS}: {left}")
+    return problems
+
+
+def provision(inspect=None, firmware=None, keep_install_slots=False):
+    """The real disko script, from an empty disk, then nixos-install, as an install
+    does. Only how the secrets get there is the test's own. `inspect` runs with the new
+    system still mounted at /mnt.
+
+    `firmware` is the machine being installed: its TPM is the installer's, as a node's is
+    its rescue boot's. With `keep_install_slots` the legs are left as an install leaves
+    them. Without it the install's TPM slot is removed from both once it has been checked:
+    the frozen base is then a node whose TPM has nothing for it, which is where every test
+    but boot-install starts (a prompt, then a bind with the recovery key)."""
     global HOST_KEY_LINE
     BASE.mkdir(parents=True)
-    TPM.mkdir(parents=True)
+    TPM.mkdir(parents=True, exist_ok=True)
     for letter in "ab":
         new_blank(BASE / f"{letter}.qcow2")
-    installer_up(BASE)
+    installer_up(BASE, firmware)
+
+    # No recovery key: nothing could ever open the disks but this one TPM. Refused before
+    # either leg is formatted.
+    seed_secrets(recovery=False)
+    rc, out = installer.execute(
+        f"rc=0; {DISKO} --yes-wipe-all-disks > /tmp/disko.log 2>&1 || rc=$?; tail -n 20 /tmp/disko.log; exit $rc",
+        timeout=600,
+    )
+    formatted = [
+        name
+        for name, device in sorted(LUKS_DEVICES.items())
+        if installer.execute(f"test -e {device} && cryptsetup isLuks {device}")[0] == 0
+    ]
+    control(
+        "disko-hook-refuses-missing-recovery-key",
+        rc != 0 and "refusing to install" in out and formatted == [],
+        f"rc={rc}, LUKS headers written: {formatted}: {out[-400:]}",
+    )
+    release_disks()
 
     seed_secrets(identity=False)
     rc, out = installer.execute(
@@ -184,7 +270,10 @@ def provision(inspect=None):
     release_disks()
 
     seed_secrets()
-    installer.succeed(f"{DISKO} --yes-wipe-all-disks >&2", timeout=600)
+    installer.succeed(f"{DISKO} --yes-wipe-all-disks > /tmp/disko.log 2>&1 || {{ tail -n 60 /tmp/disko.log >&2; exit 1; }}", timeout=600)
+    # The log is the script's trace (disko runs under set -x): no key may be in it.
+    leaked = installer.execute(f"grep -c -F -e {shlex.quote(PASSPHRASE)} /tmp/disko.log")[1].strip()
+    control("disko-log-holds-no-key", leaked == "0", f"{leaked} line(s) of the disko log hold the recovery key")
     installer.succeed(
         f"nixos-install --root /mnt --system {TOPLEVEL} --no-root-passwd --no-channel-copy < /dev/null >&2",
         timeout=1200,
@@ -196,8 +285,13 @@ def provision(inspect=None):
         control("both-esps-identical-after-install", out == "", out)
     # espread compares the initrd on the ESP with this. It isn't kept anywhere else.
     HOST_KEY_LINE = installer.succeed(f"sed -n 2p {HOST_KEY_FILE}").strip()
+    problems = installed_slots()
+    control("install-leaves-a-tpm-slot-and-the-recovery-key", problems == [], "; ".join(problems))
     if inspect is not None:
         inspect()
+    if not keep_install_slots:
+        for _, device in sorted(LUKS_DEVICES.items()):
+            installer.succeed(f"systemd-cryptenroll --wipe-slot=tpm2 {device} >&2")
     release_disks()
     installer.shutdown()
     for letter in "ab":
@@ -644,13 +738,32 @@ def without_drive(letter):
 
 
 def bind(*args, passphrase=None):
-    """(rc, output) of cluster-boot-seal bind, with the passphrase on stdin as `avc boot bind`
-    sends it: no final newline."""
+    """(rc, output) of cluster-boot-seal bind, with the recovery key on stdin as `avc boot bind
+    --recovery-key` sends it: no final newline. `passphrase=""` is `avc boot bind` without
+    it, which sends nothing: the leg's own TPM slot has to authorise the new one."""
     extra = " ".join(shlex.quote(a) for a in args)
     typed = PASSPHRASE if passphrase is None else passphrase
     return target.execute(
         f"printf %s {shlex.quote(typed)} | cluster-boot-seal bind {extra} 2>&1",
         timeout=300,
+    )
+
+
+def sealed_tokens(machine=None):
+    """TPM slots per leg that are sealed to PCR 7: what a bind makes, and the install's is not."""
+    machine = machine or target
+    return {
+        name: sum(1 for t in tpm2_tokens(luks_header(machine, device)) if 7 in t.get("tpm2-pcrs", []))
+        for name, device in sorted(LUKS_DEVICES.items())
+    }
+
+
+def recovery_key_opens(machine=None):
+    """Whether the recovery key opens every leg: a bind may replace TPM slots and nothing else."""
+    machine = machine or target
+    return all(
+        machine.execute(f"printf %s {shlex.quote(PASSPHRASE)} | cryptsetup open --test-passphrase --key-file - {device}")[0] == 0
+        for _, device in sorted(LUKS_DEVICES.items())
     )
 
 

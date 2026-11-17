@@ -25,7 +25,7 @@ rec {
   cliName = "cli.${region}.nomad";
 
   # A CA outlives every certificate it signs, so a rotation is always a reissue of
-  # agents first. clan does not renew on age: `security.nomadTlsRotation` forces it.
+  # agents first. Nothing renews on age: `security.nomadTlsRotation` forces it.
   caDays = 3650;
   certDays = 825;
 

@@ -2,7 +2,7 @@
 
 `quick` is what the menu shows on every return: git, nodes (one ssh round
 trip each, in parallel) and what is pending. `full` adds what costs an eval —
-whether each node runs origin/main, and clan's vars status.
+whether each node runs origin/main, and whether its secrets are generated and rekeyed.
 """
 
 from __future__ import annotations
@@ -13,8 +13,7 @@ from typing import TYPE_CHECKING
 
 from avc import ui
 from avc.actions import Arg, action
-from avc.core import repo, ship
-from avc.core import vars as clanvars
+from avc.core import repo, secretstore, ship
 from avc.errors import AvcError
 
 if TYPE_CHECKING:
@@ -84,7 +83,7 @@ def _pending(ctx: Ctx) -> None:
 def _hygiene(ctx: Ctx) -> None:
     """Leftovers the README says should go, surfaced rather than removed."""
     if (ctx.root / "tmp" / "cloud-storage.json").exists():
-        ui.warn("tmp/cloud-storage.json holds plaintext S3 credentials — delete it once stored in vars")
+        ui.warn("tmp/cloud-storage.json holds plaintext S3 credentials — delete it once they are stored (`avc secrets set`)")
 
 
 def quick(ctx: Ctx) -> None:
@@ -107,36 +106,39 @@ def _converged(ctx: Ctx, healths: dict[str, Health]) -> None:
             ui.warn(f"{name}: NOT on {repo.deploy_ref(ctx.root)} {rev[:8]} — `avc deploy now`, or wait for the timer")
 
 
-def _vars(ctx: Ctx) -> None:
+def _secrets(ctx: Ctx) -> None:
     for name in ctx.installed:
-        with ui.spin(f"{name}: checking vars"):
+        with ui.spin(f"{name}: checking secrets"):
             try:
-                s = clanvars.status(ctx.root, name)
+                s = secretstore.status(ctx.root, name)
+                r = secretstore.readiness(ctx.root, name)
             except AvcError as e:
                 ui.err(str(e))
                 continue
-        if s.clean:
-            ui.ok(f"{name}: all vars present and current")
+        if s.clean and r.ok:
+            ui.ok(f"{name}: every secret is generated, current and rekeyed")
         for v in s.missing:
-            ui.warn(f"{name}: missing {v}")
-        for v in s.unfixed:
-            ui.warn(f"{name}: needs re-encryption {v}  (recipients changed)")
+            ui.warn(f"{name}: missing {v}  (`avc secrets provision`)")
+        if s.unfixed:
+            ui.warn(f"{name}: {len(s.unfixed)} secret(s) need re-encryption  (master recipients changed; `avc secrets fix`)")
         for g in s.outdated:
-            ui.warn(f"{name}: outdated generator {g}  (its definition changed; regenerate)")
+            ui.warn(f"{name}: outdated generator {g}  (what it is made from changed; `avc secrets provision`)")
+        for v in r.unrekeyed:
+            ui.warn(f"{name}: {v} is not rekeyed for it  (`avc secrets rekey`)")
 
 
-@action("status", "show", "Overview (repo, nodes, pending work)", Arg("full", "Also check deploy convergence and vars", flag=True))
+@action("status", "show", "Overview (repo, nodes, pending work)", Arg("full", "Also check deploy convergence and secrets", flag=True))
 def show(ctx: Ctx, full: bool) -> None:
     ui.header("cluster")
     _git(ctx)
     healths = _nodes(ctx)
     if full:
         _converged(ctx, healths)
-        _vars(ctx)
+        _secrets(ctx)
     _pending(ctx)
     _hygiene(ctx)
 
 
-@action("status", "full", "Full check (+ convergence with origin/main, vars)")
+@action("status", "full", "Full check (+ convergence with origin/main, secrets)")
 def full(ctx: Ctx) -> None:
     show(ctx, full=True)

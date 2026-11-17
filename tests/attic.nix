@@ -23,12 +23,12 @@
 {
   pkgs,
   lib,
-  mkClan,
+  mkSite,
   topology,
 }:
 let
-  clan = mkClan topology;
-  machine = clan.config.nixosConfigurations.node1;
+  site = mkSite topology;
+  machine = site.nixosConfigurations.node1;
   net = import ../lib/net.nix { inherit lib; };
   node = topology.nodes.node1;
 
@@ -110,7 +110,7 @@ pkgs.testers.runNixOSTest {
     wan = harness.wanNode;
     node1 = {
       imports = [
-        clan.config.nixosModules."clan-machine-node1"
+        site.machineModules.node1
         (harness.nodeModule { memoryMB = 4096; })
         cacheApp
       ];

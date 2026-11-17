@@ -22,14 +22,14 @@
 # client does.
 #
 # Break-glass, for when the IdP is down: the built-in `admin` user, password
-# in `clan vars get <node> <name>/admin-password`, at
+# in `agenix view secrets/shared/<name>/admin-password.age`, at
 # https://<hostname>/login?disableAutoLogin=true (or basic auth on the API).
 #
 # ── first start ─────────────────────────────────────────────────────────────
 #   cloudflared tunnel create <name>
-#   set tunnel.id; clan vars set <node> <name>-cf/cloudflared < ~/.cloudflared/<id>.json
+#   set tunnel.id; agenix edit -i ~/.cloudflared/<id>.json secrets/shared/<name>-cf/cloudflared.age
 #   cloudflared tunnel route dns <name> <hostname>
-#   clan vars generate <node>        # <name>/*, <idp>-oidc-<name>/*
+#   generate the secrets             # <name>/*, <idp>-oidc-<name>/*
 #   -> deploy, `nomad job run` app-<name>; and `nomad job restart app-<idp>`
 #      so Authelia mounts the new client secret.
 {
@@ -46,7 +46,6 @@ let
   inherit (lib) mkOption types;
   net = clusterLib.net;
   hostApps = config.clusterApps;
-
 
   socket = "/run/grafana/grafana.sock";
   dataDir = "/var/lib/grafana";
@@ -276,7 +275,7 @@ in
       message = "clusterApps.${n}: Grafana signs in through oidc.idp, which must name a FreeIPA app with authelia.enable.";
     }) apps;
 
-    clan.core.vars.generators = lib.mapAttrs (_: _: {
+    cluster.secrets.generators = lib.mapAttrs (_: _: {
       share = true;
       files.secret-key = { };
       files.admin-password = { };

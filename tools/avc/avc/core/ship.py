@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 # Paths a flow writes; anything else in the working tree is left unticked when
 # choosing what to commit, so a stray scratch file is never swept in.
-OPS_PATHS = ("apps/", "vars/", "secrets/", "cluster/", "hosts/", "topology.nix", "machines/", "inventory.json")
+OPS_PATHS = ("apps/", "secrets/", "cluster/", "hosts/", "topology.nix")
 
 # Waiting for a pull request to merge: how often to look, and when to stop looking and
 # leave the rest to `avc deploy ship`. An hour covers the gate's boot tests and every

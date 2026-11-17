@@ -205,8 +205,6 @@ rec {
   volumeLoadCredentials = vars: v: loadCredentials (volumeCredPath vars v);
 
   # LoadCredential entries given a resolver from credential id -> host path.
-  # Stage 2 swapped these from agenix paths to clan vars paths by changing only
-  # the resolver passed in here.
   # `pathFor` is given the attribute name (rsaPem); the credential is named by its
   # value (rsapem), which is what the scripts read. The two were equal until WS11.
   loadCredentials = pathFor: lib.mapAttrsToList (key: id: "${id}:${pathFor key}") credIds;

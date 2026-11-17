@@ -33,7 +33,7 @@ let
         extraModules = modules;
       }
       // lib.optionalAttrs (admins != null) { inherit admins; }
-    )).config.nixosConfigurations.node1;
+    )).nixosConfigurations.node1;
 
   contractOf = args: builtins.toJSON (node args).config.cluster.deploy.bootContract;
   baseline = contractOf { };

@@ -406,7 +406,7 @@ let
           mesh = builtins.removeAttrs secureTopology.mesh [ "mtu" ];
         };
       }
-    ).config.nixosConfigurations.node1.config;
+    ).nixosConfigurations.node1.config;
   mtusIn =
     nw:
     lib.filter (x: x != null) (

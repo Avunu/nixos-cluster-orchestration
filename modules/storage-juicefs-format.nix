@@ -20,7 +20,7 @@
 let
   jfs = clusterLib.juicefs;
   os = topology.objectStorage;
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
 
   metaIp = jfs.metaHost;
 
@@ -30,9 +30,8 @@ let
     gen: file:
     let
       f = vars.${gen}.files.${file};
-      p = config.clan.core.settings.directory + "/secrets/clan-vars/${f.rel_dir}/${f.name}/${f.name}.age";
     in
-    lib.optional (builtins.pathExists p) (builtins.hashFile "sha256" p);
+    lib.optional f.exists (builtins.hashFile "sha256" f.source);
 
   juicefs = "${pkgs.juicefs}/bin/juicefs";
   rclone = "${pkgs.rclone}/bin/rclone";

@@ -1,7 +1,7 @@
-# modules/backup.nix — backups, wired to clan vars.
+# modules/backup.nix — backups, wired to the site's secrets.
 #
 # Everything that decides WHAT is backed up and HOW lives in
-# modules/backup-core.nix, which knows nothing about clan (so it can be tested
+# modules/backup-core.nix, which knows nothing about them (so it can be tested
 # in a VM against an S3 server with plain credential files). This file only adds the
 # secrets: where the repository password and the target's credentials come from.
 #
@@ -45,7 +45,7 @@
   ...
 }:
 let
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
   salt = topology.backup.repoSalt or null;
   state = topology.backup.state or null;
 in
@@ -55,7 +55,7 @@ in
     ./state-backup-core.nix
   ];
 
-  clan.core.vars.generators = {
+  cluster.secrets.generators = {
     # The repository password. Generated, not prompted -- losing it means
     # losing every backup, so it lives in vars (in git, encrypted) rather than
     # in someone's password manager. One password, but every app's repository
@@ -76,7 +76,7 @@ in
     # target (for MinIO: a user limited to the backup bucket, WITHOUT
     # s3:DeleteObjectVersion, so versioning keeps history this cluster cannot
     # erase; see README "Backups"). Prompted, so swapping targets is
-    # `clan vars set <node> backup-target/access-key` + `/secret-key`.
+    # `agenix edit secrets/shared/backup-target/access-key.age` + `secret-key.age`.
     backup-target = {
       share = true;
       prompts = {
@@ -96,7 +96,7 @@ in
   # Credentials for topology.backup.state.target, the frequent backup's own target
   # (modules/state-backup-core.nix): a different place from the nightly one's, so a
   # different pair. Declared only where the topology names that target.
-  clan.core.vars.generators.backup-state-target = lib.mkIf (state != null) {
+  cluster.secrets.generators.backup-state-target = lib.mkIf (state != null) {
     share = true;
     prompts = {
       access-key = {

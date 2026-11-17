@@ -6,7 +6,7 @@
 #   s3      `rclone serve s3` (as in tests/jfs-encrypted.nix), and the off-host audit
 #           receiver: the REAL watchdog Worker behind tests/lib/audit-stub.mjs, on http.
 #   node1   the REAL modules/canary-scan.nix, with the real modules/vars.nix,
-#           storage-juicefs.nix and storage-juicefs-format.nix under clanCore for the s3
+#           storage-juicefs.nix and storage-juicefs-format.nix over modules/secrets.nix for the s3
 #           class (the jfs-encrypted pattern: fixture secrets, a dummy interface for the
 #           mesh address), modules/coredumps-off.nix, and the audit spool's sender.
 #           Extra disks, by serial: an ESP (vfat at /boot), a plain swap (declared
@@ -67,7 +67,7 @@
   lib,
   topology,
   harnessFor,
-  clanCoreModule,
+  secretsModule,
   mutant ? "",
   extraModule ? { },
 }:
@@ -175,7 +175,7 @@ pkgs.testers.runNixOSTest {
       { config, pkgs, ... }:
       {
         imports = [
-          clanCoreModule
+          secretsModule
           ../modules/vars.nix
           ../modules/storage-juicefs.nix
           ../modules/storage-juicefs-format.nix
@@ -232,11 +232,11 @@ pkgs.testers.runNixOSTest {
         boot.kernelParams = [ "zswap.enabled=0" ];
 
         system.stateVersion = testTopology.stateVersion;
-        clan.core.enableRecommendedDefaults = false;
-        clan.core.settings.state-version.enable = false;
-        clan.core.settings.machine.name = "node1";
-        clan.core.settings.directory = toString ./fixtures;
-        clan.core.vars.settings.secretStore = "age";
+        cluster.secrets = {
+          machine = "node1";
+          directory = toString ./fixtures;
+          masterIdentities = import ./fixtures/master-identities.nix;
+        };
 
         # The control-mesh address the metadata URL names (a test that asks the database by that address).
         systemd.services."${net.meshIf}-ready" = {
@@ -289,7 +289,7 @@ pkgs.testers.runNixOSTest {
   testScript =
     { nodes, ... }:
     let
-      gens = nodes.node1.clan.core.vars.generators;
+      gens = nodes.node1.cluster.secrets.generators;
       cryptSwap = lib.findFirst (s: s.randomEncryption.enable) null nodes.node1.swapDevices;
     in
     ''

@@ -1,16 +1,17 @@
 # Shared pieces of the cluster VM tests (tests/cluster-single.nix, tests/cluster.nix).
 #
-# Those tests boot the REAL machine modules — what `clan` builds for each node,
-# taken from `clanEval.config.nixosModules."clan-machine-<name>"`, the very
-# module behind nixosConfigurations.<name> — and change only what a VM cannot
-# have. Each change below is the smallest one that lets the production code
-# path run unmodified:
+# Those tests boot the REAL machine modules — what mkCluster builds for each node,
+# taken from its `machineModules.<name>`, the very module behind
+# nixosConfigurations.<name> — and change only what a VM cannot have. Each change
+# below is the smallest one that lets the production code path run unmodified:
 #
-#   secrets      clan's age backend decrypts every vars file into /run/secrets
-#                during activation, with a key no CI machine holds. The test
-#                replaces only that activation step, writing FIXTURE values to
-#                the same paths with the same owner and mode. Nothing real is
-#                decrypted, and every unit still reads /run/secrets/...
+#   secrets      agenix decrypts every secret into /run/secrets during activation,
+#                with a key only the node's TPM holds, from files only an operator's
+#                master key can make. The test replaces only that activation step,
+#                writing FIXTURE values to the same paths with the same owner and
+#                mode. Nothing real is decrypted, every unit still reads
+#                /run/secrets/..., and the gate (cluster-secrets.service) checks the
+#                same paths. tests/secrets-tpm.nix is the one test that decrypts.
 #   NICs         the VMs' NICs are NAMED as the topology says (wanInterface, the
 #                vRack trunk vrackInterface), so overlay-network.nix's networkd units and
 #                VLAN children apply as written, at the real addresses.
@@ -39,7 +40,7 @@
   # (tests/voter-growth.nix: the same CA before and after a worker becomes a voter).
   # null: made here, from this topology.
   fixturePki ? null,
-  # "<generator>/<file>" -> a path, for a test whose vars need more than a
+  # "<generator>/<file>" -> a path, for a test whose secrets need more than a
   # placeholder (tests/attic.nix: a real RSA key, and a token signed with it).
   extraFixtureSources ? { },
 }:
@@ -126,14 +127,14 @@ let
   pki =
     if fixturePki != null then fixturePki else import ./fixture-pki.nix { inherit pkgs lib topology; };
   # The control mesh's keys: literals, whose public halves are the fixture's public
-  # vars (tests/lib/fixture-wg.nix).
+  # files (tests/lib/fixture-wg.nix).
   wg = import ./fixture-wg.nix;
   net = import ../../lib/net.nix { inherit lib; };
   meshIps = lib.mapAttrs (_: n: net.meshIp topology n) topology.nodes;
   nomadPki = import ../../lib/nomad-pki.nix { inherit lib; };
   inherit (import ../../lib/nomad.nix) appsNamespace;
 
-  # Values for the vars files whose content something checks. Everything else
+  # Values for the secret files whose content something checks. Everything else
   # gets "ci-fixture-<generator>-<file>", which is enough for a password.
   fixtures = {
     "nomad-acl/token" = nomadToken;
@@ -157,7 +158,7 @@ let
     else
       fixtures."${gen}/${file}" or "ci-fixture-${gen}-${file}";
 
-  # The file a node gets for one vars file: a path, installed as it is. Never read it
+  # The file a node gets for one secret file: a path, installed as it is. Never read it
   # into a string at evaluation: the PKI is a build output, and reading one is
   # import-from-derivation, which `nix flake check --no-build` refuses.
   fixtureSource =
@@ -184,28 +185,22 @@ let
     else
       pkgs.writeText "fixture-${gen}-${file}" (fixtureFor gen file);
 
-  # Replaces clan's age `setupSecrets` activation snippet (clan-core:
-  # nixosModules/clanCore/vars/secret/age.nix) with one that writes fixtures to
-  # the paths that snippet would have decrypted to. `keep` picks the generators:
-  # every one for a cluster node, only its own for a test that imports a few modules
-  # (tests/jfs-encrypted.nix).
+  # Turns agenix off (no secret, so no decryption and no rekeyed file looked for) and
+  # writes fixtures to the paths it would have decrypted to. `keep` picks the
+  # generators: every one for a cluster node, only its own for a test that imports a
+  # few modules (tests/jfs-encrypted.nix). Every file a node is meant to hold gets
+  # one, with or without a placeholder under tests/fixtures/secrets.
   secretsModuleFor =
     keep:
     { config, nodeName, ... }:
     let
-      files = lib.concatLists (
-        lib.mapAttrsToList (
-          gen: g:
-          lib.mapAttrsToList (name: f: f // { inherit gen name; }) (
-            lib.filterAttrs (_: f: f.secret && f.deploy && f.neededFor == "services") g.files
-          )
-        ) (lib.filterAttrs (gen: _: keep gen) config.clan.core.vars.generators)
-      );
+      files = lib.filter (f: keep f.generator) config.cluster.secrets.deployed;
+      whole = lib.all (f: keep f.generator) config.cluster.secrets.lowered;
       write = f: ''
         install -D -m ${f.mode} -o ${f.owner} -g ${f.group} \
           ${
             fixtureSource {
-              inherit (f) gen;
+              gen = f.generator;
               file = f.name;
               node = nodeName;
             }
@@ -213,32 +208,35 @@ let
       '';
     in
     {
-      # The production backend is still what decides every `.path`; only the
-      # decryption is swapped.
-      assertions = [
-        {
-          assertion = config.clan.core.vars.settings.secretStore == "age";
-          message = "cluster-harness: expected the age vars backend; the fixture writer mirrors its paths.";
-        }
-      ];
-      system.activationScripts.setupSecrets = lib.mkForce (
-        lib.stringAfter [
-          "specialfs"
-          "users"
-          "groups"
-        ] (lib.concatMapStrings write files)
-      );
+      age.secrets = lib.mkForce { };
+      # The gate expects every generated secret. A test that writes only some of them
+      # is not a node, and has no gate.
+      systemd.services.cluster-secrets.enable = whole;
+      systemd.services.cluster-secrets-watch.enable = whole;
+      systemd.timers.cluster-secrets-watch.enable = whole;
+      system.activationScripts.fixtureSecrets = lib.stringAfter [
+        "specialfs"
+        "users"
+        "groups"
+      ] (lib.concatMapStrings write files);
     };
 
   secretsModule = secretsModuleFor (_: true);
 
   # What every cluster node gets on top of its real machine module.
-  nodeModule =
+  nodeModule = args: {
+    imports = [
+      secretsModule
+      (vmModule args)
+    ];
+  };
+
+  # The same without the fixture secrets, for the test that decrypts real ones
+  # (tests/secrets-tpm.nix).
+  vmModule =
     { memoryMB }:
     { node, ... }:
     {
-      imports = [ secretsModule ];
-
       virtualisation = {
         memorySize = memoryMB;
         cores = 2;
@@ -338,7 +336,7 @@ let
   #
   # Nomad wants a client certificate on every HTTP call. TLSCURL names the one a
   # root shell on the node already has: modules/cluster-common.nix puts NOMAD_CACERT,
-  # NOMAD_CLIENT_CERT and NOMAD_CLIENT_KEY in the environment from the node's vars, and
+  # NOMAD_CLIENT_CERT and NOMAD_CLIENT_KEY in the environment from the node's secrets, and
   # the test driver's shell reads /etc/profile. So these helpers also prove that the
   # environment an operator gets is right; the `nomad` CLI reads the same variables.
   pythonHelpers = ''
@@ -431,6 +429,7 @@ in
 {
   inherit
     nodeModule
+    vmModule
     secretsModuleFor
     wanNode
     pythonHelpers

@@ -26,7 +26,7 @@
 #                                      the app stopped everywhere: its dataset replaced
 #                                      by the snapshot's, here, and handed to the others
 #
-# The clan-independent half; modules/backup.nix supplies the credentials.
+# modules/backup.nix supplies the credentials.
 {
   config,
   lib,
@@ -151,7 +151,9 @@ let
         summary=$(mktemp)
         # Dated as the data is, not as the upload: a restore is chosen by what it holds.
         r backup --host "$APP" --tag state --tag "snapshot:''${src#*@}" --time "$(date -d "@$created" '+%F %T')" \
-          --json ${lib.optionalString (uploadLimitKiB > 0) "--limit-upload ${toString uploadLimitKiB}"} \
+          --json ${
+            lib.optionalString (uploadLimitKiB > 0) "--limit-upload ${toString uploadLimitKiB}"
+          } \
           "$MNT" > "$summary" || rc=$?
         grep '"message_type":"error"' "$summary" | jq -r '"\(.item // "") \(.error.message // .error)"' >&2 || true
         rm -f "$summary"

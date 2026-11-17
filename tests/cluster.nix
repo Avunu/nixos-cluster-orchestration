@@ -1,7 +1,7 @@
 # VM test: a three-node cluster forms, shares storage, and runs containers
 # under Nomad.
 #
-# The same clan as the fixture cluster (`mkClan`, tests/fixtures) over its
+# The same site as the fixture cluster (`mkSite`, tests/fixtures) over its
 # topology with ONE change: node2 and node3 are provisioned voters, which is
 # exactly the commit a topology needs when their machines land. node1 keeps
 # every singleton. Every node boots its real machine module plus
@@ -46,7 +46,7 @@
 {
   pkgs,
   lib,
-  mkClan,
+  mkSite,
   topology,
   # tests/lib/cluster-harness.nix, as a function of the topology: the voters below
   # need server certificates, which follow the tag.
@@ -69,7 +69,7 @@ let
     nodes.node2 = voter;
     nodes.node3 = voter;
   };
-  clan = mkClan testTopology;
+  site = mkSite testTopology;
   harness = harnessFor testTopology;
   names = [
     "node1"
@@ -175,7 +175,7 @@ pkgs.testers.runNixOSTest {
   name = "cluster";
 
   node.pkgs = lib.mkForce null;
-  node.specialArgs = removeAttrs clan.config.nixosConfigurations.node1._module.specialArgs [
+  node.specialArgs = removeAttrs site.nixosConfigurations.node1._module.specialArgs [
     "modulesPath"
   ];
 
@@ -184,7 +184,7 @@ pkgs.testers.runNixOSTest {
   }
   // lib.genAttrs names (name: {
     imports = [
-      clan.config.nixosModules."clan-machine-${name}"
+      site.machineModules.${name}
       (harness.nodeModule { memoryMB = if name == "node1" then 3072 else 2048; })
       probeApps
       extraModule

@@ -13,7 +13,7 @@
   lib,
   topology,
   clusterLib,
-  clanCoreModule,
+  secretsModule,
   appContainerModule,
   overlayNetworkModule,
 }:
@@ -33,10 +33,9 @@ let
       nodeName = "node1";
     };
     modules = [
-      # clanCore supplies clan.core.vars.*, which the secret bind mounts resolve
-      # through. Its recommended defaults are off for the same reason as on a
-      # real node — see checks.clan-coexist.
-      clanCoreModule
+      # modules/secrets.nix supplies cluster.secrets.*, which the secret bind mounts
+      # resolve through.
+      secretsModule
       appContainerModule
       overlayNetworkModule
       {
@@ -46,18 +45,20 @@ let
           fsType = "ext4";
         };
         system.stateVersion = topology.stateVersion;
-        clan.core.enableRecommendedDefaults = false;
-        clan.core.settings.machine.name = "node1";
-        # Normally supplied by lib.clan; this fixture builds a bare nixosSystem.
-        # A string: see tests/fixtures/default.nix.
-        clan.core.settings.directory = toString ../.;
+        # Normally supplied by mkCluster; this fixture builds a bare nixosSystem.
+        cluster.secrets = {
+          machine = "node1";
+          # A string: see tests/fixtures/default.nix.
+          directory = toString ../.;
+          masterIdentities = import ./fixtures/master-identities.nix;
+        };
 
         # A stand-in generator. Nothing is actually generated in a test fixture,
         # so every `.path` here resolves to the "/no-such-path" sentinel — which
         # is exactly why the assertions below check the GUEST side (mount points,
         # credentialsFile) rather than host paths. What can regress in this file
         # is the wiring, and the wiring is guest-side.
-        clan.core.vars.generators.probe = {
+        cluster.secrets.generators.probe = {
           files.cloudflared = { };
           files.token = { };
           script = "";

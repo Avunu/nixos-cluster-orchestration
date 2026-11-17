@@ -1,7 +1,7 @@
 # modules/alerting-core.nix — Alertmanager + rules + probes + email bridge.
 #
-# The clan-independent half of alerting; modules/alerting.nix feeds it from
-# topology, clusterApps and clan vars, and tests/alerting.nix drives it in a VM
+# The half of alerting that knows no secret store; modules/alerting.nix feeds it from
+# topology, clusterApps and the site's secrets, and tests/alerting.nix drives it in a VM
 # against a stub of the Cloudflare API.
 #
 #   Prometheus (rules: lib/alert-rules.nix)

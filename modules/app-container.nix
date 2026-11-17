@@ -102,15 +102,15 @@ let
     };
   };
 
-  # A reference to one file of one clan vars generator. Secrets are named by
-  # (generator, file) rather than by a flat name because that is how clan
-  # addresses them, and it keeps a client's whole secret set in one generator
+  # A reference to one file of one generator (cluster.secrets.generators). Secrets are
+  # named by (generator, file) rather than by a flat name because that is how the
+  # repository keeps them, and it keeps a client's whole secret set in one generator
   # that can be regenerated or deleted as a unit.
   secretRefType = types.submodule {
     options = {
       generator = mkOption {
         type = types.str;
-        description = "clan.core.vars.generators.<name>";
+        description = "cluster.secrets.generators.<name>";
       };
       file = mkOption {
         type = types.str;
@@ -145,7 +145,7 @@ let
           file = "cloudflared";
         };
         description = ''
-          clan vars file holding the tunnel credentials JSON; defaults to
+          The secret file holding the tunnel credentials JSON; defaults to
           <name>-cf/cloudflared once `id` is set. Added to the
           app's `secrets` automatically as `cloudflared`, so it is
           bind-mounted read-only at /run/secrets/cloudflared inside the
@@ -235,12 +235,11 @@ let
             };
           };
           description = ''
-            Secrets this container needs: guest name -> clan vars file. Each is
+            Secrets this container needs: guest name -> generator file. Each is
             bind-mounted read-only at /run/secrets/<guest name> inside the
-            container, decrypted on the HOST by clan's age vars backend at
-            activation.
+            container, decrypted on the HOST by agenix at activation.
 
-            The container itself never holds a key and never runs clan.
+            The container itself never holds a key.
           '';
         };
         juicefsPaths = mkOption {

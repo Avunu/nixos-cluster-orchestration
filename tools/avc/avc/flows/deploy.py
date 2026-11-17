@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from avc import ui
 from avc.actions import Arg, action
 from avc.core import proc, repo, ship
+from avc.flows import secrets
 from avc.errors import AvcError
 
 if TYPE_CHECKING:
@@ -17,8 +19,19 @@ def _nodes(ctx: Ctx) -> list[str]:
     return ctx.installed
 
 
+def _secrets_ready(ctx: Ctx, nodes: list[str]) -> None:
+    """A node switches to a system whose secrets were never generated or never rekeyed,
+    and runs short of them (modules/secrets.nix). So this tree is not deployed like that."""
+    problems = secrets.readiness_problems(ctx, nodes, strict=True)
+    for p in problems:
+        ui.err(p)
+    if problems:
+        raise AvcError(f"{len(problems)} secret(s) would not reach their node: `avc secrets check`")
+
+
 @action("deploy", "ship", "Ship changes (commit → pull request → merge → deploy → post-actions)")
 def ship_changes(ctx: Ctx) -> None:
+    _secrets_ready(ctx, ctx.installed)
     ship.ship(ctx, "chore: update cluster configuration", post=ship.pending(ctx))
 
 
@@ -57,23 +70,33 @@ def retry(ctx: Ctx, node: str) -> None:
     ui.ok(f"{node}: attempts cleared — the next tick tries again, or `avc deploy now`")
 
 
+def push_argv(root: Path, node: str, host: str) -> list[str]:
+    """Build `node` from the working tree on this machine and switch it over SSH."""
+    return ["nixos-rebuild", "switch", "--flake", f"{root}#{node}", "--target-host", f"root@{host}"]
+
+
 @action("deploy", "break-glass", "Break-glass push from this working tree", Arg("node", "Node", choices=_nodes))
 def break_glass(ctx: Ctx, node: str) -> None:
-    """README "break-glass": hold → clan machines update → pull request → release.
+    """README "break-glass": hold → nixos-rebuild switch --target-host → pull request → release.
+
+    The push builds this working tree here and activates it on the node over SSH. The node
+    needs nothing from this machine but the closure: its secrets are the rekeyed files in
+    that closure, which its own TPM decrypts.
 
     The hold stops the timer from reverting the pushed build to what the deploy
     branch has; it is only released once the same change has merged there, so
     the next pull builds the same thing."""
     ui.header(f"Break-glass deploy to {node}")
     ui.warn("this builds the WORKING TREE (uncommitted edits included) and activates it directly")
-    if not ui.confirm(f"Hold {node}, then `clan machines update {node}`?"):
-        return
     n = ctx.node(node)
+    _secrets_ready(ctx, [node])
+    if not ui.confirm(f"Hold {node}, then `{' '.join(push_argv(ctx.root, node, n.host))}`?"):
+        return
     n.hold()
     ui.ok(f"{node}: held")
-    rc = proc.run(["clan", "machines", "update", node], cwd=ctx.root, check=False, capture=False).returncode
+    rc = proc.run(push_argv(ctx.root, node, n.host), cwd=ctx.root, check=False, capture=False).returncode
     if rc != 0:
-        ui.err(f"clan machines update failed ({rc}); {node} stays HELD so the timer cannot revert a partial state")
+        ui.err(f"nixos-rebuild failed ({rc}); {node} stays HELD so the timer cannot revert a partial state")
         ui.say(f"fix and re-run, or `avc deploy release {node}` to go back to pull-deploy")
         return
     ui.ok(f"{node}: updated")

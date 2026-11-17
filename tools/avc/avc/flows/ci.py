@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from avc import ui
 from avc.actions import action
-from avc.core import vars as clanvars
+from avc.core import secretstore
 from avc.errors import AvcError
 
 if TYPE_CHECKING:
@@ -23,7 +23,7 @@ def agent_tokens(ctx: Ctx) -> dict[str, str]:
     for name, node in sorted(ctx.index.nodes.items()):
         if not (node.get("ci") or {}).get("enabled"):
             continue
-        token = clanvars.get_value(ctx.root, name, "ci/token").strip()
+        token = secretstore.get_value(ctx.root, name, "ci/token").strip()
         if not token:
             raise AvcError(f"{name}: ci/token is empty; run `avc secrets provision`")
         if token in out:

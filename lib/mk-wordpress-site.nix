@@ -236,7 +236,7 @@ in
     ${genGit} = {
       share = true;
       files."deploy-key" = wpOwned;
-      # The public half is readable at EVAL time (clanLib.getPublicValue), so
+      # The public half is readable at EVAL time (its `value`), so
       # tooling can register the deploy key with GitHub without decrypting.
       files."deploy-key.pub".secret = false;
       runtimeInputs = [

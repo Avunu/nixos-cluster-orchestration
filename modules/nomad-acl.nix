@@ -42,7 +42,7 @@ let
   net = clusterLib.net;
   pki = clusterLib.nomadPki;
   ns = clusterLib.nomad.appsNamespace;
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
   tls = pki.cliTlsFor vars;
   nomadAddr = net.nomadAddr node;
   isServer = net.hasTag "nomad-server" node;
@@ -53,9 +53,8 @@ let
     gen: file:
     let
       f = vars.${gen}.files.${file};
-      p = config.clan.core.settings.directory + "/secrets/clan-vars/${f.rel_dir}/${f.name}/${f.name}.age";
     in
-    lib.optional (builtins.pathExists p) (builtins.hashFile "sha256" p);
+    lib.optional f.exists (builtins.hashFile "sha256" f.source);
 
   namespaces = [
     {
@@ -384,6 +383,13 @@ in
   warnings = lib.optional (net.hasTag "nomad-leader" node) "topology: the `nomad-leader` tag no longer means anything (every `nomad-server` node registers jobs and applies ACLs); remove it from the node's tags.";
 
   systemd.tmpfiles.rules = [ "d ${pki.tokenDir} 0700 root root -" ];
+
+  # These retry until the local agent answers, as part of the boot. On a boot whose
+  # secrets did not all decrypt the agent is not started (modules/secrets.nix), and
+  # they are held with it: retrying against nothing, they would keep the boot from
+  # finishing.
+  cluster.secrets.gate =
+    lib.optional isServer "nomad-acl-init.service" ++ map (role: "nomad-login@${role}.service") roles;
 
   systemd.services = lib.mkMerge [
     {

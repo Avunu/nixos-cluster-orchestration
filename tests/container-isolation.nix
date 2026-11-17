@@ -84,10 +84,10 @@
 {
   pkgs,
   lib,
-  mkClan,
+  mkSite,
   topology,
   harnessFor,
-  clanCoreModule,
+  secretsModule,
   mutant ? "",
   extraModule ? { },
 }:
@@ -95,11 +95,11 @@ let
   testTopology = lib.recursiveUpdate topology {
     nodes.node2.provisioned = true;
   };
-  clan = mkClan testTopology;
+  site = mkSite testTopology;
   harness = harnessFor testTopology;
   clusterLib = import ../lib { inherit lib; };
   net = clusterLib.net;
-  machines = clan.config.nixosConfigurations;
+  machines = site.nixosConfigurations;
   n1 = testTopology.nodes.node1;
   n2 = testTopology.nodes.node2;
 
@@ -266,7 +266,7 @@ let
         inherit clusterLib;
       };
       modules = [
-        clanCoreModule
+        secretsModule
         ../modules/app-container.nix
         ../modules/overlay-network.nix
         {
@@ -276,9 +276,11 @@ let
             fsType = "ext4";
           };
           system.stateVersion = testTopology.stateVersion;
-          clan.core.enableRecommendedDefaults = false;
-          clan.core.settings.machine.name = "node1";
-          clan.core.settings.directory = toString ../.;
+          cluster.secrets = {
+            machine = "node1";
+            directory = toString ../.;
+            masterIdentities = import ./fixtures/master-identities.nix;
+          };
           clusterApps = apps;
         }
       ];
@@ -387,7 +389,7 @@ let
 
   nodeModule = name: memoryMB: {
     imports = [
-      clan.config.nixosModules."clan-machine-${name}"
+      site.machineModules.${name}
       (harness.nodeModule { inherit memoryMB; })
       ciApps
       extraModule

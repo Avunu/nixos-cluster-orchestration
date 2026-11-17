@@ -37,7 +37,7 @@ env:
 
 jobs:
   # The library's boot tests, as this lock resolves the library and its inputs
-  # (flake.nix re-exports them). A nixpkgs, clan, Lanzaboote or library bump that breaks
+  # (flake.nix re-exports them). A nixpkgs, agenix, Lanzaboote or library bump that breaks
   # an encrypted node's boot fails here, before any node has it.
   boot-install:
     runs-on: [self-hosted, linux, x64, kvm]

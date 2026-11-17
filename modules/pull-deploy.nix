@@ -3,13 +3,13 @@
 # The "pull" paradigm (rebuild from a GitHub flake ref), run frequently, and applies with `switch` (live) rather than
 # `boot`. Each node rebuilds ITSELF from <flakeUrl>#<hostName> on a timer.
 #
-# Bootstrap is still push (`clan machines install`); this takes over once a node
+# Bootstrap is still push (the install); this takes over once a node
 # is up. Private-repo access (this flake + private flake inputs) comes from a
 # github token kept OUT of the Nix store (a nix.conf `!include`).
 #
-# This loop is why the whole secrets design has to work with NO clan CLI on the
-# node: plain `age` decrypts vars in an activation script using the node's existing
-# SSH host key (modules/vars.nix), so a switch here needs nothing uploaded.
+# This loop is why the whole secrets design has to work with no operator and no
+# operator key: every secret a node reads is in its closure, encrypted to the identity
+# its TPM holds (modules/secrets.nix), so a switch here needs nothing uploaded.
 #
 # What a tick does is lib/cluster-upgrade.nix: a closure gets three attempts and then
 # waits for a new commit, a closure whose boot contract differs from the running one
@@ -24,7 +24,7 @@
 # the gate is what stands between a topology edit and a node that cannot unlock.
 #
 # The staged rollout (design D22) is the same problem for what every node shares: a
-# nixpkgs, kernel, Lanzaboote, clan or library bump changes no contract, reaches every
+# nixpkgs, kernel, Lanzaboote, agenix or library bump changes no contract, reaches every
 # node within the pull interval, and first runs at the next reboot, on all of them. So
 # one node, `topology.nodes.<n>.canary = true`, takes each new boot stack first and is
 # rebooted into it with someone watching; when that boot unlocked cleanly it publishes
@@ -93,7 +93,7 @@ in
       assertion = lib.length provisioned <= 1 || canaries != [ ] || isReason withoutCanary;
       message =
         "topology: a site with more than one node needs a canary. Set `canary = true` on one node: "
-        + "it takes each new boot stack (nixpkgs, kernel, Lanzaboote, clan, this library) first, and the others "
+        + "it takes each new boot stack (nixpkgs, kernel, Lanzaboote, agenix, this library) first, and the others "
         + "activate it only once that node has rebooted into it with a clean unlock (modules/pull-deploy.nix). "
         + "Without one, a bump that cannot boot reaches every node at once. To go without, set "
         + "deploy.withoutCanary = \"<reason>\".";
@@ -111,7 +111,7 @@ in
   ];
 
   # What a boot is built from, besides the library inputs lib/mk-cluster.nix adds. The
-  # nixpkgs this node really evaluates (clan takes the site's, not the library's) and its
+  # nixpkgs this node really evaluates (mkCluster takes the site's, not the library's) and its
   # kernel, which a host file or a site-wide setting can change without any bump. Store
   # paths as plain strings: they name, they do not pull anything into the closure.
   #
@@ -201,7 +201,7 @@ in
   # "public repos only" instead of every single nix command failing to parse its
   # config — which on a pull-deployed fleet would be unrecoverable remotely.
   nix.extraOptions = ''
-    !include ${config.clan.core.vars.generators.github-token.files."nix.conf".path}
+    !include ${config.cluster.secrets.generators.github-token.files."nix.conf".path}
   '';
 
   # `access-tokens` above only covers Nix's own `github:` fetcher. A
@@ -209,18 +209,18 @@ in
   # a username and fails non-interactively — so private git+https inputs need
   # netrc as well. Nix's `netrc-file` setting feeds only Nix's OWN downloader
   # (tarballs, `github:`), never the git subprocess; git reads ~/.netrc through
-  # curl. Every flake fetch on a node runs as root — the pull loop and the
-  # `nixos-rebuild` a `clan machines update` runs remotely — so root's ~/.netrc
-  # is the vars file. A symlink, so the target stays root-only (0400) and the
+  # curl. Every flake fetch on a node runs as root — the pull loop and a
+  # pushed `nixos-rebuild` — so root's ~/.netrc
+  # is the secret file. A symlink, so the target stays root-only (0400) and the
   # token never sits in a second place; created before any unit that fetches.
   #
   # Verified on node1 (2026-09-21): with only netrc-file set, every private
   # git+https input failed with "could not read Username for
-  # 'https://github.com'", and `clan machines update` reported "Failed to fetch
+  # 'https://github.com'", and a pushed rebuild reported "Failed to fetch
   # git repository" on the remote; with the symlink, 401 -> Basic -> 200.
-  nix.settings.netrc-file = config.clan.core.vars.generators.github-token.files."netrc".path;
+  nix.settings.netrc-file = config.cluster.secrets.generators.github-token.files."netrc".path;
   systemd.tmpfiles.rules = [
-    "L+ /root/.netrc - - - - ${config.clan.core.vars.generators.github-token.files."netrc".path}"
+    "L+ /root/.netrc - - - - ${config.cluster.secrets.generators.github-token.files."netrc".path}"
   ];
 
   systemd.services.cluster-upgrade.description = "Pull + apply cluster config from ${d.flakeUrl}#${host}";
@@ -228,10 +228,4 @@ in
   # We drive `switch` ourselves; make sure the built-in (which can stage for
   # boot) isn't also enabled.
   system.autoUpgrade.enable = lib.mkDefault false;
-
-  # The pull loop is the deployment mechanism; `clan machines update` is
-  # break-glass. Requiring the machine to be named explicitly means a bare
-  # `clan machines update` (which would otherwise hit the whole fleet) skips
-  # these nodes rather than racing the timer on all of them at once.
-  clan.core.deployment.requireExplicitUpdate = true;
 }

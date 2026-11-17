@@ -22,6 +22,7 @@ let
       lanzabooteModule
       ;
   };
+  skDummy = import ./lib/sk-dummy.nix { inherit pkgs; };
 in
 harness.mkTest {
   name = "boot-fallback";
@@ -29,10 +30,23 @@ harness.mkTest {
   # The boot report goes to the real Worker on the peer VM (report-passphrase,
   # report-initrd-ssh-logins).
   peerModule = harness.audit.peer;
+  # An operator's FIDO2 key, as an `admins` entry is once the operators' SSH keys are
+  # `ed25519-sk`: OpenSSH's software security key stands in for the YubiKey
+  # (./lib/sk-dummy.nix), and the pair is a fixture made with it (./fixtures/sk-key).
+  prelude = _: ''
+    SK_SSH = "${skDummy}/bin/ssh"
+    SK_PROVIDER = "${skDummy}/lib/sk-dummy.so"
+    SK_KEY = "${./fixtures/sk-key/operator}"
+    SK_OTHER_KEY = "${./fixtures/sk-key/other}"
+  '';
   targetModule =
     { lib, pkgs, ... }:
     {
       imports = [ harness.audit.target ];
+      # Beside the harness's plain ed25519 key: the initrd's sshd is given both.
+      cluster.boot.ssh.authorizedKeys = [
+        (lib.removeSuffix "\n" (builtins.readFile ./fixtures/sk-key/operator.pub))
+      ];
       # Reached by editing the unsigned loader.conf, as an attacker can. Without the gate,
       # zfs-import-rpool fails at about a minute, which is the fast way to emergency mode.
       specialisation.nogate.configuration.boot.initrd.systemd.services.rpool-unlock-gate.enable =

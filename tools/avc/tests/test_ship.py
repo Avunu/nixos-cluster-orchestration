@@ -279,14 +279,14 @@ def test_push_branch_refuses_the_deploy_branch(site):
 
 
 def test_commits_made_on_main_by_hand_go_by_pull_request_too(site, ran, deployed):
-    # `clan vars` commits what it writes, on whatever branch is checked out.
+    # A commit made by hand, or by a tool that commits what it writes, on the deploy branch.
     ctx, forge = site
     edit(ctx)
-    git(ctx.root, "commit", "--quiet", "-am", "chore(vars): by clan")
+    git(ctx.root, "commit", "--quiet", "-am", "chore(vars): by hand")
     with ui.scripted([True, True]):  # open the pull request? deploy now?
         assert ship.ship(ctx, "msg", post=POST)
     (opened,) = forge.prs.values()
-    assert opened["title"] == "chore(vars): by clan" and opened["state"] == "MERGED"
+    assert opened["title"] == "chore(vars): by hand" and opened["state"] == "MERGED"
     assert git(forge.bare, "show", "main:vars/a") == "2"
     assert on_main_at_the_remote(ctx, forge)
     assert ran == ["restart app-blog on node1"]

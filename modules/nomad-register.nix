@@ -38,7 +38,7 @@ let
   pki = clusterLib.nomadPki;
   token = "${pki.tokenDir}/registrar";
   # The HTTP API wants a client certificate before anything else (cluster-common.nix).
-  tls = clusterLib.nomadPki.cliTlsFor config.clan.core.vars.generators;
+  tls = clusterLib.nomadPki.cliTlsFor config.cluster.secrets.generators;
 
   # All rendered jobspecs -> one store dir; hash changes when any job changes.
   jobsDir = pkgs.linkFarm "nomad-jobs" (
@@ -120,6 +120,9 @@ let
   '';
 in
 lib.mkIf (isServer && managedApps != [ ]) {
+  # Held with the agent it registers with, for the reason in modules/nomad-acl.nix.
+  cluster.secrets.gate = [ "nomad-bootstrap.service" ];
+
   systemd.services.nomad-bootstrap = {
     description = "Register rendered Nomad jobs (declarative convergence)";
     # Registration must not race the JuiceFS placement flag. A jobspec with

@@ -54,8 +54,8 @@ def _provision(ctx: Ctx, *args: str) -> None:
 
 
 def _site_paths(slug: str) -> list[str]:
-    # The catalogue entry plus whatever vars the step created or changed.
-    return [f"apps/{slug}.json", "vars/", "secrets/"]
+    # The catalogue entry plus whatever secrets the step created or changed.
+    return [f"apps/{slug}.json", "secrets/"]
 
 
 def _slug(text: str) -> str | bool:
@@ -136,7 +136,7 @@ def r2_rotate(ctx: Ctx, slug: str) -> None:
     ship.ship(
         ctx,
         f"chore(secrets): rotate {slug} R2 key",
-        paths=["vars/", "secrets/"],
+        paths=["secrets/"],
         post=[ship.restart(f"app-{slug}", ctx.contact().name)]
         if slug in ctx.index.apps
         else [],

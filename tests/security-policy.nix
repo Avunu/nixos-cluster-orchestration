@@ -7,7 +7,7 @@
 # "evaluation failed" alone could mean anything, and a misspelt option or a stale
 # fixture would pass.
 #
-# Memory. Nearly every subtest below is its own evaluation of a clan and a NixOS system,
+# Memory. Nearly every subtest below is its own evaluation of a site and a NixOS system,
 # about 250 MB each, and evaluating this file used to peak at 19 GB because they stayed
 # reachable until the end. The evaluator frees a system once nothing refers to it, so
 # the rule here is that nothing does once its subtests have run:
@@ -32,8 +32,8 @@
   mkFixtureCluster,
   fixtureCluster,
   fixtureTopology,
-  # This library's flake inputs the boot stack names (clan-core, lanzaboote, disko,
-  # nixpkgs), to hold each stack value to the lock.
+  # This library's flake inputs the boot stack names (agenix, agenix-rekey, lanzaboote,
+  # disko, nixpkgs), to hold each stack value to the lock.
   libraryInputs,
 }:
 let
@@ -56,7 +56,7 @@ let
     (mkSecure {
       inherit topology;
       extraModules = modules;
-    }).config.nixosConfigurations.node1;
+    }).nixosConfigurations.node1;
 
   # ── the baseline ──────────────────────────────────────────────────────────
   # The secure fixture with nothing added: the core is complete, so this is what
@@ -68,7 +68,7 @@ let
     (import ../lib/mk-disk-layout.nix {
       inherit lib;
       encrypted = true;
-      passwordFile = "/run/partitioning-secrets/passphrase";
+      leg = name: { passwordFile = "/run/cluster-install/${name}.key"; };
     }).disko.devices;
 
   # What a consumer's host file would do, against that baseline.
@@ -124,7 +124,7 @@ let
 
   # ── the opted-out fixture ─────────────────────────────────────────────────
   fixtureNodes = lib.attrNames fixtureTopology.nodes;
-  fixtureNode = name: fixtureCluster.config.nixosConfigurations.${name};
+  fixtureNode = name: fixtureCluster.nixosConfigurations.${name};
 
   optedOutWith =
     reason:
@@ -187,7 +187,7 @@ let
   etcdNeedle = "node(s) are tagged `etcd`";
 
   # ── partitioning secrets ──────────────────────────────────────────────────
-  # clan uploads these only at install, and the pull loop never does, so each one is
+  # These are on a node only at install, and are rekeyed to none, so each one is
   # a decision. New ones must be added here on purpose.
   partitioningSecrets =
     system:
@@ -197,7 +197,7 @@ let
         lib.mapAttrsToList (fn: _: "${g.name}/${fn}") (
           lib.filterAttrs (_: f: f.neededFor == "partitioning") g.files
         )
-      ) (lib.attrValues system.config.clan.core.vars.generators)
+      ) (lib.attrValues system.config.cluster.secrets.generators)
     );
 
   # ── the positive case ─────────────────────────────────────────────────────
@@ -217,7 +217,8 @@ let
         (
           let
             stackKeys = [
-              "clan-core"
+              "agenix"
+              "agenix-rekey"
               "disko"
               "kernel"
               "lanzaboote"
@@ -280,7 +281,8 @@ let
                 # no store and changes on every evaluation, so no follower would ever
                 # match the canary's key.
                 && lib.all (n: first.${n} == libraryInputs.${n}.narHash && lib.hasPrefix "sha256-" first.${n}) [
-                  "clan-core"
+                  "agenix"
+                  "agenix-rekey"
                   "disko"
                   "lanzaboote"
                 ]
@@ -379,8 +381,8 @@ let
               detail = failedMessages template;
             }
             {
-              name = "the template's failure says to generate vars, which nothing else can say";
-              ok = fails template "clan vars generate node1";
+              name = "the template's failure says to generate the boot secrets, which nothing else can say";
+              ok = fails template "Generate node1's secrets";
               detail = failedMessages template;
             }
 
@@ -392,15 +394,15 @@ let
                 && template.config.disko.devices.disk.nvme0.content.partitions.luks.content.type == "luks";
               detail = failedMessages template;
             }
-            # The reason these are assertions rather than throws. `clan vars generate` evaluates
-            # the machine to discover its generators, before any of their values exist, and a
+            # The reason these are assertions rather than throws. Generating a node's secrets
+            # evaluates the machine to discover its generators, before any of their values exist, and a
             # throw on this path would stop a new site from ever generating them.
             {
               name = "a new site can still discover and build its boot generators";
               ok = lib.all (
                 g:
                 let
-                  generator = template.config.clan.core.vars.generators.${g};
+                  generator = template.config.cluster.secrets.generators.${g};
                 in
                 (builtins.tryEval generator.finalScript.drvPath).success
                 && lib.all (f: !f.exists) (lib.filter (f: !f.secret) (lib.attrValues generator.files))
@@ -408,16 +410,16 @@ let
               detail = [ ];
             }
 
-            # What `clan vars generate` reads of every generator before it runs any (its
-            # `clan select` of share, dependencies, prompts and validationHash, and of each
-            # file's secret, deploy, owner, group, mode and neededFor). Nothing in a system
-            # build forces these, so a generator whose `validation` clan's type refuses (a
+            # What is read of every generator before any runs: its share, dependencies,
+            # prompts and validationHash, and each file's secret, deploy, owner, group, mode
+            # and neededFor (`cluster.secrets.export`). Nothing in a system
+            # build forces these, so a generator whose `validation` the type refuses (a
             # list, WS16) evaluated everywhere here and failed only on a real site's S0.
             {
-              name = "clan vars generate can read every generator of a new site";
+              name = "every generator of a new site can be read";
               ok =
                 let
-                  gens = template.config.clan.core.vars.generators;
+                  gens = template.config.cluster.secrets.generators;
                   readable =
                     g:
                     (builtins.tryEval (
@@ -440,7 +442,7 @@ let
                 lib.all readable (lib.attrNames gens) && gens ? nomad-login && gens ? nomad-tls;
               detail =
                 let
-                  gens = template.config.clan.core.vars.generators;
+                  gens = template.config.cluster.secrets.generators;
                 in
                 lib.filter (g: !(builtins.tryEval (builtins.deepSeq gens.${g}.validationHash true)).success) (
                   lib.attrNames gens
@@ -551,11 +553,11 @@ let
               lib.mapAttrsToList (
                 site: topology:
                 let
-                  clan = if site == "fixture" then fixtureCluster else mkFixtureCluster topology;
+                  built = if site == "fixture" then fixtureCluster else mkFixtureCluster topology;
                 in
                 map (name: {
                   inherit site name;
-                  have = serverBlockHave clan.config.nixosConfigurations.${name};
+                  have = serverBlockHave built.nixosConfigurations.${name};
                   want = serverBlockWant topology name;
                 }) (lib.attrNames topology.nodes)
               ) sites
@@ -612,13 +614,13 @@ let
             hashes =
               dir:
               map (builtins.hashFile "sha256") [
-                (dir + "/secrets/clan-vars/per-machine/node1/nomad-tls/agent.crt/agent.crt.age")
-                (dir + "/secrets/clan-vars/per-machine/node1/nomad-tls/agent.key/agent.key.age")
-                (dir + "/secrets/clan-vars/shared/nomad-ca/ca.crt/ca.crt.age")
+                (dir + "/secrets/per-machine/node1/nomad-tls/agent.crt.age")
+                (dir + "/secrets/per-machine/node1/nomad-tls/agent.key.age")
+                (dir + "/secrets/shared/nomad-ca/ca.crt.age")
               ];
             triggers = system: system.config.systemd.services.nomad.reloadTriggers;
             distinct = (fixtureNode "node1").extendModules {
-              modules = [ { clan.core.settings.directory = lib.mkForce ./fixtures/reload-triggers; } ];
+              modules = [ { cluster.secrets.directory = lib.mkForce ./fixtures/reload-triggers; } ];
             };
           in
           [
@@ -841,14 +843,14 @@ let
                 directory = toString ./fixtures/mk-cluster;
                 topology = secureTopology;
                 meta.name = "no-vars";
-                recipients = [ "age1d4xvnzk8ukfgsawg7alhva2lzp9cuztygzwpwdgvgtepzvv44e0qgvt7ar" ];
+                masterIdentities = import ./fixtures/master-identities.nix;
                 admins = import ./fixtures/admins.nix;
-              }).config.nixosConfigurations.node1;
+              }).nixosConfigurations.node1;
           in
           [
             {
-              name = "a site with no vars is told so, not given a missing-option error";
-              ok = fails noVars "clan vars generate node1" && !evaluates noVars;
+              name = "a site with no secrets is told so, not given a missing-option error";
+              ok = fails noVars "Generate node1's secrets" && !evaluates noVars;
               detail = failedMessages noVars;
             }
           ]
@@ -875,7 +877,7 @@ let
               in
               !c.cluster.boot.enable
               && !c.boot.lanzaboote.enable
-              && lib.all (g: !(c.clan.core.vars.generators ? ${g})) bootGenerators;
+              && lib.all (g: !(c.cluster.secrets.generators ? ${g})) bootGenerators;
             detail = [ ];
           }
           # The required mounts as well: a new dataset halts any node at its next boot,
@@ -994,7 +996,7 @@ let
                     "tpm2-device=auto"
                   ]);
                 };
-                identityHash = c.clan.core.vars.generators.volume-identity.files.hash.value;
+                identityHash = c.cluster.secrets.generators.volume-identity.files.hash.value;
                 identityPath = "/var/lib/volume-identity/secret";
                 hostKeyPath = "/var/lib/initrd-ssh/ssh_host_ed25519_key";
                 espMounts = [
@@ -1088,7 +1090,7 @@ let
               system.config.cluster.boot.enable
               && system.config.boot.lanzaboote.enable
               && system.config.boot.initrd.systemd.tpm2.enable
-              && system.config.clan.core.vars.generators ? luks
+              && system.config.cluster.secrets.generators ? luks
               && !lib.any (lib.hasInfix "opted out of boot security") system.config.warnings
               # Nothing refused: null is read as "not set", so the whole posture is in force
               # and the core satisfies it.
@@ -1152,16 +1154,53 @@ let
             ) baseline.config.boot.initrd.luks.devices;
           }
           {
-            name = "a secure node's layout reads the luks generator's passphrase, at install only";
+            # The recovery key is given a slot by the leg's hook and formats nothing: what
+            # disko formats with is a key the hook makes in the installer's memory.
+            name = "a secure node's layout reads the luks generator's passphrase, at install only, as the recovery key";
             ok =
               let
                 c = baseline.config;
-                parts = c.disko.devices.disk.nvme1.content.partitions;
+                leg = c.disko.devices.disk.nvme1.content.partitions.luks.content;
                 want = "/run/partitioning-secrets/per-machine/node1/luks/passphrase";
               in
-              c.clan.core.vars.generators.luks.files.passphrase.path == want
-              && parts.luks.content.passwordFile == want
+              c.cluster.secrets.generators.luks.files.passphrase.path == want
+              && c.cluster.boot.install.recoveryKeyFile == want
+              && leg.passwordFile == "/run/cluster-install/crypt-b.key"
+              && lib.hasInfix "recovery=${want}" leg.preCreateHook
+              && lib.hasInfix "recovery=${want}" leg.postCreateHook
               && !(c.boot.initrd.luks.devices.crypt-b ? passwordFile);
+            detail = [ ];
+          }
+          {
+            # In this order: a failure part way leaves a leg only the install key opens,
+            # which is in memory, and never one whose only way in is a TPM slot.
+            name = "a leg's install hook enrolls a TPM slot bound to no PCR, then the recovery key, then removes the install key";
+            ok =
+              let
+                c = baseline.config;
+                legs = map (d: d.content.partitions.luks.content) (lib.attrValues c.disko.devices.disk);
+                order =
+                  hook: needles:
+                  let
+                    at = n: lib.stringLength (lib.head (lib.splitString n hook));
+                    found = lib.all (n: lib.hasInfix n hook) needles;
+                  in
+                  found && lib.sort lib.lessThan (map at needles) == map at needles;
+              in
+              lib.length legs == 2
+              && lib.all (
+                leg:
+                lib.hasInfix "/dev/urandom" leg.preCreateHook
+                && lib.hasInfix "no TPM" leg.preCreateHook
+                && lib.hasInfix "refusing to install" leg.preCreateHook
+                && order leg.postCreateHook [
+                  "systemd-cryptenroll --unlock-key-file=\"$key\" --tpm2-device=auto --tpm2-pcrs= \"$device\""
+                  "cryptsetup luksAddKey --key-file \"$key\""
+                  "cryptsetup open --test-passphrase"
+                  "cryptsetup -q luksRemoveKey \"$device\" \"$key\""
+                  "rm -f \"$key\""
+                ]
+              ) legs;
             detail = [ ];
           }
           {
@@ -1220,6 +1259,13 @@ let
                 (import ../lib/mk-disk-layout.nix {
                   inherit lib;
                   encrypted = true;
+                }).disko.devices.disk.nvme0.device
+              ).success
+              && !(builtins.tryEval
+                (import ../lib/mk-disk-layout.nix {
+                  inherit lib;
+                  encrypted = true;
+                  leg = _: { };
                 }).disko.devices.disk.nvme0.device
               ).success;
             detail = [ ];
@@ -1426,7 +1472,9 @@ let
                   "nofail"
                 ]
               ) (lib.attrValues devices);
-            detail = lib.mapAttrsToList (n: d: "${n}: ${toString d.crypttabExtraOpts}") baseline.config.boot.initrd.luks.devices;
+            detail = lib.mapAttrsToList (
+              n: d: "${n}: ${toString d.crypttabExtraOpts}"
+            ) baseline.config.boot.initrd.luks.devices;
           }
           {
             name = "the initrd-contents check is a build gate";
@@ -1478,13 +1526,13 @@ let
               let
                 secure =
                   (mkOpsIndex {
-                    clan = mkSecure { topology = secureTopology; };
+                    site = mkSecure { topology = secureTopology; };
                     topology = secureTopology;
                   }).nodes;
-                pub = baseline.config.clan.core.vars.generators.initrd-ssh.files."ssh_host_ed25519_key.pub".value;
+                pub = baseline.config.cluster.secrets.generators.initrd-ssh.files."ssh_host_ed25519_key.pub".value;
                 optedOut =
                   (mkOpsIndex {
-                    clan = fixtureCluster;
+                    site = fixtureCluster;
                     topology = fixtureTopology;
                   }).nodes.node1.boot;
               in
@@ -1804,11 +1852,11 @@ let
           # The refusals above read results. This is the other half: what the core will be
           # given, because a wrong value here would pass every assertion and fail at boot.
           {
-            name = "the wiring hands the core the topology's and the vars' values";
+            name = "the wiring hands the core the topology's and the generators' values";
             ok =
               let
                 b = baseline.config.cluster.boot;
-                gens = baseline.config.clan.core.vars.generators;
+                gens = baseline.config.cluster.secrets.generators;
               in
               b.enable
               && b.identity.hash == gens.volume-identity.files.hash.value

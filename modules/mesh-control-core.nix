@@ -1,4 +1,4 @@
-# modules/mesh-control-core.nix — the WireGuard control mesh, without clan.
+# modules/mesh-control-core.nix — the WireGuard control mesh, with its keys given.
 #
 # Every service but Nomad listens on this interface (design D1): etcd, Loki,
 # Prometheus, the exporters, Vector and the JuiceFS metadata engine. A machine
@@ -7,8 +7,8 @@
 # machine authentication, not per-service: any process on a node can use the mesh.
 # Nomad stays on the control VLAN under its own mTLS, a separate failure domain.
 #
-# The clan wiring (modules/mesh-control.nix) supplies the keys from vars; the VM
-# tests that need no clan (checks.jumbo-mtu) supply literals. Peers are every other
+# modules/mesh-control.nix supplies the keys from the site's secrets; the VM
+# tests that need none (checks.jumbo-mtu) supply literals. Peers are every other
 # node in the topology. Its own address is <mesh.subnet base>.<index>.
 #
 # The ruleset (modules/overlay-network.nix) is the other half: the kernel answers
@@ -207,7 +207,7 @@ in
         }
         {
           assertion = missingProvisioned == [ ];
-          message = "mesh: no ${ifName} public key for ${lib.concatStringsSep ", " missingProvisioned}. Run: clan vars generate";
+          message = "mesh: no ${ifName} public key for ${lib.concatStringsSep ", " missingProvisioned}. Generate their secrets (the `wg-ctrl` generator) and commit them.";
         }
       ];
     }

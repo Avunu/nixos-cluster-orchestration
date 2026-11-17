@@ -3,7 +3,7 @@
 # so on the shared store. Two VMs, the real tick and the real publisher, and the test
 # driver's shared directory standing in for /mnt/jfs, which both mount.
 #
-# Why it matters: a nixpkgs, kernel, Lanzaboote, clan or library bump is in every node's
+# Why it matters: a nixpkgs, kernel, Lanzaboote, agenix or library bump is in every node's
 # next closure at once, and its kernel, initrd and unlock path first run at a reboot. A
 # stack that cannot boot passes every build gate and activates everywhere, then stops the
 # whole fleet at its next reboots. The canary reboots into it first, with someone

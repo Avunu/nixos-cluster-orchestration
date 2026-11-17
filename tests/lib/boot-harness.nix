@@ -10,7 +10,14 @@
 # The target boots through Lanzaboote with the keys the disko hook made. A fresh set of
 # firmware variables is Setup Mode, so nothing is enforcing until a test enrolls them,
 # and the signed boot chain is the same with or without that. Each leg is then bound to
-# the target's TPM. The `peer` VM is where initrd SSH comes from, and where the audit
+# the target's TPM.
+#
+# The install gives each leg a TPM slot on the installer's TPM, bound to no PCR, and a
+# slot for the recovery key (modules/boot-security-core.nix). boot-install keeps both and
+# installs on the target's own TPM, as a node is installed. The other tests are about a
+# node at the prompt and what a bind makes of it, on TPMs of their own, so their
+# provisioning removes the install's slot once it has checked it is there
+# (boot-harness.py, `provision`). The `peer` VM is where initrd SSH comes from, and where the audit
 # receiver runs for the tests that check the boot report.
 {
   pkgs,
@@ -19,6 +26,7 @@
   lanzabooteModule,
 }:
 let
+  # The node's recovery key (the `luks/passphrase` secret): what is typed at a prompt.
   passphrase = "boot-harness-luks-passphrase";
   emergencyPassword = "boot-harness-emergency-password";
   # printf %s "$emergencyPassword" | openssl passwd -6 -salt fixturesalt -stdin
@@ -56,7 +64,7 @@ let
 
   hostId = "f0000b00";
 
-  # Where clan uploads partitioning secrets for a machine called target.
+  # Where an install puts the partitioning secrets of a machine called target.
   partitioningSecret = gen: file: "/run/partitioning-secrets/per-machine/target/${gen}/${file}";
   passwordFile = partitioningSecret "luks" "passphrase";
   identitySecretFile = partitioningSecret "volume-identity" "secret";
@@ -85,6 +93,18 @@ let
 
 in
 {
+  # What a test that builds its own machines around the target needs of the above.
+  inherit
+    drives
+    hostId
+    wan
+    sshKeys
+    passwordFile
+    identitySecretFile
+    hostKeyFile
+    identityHash
+    ;
+
   # The boot report and the audit trail, for the tests that check them (boot-install,
   # boot-fallback): the target reports each boot to the real Worker on the peer VM. Not
   # in the shared target, so the other boot tests stay as they are.
@@ -152,12 +172,18 @@ in
       sealEdit ? null,
       # More for the peer VM: the audit receiver (`audit.peer`), in the tests that use it.
       peerModule ? { },
+      # More machines, and more constants for the script (a function of `nodes`), for the
+      # test that installs through the real installer (tests/install-node.nix).
+      extraNodes ? { },
+      prelude ? (_: ""),
     }:
     pkgs.testers.runNixOSTest {
       inherit name globalTimeout;
       # The script drives VMs from threads and reaches into the driver's machine objects.
       skipLint = true;
       skipTypeCheck = true;
+
+      imports = [ { nodes = extraNodes; } ];
 
       nodes.peer =
         { lib, ... }:
@@ -180,6 +206,9 @@ in
           virtualisation.memorySize = 4096;
           virtualisation.cores = 2;
           virtualisation.qemu.drives = drives;
+          # The install enrolls a TPM slot on each leg and refuses a machine without a
+          # TPM. Which one this is, the harness decides at each start (NIX_SWTPM_DIR).
+          virtualisation.tpm.enable = true;
           # In the VM's Nix database, so nixos-install can copy it to the new root.
           virtualisation.additionalPaths = [
             nodes.target.system.build.toplevel
@@ -218,8 +247,9 @@ in
 
           disko.devices =
             (import ../../lib/mk-disk-layout.nix {
-              inherit lib devices passwordFile;
+              inherit lib devices;
               encrypted = true;
+              inherit (config.cluster.boot.install) leg;
             }).disko.devices;
 
           cluster.boot = {
@@ -237,7 +267,10 @@ in
                 "virtio_pci"
               ];
             };
-            install = { inherit identitySecretFile hostKeyFile; };
+            install = {
+              recoveryKeyFile = passwordFile;
+              inherit identitySecretFile hostKeyFile;
+            };
             sealPackage = lib.mkIf (sealEdit != null) (
               lib.mkForce (
                 config.system.build.sealPackageFor (
@@ -326,11 +359,14 @@ in
           SSH_PORT = ${toString sshPort}
           WAN_INTERFACE = "${wan.interface}"
           WAN_ADDRESS = "${wan.address4}"
-          LUKS_DEVICES = ${builtins.toJSON (lib.mapAttrs (_: v: v.device) nodes.target.boot.initrd.luks.devices)}
+          LUKS_DEVICES = ${
+            builtins.toJSON (lib.mapAttrs (_: v: v.device) nodes.target.boot.initrd.luks.devices)
+          }
           TPM2_PLUGINS = "${nodes.target.systemd.package}/lib/cryptsetup"
           VIRT_FW_VARS = "${pkgs.python3Packages.virt-firmware}/bin/virt-fw-vars"
           OPENSSL = "${pkgs.openssl}/bin/openssl"
           IOMMU_PARAMS = ${builtins.toJSON nodes.target.cluster.boot.iommuParams}
+          ${prelude nodes}
           ${builtins.readFile ./control.py}
           ${builtins.readFile ./boot-harness.py}
           ${script}

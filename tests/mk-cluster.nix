@@ -1,10 +1,8 @@
 # Eval-level check of the consumer interface (lib/mk-cluster.nix), with mkCluster
 # called the way a private flake calls it.
 #
-# `self` here exports NOTHING: no `clan.modules`, no nixosConfigurations. That is
-# the point of the first check. If the local clan service were resolved through
-# the calling flake's outputs rather than clan's `modules` option, a consumer
-# would have to re-export it, and this eval would throw.
+# `self` here exports NOTHING: mkCluster builds a consumer's machines from its
+# arguments, never from the calling flake's outputs.
 #
 # The second half runs the template's own flake.nix `outputs` function, so the
 # template cannot drift from the interface it documents. The template does not opt
@@ -36,7 +34,7 @@ let
   # An app file that fails to evaluate unless the consumer's input reached it.
   appsDir = ./fixtures/mk-cluster/apps;
 
-  clan = mkCluster {
+  site = mkCluster {
     self = {
       inputs = { };
       outPath = ./fixtures;
@@ -48,15 +46,15 @@ let
       name = "consumer";
       domain = "example.org";
     };
-    recipients = [ "age1d4xvnzk8ukfgsawg7alhva2lzp9cuztygzwpwdgvgtepzvv44e0qgvt7ar" ];
+    masterIdentities = import ./fixtures/master-identities.nix;
     admins = [ "ssh-ed25519 AAAA-consumer-test-key" ];
     hostsDir = ./fixtures/mk-cluster/hosts;
     grafanaDashboards = dashboards;
     extraModules = [ { environment.etc."consumer-extra-module".text = "yes"; } ];
   };
 
-  node1 = clan.config.nixosConfigurations.node1;
-  node2 = clan.config.nixosConfigurations.node2;
+  node1 = site.nixosConfigurations.node1;
+  node2 = site.nixosConfigurations.node2;
   c = node1.config;
   args = node1._module.specialArgs;
 
@@ -68,7 +66,7 @@ let
     directory = toString ./fixtures/mk-cluster; # see tests/fixtures/default.nix
     inherit topology;
     meta.name = "bare";
-    recipients = [ "age1d4xvnzk8ukfgsawg7alhva2lzp9cuztygzwpwdgvgtepzvv44e0qgvt7ar" ];
+    masterIdentities = import ./fixtures/master-identities.nix;
     admins = [ "ssh-ed25519 AAAA-consumer-test-key" ];
   };
 
@@ -142,16 +140,57 @@ let
         && node2.config.services.haproxy.enable;
     }
     {
-      name = "meta reaches clan";
-      ok = c.clan.core.settings.name == "consumer";
+      name = "meta.name reaches the modules";
+      ok = args.clusterSite.name == "consumer" && c.cluster.alerting.clusterName == "consumer";
     }
     {
-      name = "the age backend, with the consumer's recipients";
-      ok = c.clan.core.vars.settings.secretStore == "age";
+      name = "the consumer's master identities are what agenix-rekey encrypts to";
+      ok =
+        map (i: i.pubkey) c.age.rekey.masterIdentities
+        == map (i: i.pubkey) (import ./fixtures/master-identities.nix)
+        && c.age.rekey.storageMode == "local";
     }
     {
-      name = "the consumer's directory holds its vars";
-      ok = c.clan.core.settings.directory == toString ./fixtures/mk-cluster;
+      name = "the consumer's directory holds its secrets, each machine's under its own name";
+      ok =
+        c.cluster.secrets.directory == toString ./fixtures/mk-cluster
+        && c.cluster.secrets.machine == "node1"
+        && node2.config.cluster.secrets.machine == "node2"
+        &&
+          toString c.age.rekey.localStorageDir == toString ./fixtures/mk-cluster + "/secrets/rekeyed/node1";
+    }
+    {
+      name = "mkCluster returns what a site's flake exports: the machines, agenix-rekey's apps, the generators";
+      ok =
+        site ? machineModules
+        && site.agenix-rekey.x86_64-linux ? rekey
+        && site.agenix-rekey.x86_64-linux ? edit-view
+        && site.secrets.node1.generators ? nomad-tls
+        &&
+          site.secrets.node1.generators.nomad-tls.files."agent.key".storedAs
+          == "secrets/per-machine/node1/nomad-tls/agent.key.age";
+    }
+    {
+      # One installer per node, each nixos-install-helper's `deploy` for the site's own
+      # system of that name, and nothing of the installer a cluster does not use.
+      name = "mkCluster returns an installer per node: its deploy app, for the node's own system, with avc's step as its hook";
+      ok =
+        let
+          apps = site.apps.x86_64-linux;
+          installer = site.installers.node1;
+          program = builtins.unsafeDiscardStringContext apps.install-node1.program;
+          hook = installer.apps.x86_64-linux.deploy.program;
+        in
+        lib.attrNames apps == map (n: "install-${n}") (lib.attrNames topology.nodes)
+        && lib.all (a: a.type == "app") (lib.attrValues apps)
+        && lib.hasSuffix "/bin/deploy" program
+        && hook == apps.install-node1.program
+        # No ISO, no questionnaire: a node is installed over the network, from its topology.
+        && !(installer.packages.x86_64-linux ? installerIso)
+        && !(installer.packages.x86_64-linux ? guidedIso)
+        && !(installer.apps.x86_64-linux ? configure)
+        && installer.resolvedRoots == [ ]
+        && installer.checks.x86_64-linux == { };
     }
     {
       name = "admins reach root and admin";
@@ -175,7 +214,7 @@ let
       ok =
         args.inputs ? wordpress-nix
         && args.inputs ? odoo-nix
-        && bare.config.nixosConfigurations.node1._module.specialArgs.inputs.frappe-nix ? nixosModules;
+        && bare.nixosConfigurations.node1._module.specialArgs.inputs.frappe-nix ? nixosModules;
     }
     {
       name = "hostsDir: a node's file is imported, and a missing one is fine";
@@ -195,19 +234,25 @@ let
     }
     {
       name = "with no appsDir or hostsDir the catalogue is empty and the node still evaluates";
-      ok = bare.config.nixosConfigurations.node1.config.clusterApps == { };
+      ok = bare.nixosConfigurations.node1.config.clusterApps == { };
     }
     {
       name = "the operations index reads the consumer's topology and apps";
       ok =
         let
-          index = mkOpsIndex { inherit clan topology; };
+          index = mkOpsIndex { inherit site topology; };
         in
         index.reference == "node1" && index.flakeUrl == topology.deploy.flakeUrl && index.apps ? probe;
     }
     {
       name = "the template's flake evaluates, and enable = false leaves its example app out";
-      ok = templateNode.config.clusterApps == { } && template ? clanInternals && template ? opsIndex;
+      ok =
+        templateNode.config.clusterApps == { }
+        && template ? agenix-rekey
+        && template ? clusterSecrets
+        && template ? opsIndex
+        # `avc boot install node1` runs this.
+        && template.apps.x86_64-linux ? install-node1;
     }
     # .github/workflows/merge-gate.yml builds these at the site's own lock (WS17).
     {
@@ -247,14 +292,14 @@ let
 
   failed = lib.filter (x: !x.ok) checks;
 in
-# Forcing the toplevels' drvPaths is what proves the clans evaluate through their
+# Forcing the toplevels' drvPaths is what proves the sites evaluate through their
 # assertions, which fire there. Discarding the context keeps this an eval-level
 # check: nothing is built.
 pkgs.runCommand "mk-cluster-checks"
   {
     toplevels = map builtins.unsafeDiscardStringContext [
       node1.config.system.build.toplevel.drvPath
-      bare.config.nixosConfigurations.node1.config.system.build.toplevel.drvPath
+      bare.nixosConfigurations.node1.config.system.build.toplevel.drvPath
       templateNode.config.system.build.toplevel.drvPath
     ];
   }

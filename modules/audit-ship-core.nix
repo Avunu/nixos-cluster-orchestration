@@ -1,7 +1,7 @@
 # modules/audit-ship-core.nix — the node's half of the off-host audit trail.
 #
-# Clan-independent, as modules/backup-core.nix is: modules/audit-ship.nix supplies the
-# URL and the token from the topology and clan vars, and the boot VM tests import this
+# Independent of the secret store, as modules/backup-core.nix is: modules/audit-ship.nix supplies the
+# URL and the token from the topology and the site's secrets, and the boot VM tests import this
 # with plain files (tests/lib/boot-harness.nix's targets, through modules/boot-report.nix).
 #
 # Events go to the cluster-watchdog Worker's POST /event (workers/cluster-watchdog),

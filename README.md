@@ -1,6 +1,6 @@
 # nixos-cluster-orchestration
 
-A NixOS module library for running application containers on a small cluster of bare-metal machines: `systemd-nspawn` containers, started and stopped by HashiCorp Nomad, sharing state through an encrypted JuiceFS volume, each reaching the internet through its own outbound Cloudflare Tunnel, on top of [clan-core](https://clan.lol). Every node's disks are encrypted and unlock unattended only into the node's own signed boot.
+A NixOS module library for running application containers on a small cluster of bare-metal machines: `systemd-nspawn` containers, started and stopped by HashiCorp Nomad, sharing state through an encrypted JuiceFS volume, each reaching the internet through its own outbound Cloudflare Tunnel. Every node's disks are encrypted and unlock unattended only into the node's own signed boot.
 
 There is no Kubernetes, image registry or load balancer. Each node compiles its own closure locally from a flake, Nomad only turns pre-built dormant containers on and off, and no inbound port is opened for any application.
 
@@ -15,13 +15,12 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 ## Architecture
 
 - **The topology is the single source of truth.** Nodes, VLANs, addressing, object storage and role tags are one plain Nix attrset. Every module derives its networkd units, nftables ruleset, Nomad settings, quorum membership and Prometheus targets from it.
-- **clan-core is the fleet substrate.** It owns the machine registry, role assignment, the secret lifecycle (`vars`) and bare-metal install. It has no analogue for the orchestration below, which this library owns. The clan inventory is a mechanical projection of the topology.
-- **Bootstrap is push, steady state is pull.** `clan machines install` installs a node (through `avc boot install`, see [Installing a node](#installing-a-node)). After that, every node rebuilds itself from your flake on a timer (`modules/pull-deploy.nix`), so deploying means pushing a commit.
+- **Bootstrap is push, steady state is pull.** `avc boot install` installs a node from its provider's rescue system, with [nixos-install-helper](https://github.com/Avunu/nixos-install-helper) and nixos-anywhere underneath (see [Installing a node](#installing-a-node)). After that, every node rebuilds itself from your flake on a timer (`modules/pull-deploy.nix`), so deploying means pushing a commit.
 - **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the TPM releases the disk key only to that signed boot. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
 - **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it. No entry names a node: Nomad places every app, and an app's data is where Nomad puts it ([Where an app runs](#where-an-app-runs)).
 - **Ingress is a tunnel per app, over a unix socket.** Each container runs its own `cloudflared` against a unix socket. See [Ingress](#ingress).
 - **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds files: each app has a volume of its own, in a bucket of its own, mounted on the node the app runs on ([An app's files](#an-apps-files)). Its metadata is a PostgreSQL database with a member on every node, which survives the loss of the node holding its primary ([The JuiceFS metadata database](#the-juicefs-metadata-database)). The volume is encrypted, and every mount refuses one that is not.
-- **Secrets are `clan vars`** on clan's plain `age` backend. Values are generated offline, committed encrypted, and decrypted on the host at activation. Containers never hold a key: the plaintext is bind-mounted in.
+- **Secrets are age files, rekeyed per node.** Each is committed encrypted to the operators' master identities (YubiKeys), and [agenix-rekey](https://github.com/oddlama/agenix-rekey) re-encrypts what a node reads to that node's own recipient, whose private half is in the node's TPM. The rekeyed files are committed too, so a node decrypts at activation from its own closure, with no operator and no operator key. A node whose secrets did not all decrypt does not start Nomad, and says so (`SecretsMissing`). Containers never hold a key: the plaintext is bind-mounted in. See [Secrets](#secrets).
 - **No service belongs to one node.** A tag says what a node votes in (`nomad-server`, `etcd`) or that it runs apps (`worker`). Everything else, the JuiceFS metadata database, job registration, Prometheus, Alertmanager and Loki included, runs on every node or every Nomad server.
 - **The private network is not trusted.** Nomad speaks mTLS with a gossip key on the control VLAN. Everything else between nodes (etcd, Loki, Prometheus and its exporters, Vector, the JuiceFS metadata database) listens only on a WireGuard mesh, `wg-ctrl`, over that VLAN. See [The control plane](#the-control-plane).
 
@@ -128,7 +127,7 @@ The network modules were written for bare-metal hosts on OVHcloud's model, and s
 
 ## The interface
 
-The library's flake exports `lib.mkCluster`, which returns the clan-core clan result. A consumer's flake looks like this ([`templates/cluster`](templates/cluster) is a complete one):
+The library's flake exports `lib.mkCluster`, which returns the site's machines and what `agenix rekey` reads. A consumer's flake looks like this ([`templates/cluster`](templates/cluster) is a complete one):
 
 ```nix
 {
@@ -142,19 +141,21 @@ The library's flake exports `lib.mkCluster`, which returns the clan-core clan re
   outputs = inputs@{ self, cluster, ... }:
     let
       topology = import ./topology.nix;
-      clan = cluster.lib.mkCluster {
+      site = cluster.lib.mkCluster {
         inherit self inputs topology;
         directory = ./.;
-        meta = { name = "my-cluster"; domain = "example.com"; };
-        recipients = [ "age1..." ];
+        meta.name = "my-cluster";
+        masterIdentities = [ ./secrets/master/yubikey-1.pub ];
+        extraRecipients = [ "age1..." ];
         admins = [ "ssh-ed25519 AAAA... me@laptop" ];
         appsDir = ./apps;
         hostsDir = ./hosts;
       };
     in
     {
-      inherit (clan.config) nixosConfigurations clanInternals;
-      opsIndex = cluster.lib.mkOpsIndex { inherit clan topology; };
+      inherit (site) nixosConfigurations agenix-rekey apps;
+      clusterSecrets = site.secrets;
+      opsIndex = cluster.lib.mkOpsIndex { inherit site topology; };
       inherit (cluster) packages devShells;
     };
 }
@@ -162,12 +163,13 @@ The library's flake exports `lib.mkCluster`, which returns the clan-core clan re
 
 | Argument | Required | Meaning |
 | --- | --- | --- |
-| `self` | yes | Your flake. clan builds with `self.inputs.nixpkgs`, falling back to the library's. Use `nixpkgs.follows = "cluster/nixpkgs"` to stay on the tested revision. |
+| `self` | yes | Your flake. The machines are built with `self.inputs.nixpkgs`, falling back to the library's. Use `nixpkgs.follows = "cluster/nixpkgs"` to stay on the tested revision. `agenix rekey` writes below its root. |
 | `inputs` | no | Your flake's inputs, merged with the library's and passed to modules and app files as `inputs`. Yours win, so you can bring your own `frappe-nix`, `odoo-nix` or `wordpress-nix`. Any you don't set come from the library. |
-| `directory` | yes | Where the site's clan state lives (`vars/`, `secrets/`, `inventory.json`). Use `./.`, a path, so each secret's ciphertext joins the system closure. |
+| `directory` | yes | Where the site's secrets live, under `secrets/` (see [Secrets](#secrets)). Use `./.`, a path at your flake's root: `agenix rekey` finds where each node's rekeyed files go by it. |
 | `topology` | yes | See [Topology schema](#topology-schema). |
-| `meta` | yes | `{ name; domain; }`, handed to clan. `name` also signs alert emails. |
-| `recipients` | yes | The operators' age public keys, plus one offline recipient (see [The offline kit](#the-offline-kit)). Anyone listed can decrypt every secret. |
+| `meta` | yes | `{ name; }`. The name signs alert emails and names the binary cache's signing key. Other attributes are ignored. |
+| `masterIdentities` | yes | The operators' age identities, as agenix-rekey's `age.rekey.masterIdentities` takes them: a path to an identity file, or `{ identity; pubkey; }`. Every secret in the repository is encrypted to all of them, and `agenix rekey` decrypts with any one. For a YubiKey, the file `age-plugin-yubikey --identity` prints, which holds no private key and is committed. Anyone holding one can decrypt every secret. |
+| `extraRecipients` | no | age recipients every secret is also encrypted to and that nothing decrypts with day to day: the offline one (see [The offline kit](#the-offline-kit)). |
 | `admins` | yes | The operators' SSH public keys, for `root` and `admin` on every node, and for the initrd's SSH. Empty is an evaluation error, because it would lock you out. |
 | `appsDir` | no | One file per app. `null` means no apps. |
 | `hostsDir` | no | `<name>.nix` per machine, each optional. |
@@ -178,17 +180,29 @@ Other exports:
 
 | Output | What it is |
 | --- | --- |
-| `lib.mkOpsIndex { clan, topology; }` | What `avc` reads, exposed as your flake's `opsIndex`. |
+| `lib.mkOpsIndex { site, topology; }` | What `avc` reads, exposed as your flake's `opsIndex`. `site` is what `mkCluster` returned. |
 | `lib.net`, `lib.juicefs`, `lib.backupTarget`, `lib.mkAppContainer`, `lib.nomad` | The pure helpers the modules use. |
 | `nixosModules.*` | The modules. They read `topology`, `clusterLib` and `clusterSite` from `specialArgs`, which `mkCluster` provides. |
-| `packages.avc`, `devShells.default` | The operations tool, and a shell with `avc`, `clan`, `nomad`, `juicefs`, `age` and friends. |
+| `packages.avc`, `packages.agenix`, `devShells.default` | The operations tool; agenix-rekey's command (`nix run .#agenix -- rekey`, `edit`, `view`), which reads the flake it is run in; and a shell with both, `nomad`, `juicefs`, `age` and its YubiKey and TPM plugins. |
 | `templates.default` | The consumer flake skeleton. |
-| `nixosConfigurations`, `clanInternals`, `opsIndex` | The **fixture** cluster's, for this repository's checks. Yours come from your own `mkCluster` call. |
+| `nixosConfigurations`, `agenix-rekey`, `clusterSecrets`, `opsIndex` | The **fixture** cluster's, for this repository's checks. Yours come from your own `mkCluster` call. |
+
+`mkCluster` returns:
+
+| Attribute | What it is |
+| --- | --- |
+| `nixosConfigurations` | One NixOS system per key of `topology.nodes`. |
+| `agenix-rekey` | What `agenix rekey`, `edit` and `view` read. Export it under that name. |
+| `secrets` | Every machine's secret generators as data (script, prompts, dependencies, and where each file is kept), for the tool that runs them. `nix eval --json .#clusterSecrets.<node>`. |
+| `machineModules` | Each machine as a NixOS module, which the VM tests boot. |
+| `apps` | `apps.x86_64-linux.install-<node>` for each node: its installer, which `avc boot install` runs. Export it as your flake's `apps`. |
+| `installers` | The same per node as the whole [nixos-install-helper](https://github.com/Avunu/nixos-install-helper) project (`mkProject`'s result), for a site that wants more of it than the `deploy` app. |
 
 Three things are easy to get wrong:
 
-- **`nix flake check --no-build` evaluates read-only.** With `directory` as a path, clan's interpolation names a store path that a read-only run never adds, so that command fails on a consumer flake whose current source no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures pass a string to get past it, which a real site must not do: a string would keep the secrets out of the closure.
-- **Flakes only see tracked files.** Run `git add` on new apps and vars before you evaluate.
+- **`nix flake check --no-build` evaluates read-only.** agenix-rekey reads a node's rekeyed files through a copy of their directory in the store, which a read-only run never makes (`error: path '/nix/store/…' is not valid`), so that command fails on a flake whose rekeyed files no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures have no recipients and pass `directory` as a string to stay clear of it; `checks.secrets-tpm` and `checks.secrets` read a site that does have them.
+- **Flakes only see tracked files.** Run `git add` on new apps, secrets and rekeyed files before you evaluate.
+- **A rekeyed file that is missing stops the build.** A node with a recipient whose secret was added or changed and not rekeyed fails to evaluate, with agenix-rekey's "please run `agenix rekey`". A node with no recipient yet evaluates with placeholders that decrypt nowhere, and a warning.
 
 ## Encryption
 
@@ -201,7 +215,7 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | Where data is | How it is protected |
 | --- | --- |
 | Both disks | LUKS2 on each leg of the ZFS mirror (`crypt-a`, `crypt-b`); evaluation refuses a vdev that is not on dm-crypt, and `PoolVdevNotEncrypted` checks it at run time. Swap takes a random key every boot. The ESPs are plaintext and hold the signed boot files, public values, and one secret: the initrd's SSH host key, inside the initrd (see [Residual risks](#residual-risks)). |
-| The disk key | A TPM2 key slot on each leg, enrolled with `systemd-cryptenroll` and sealed to PCR 7, which records Secure Boot's state and keys. The TPM is the one unattended factor: see [Residual risks](#residual-risks). |
+| The disk key | Each leg's header holds two key slots and no more. One is a TPM2 slot (`systemd-cryptenroll`), made at install bound to no PCR and replaced by `avc boot bind`, once Secure Boot enforces the node's own keys, with one sealed to PCR 7, which records Secure Boot's state and keys. The other is the node's **recovery key**, which exists as ciphertext in the private repository, encrypted to the operators' YubiKeys, and nowhere else. The key a leg is formatted with is made in the installer's memory and has no slot once the install is over. The TPM is the one unattended factor: see [Residual risks](#residual-risks). |
 | The boot | Secure Boot through Lanzaboote, with keys made on the node at install and never copied off it (`/var/lib/sbctl`, on the encrypted root). No Microsoft keys by default: option ROMs this boot measured are enrolled by hash. |
 | A swapped volume | A per-node secret on the encrypted root whose hash is compiled into the signed initrd. The initrd checks it before it mounts anything from the pool, and halts on a mismatch, so a forged disk with copied identifiers gets nothing. |
 | The emergency shell | Protected by a hashed password, and entering it first extends PCR 7 with a burn, so the TPM refuses the disk key for the rest of that boot. |
@@ -210,8 +224,9 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | Backups | restic, with each app's repository at a salted hash of its name. |
 | The state backup | Restic, like the nightly backup and under the same password, at a salted hash of the app's name that is not the nightly repository's. See [Backups and restore](#backups-and-restore). |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
+| A node's secrets | In its closure and in the repository, each encrypted to an age identity whose private half is in that node's TPM. The identity file that names the key to the TPM is on the node's encrypted disk and not in the repository: the TPM key is bound to no boot state, so the disk is what keeps a rescue boot from using it. In memory once decrypted, on a tmpfs that never swaps. |
 
-Unattended unlock needs no person and no network, and never stands in a person's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
+Unattended unlock needs no person and no network, and never stands in a person's way. The recovery key, typed, always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
 
 Two records watch this: each node's **boot report** (`modules/boot-report.nix`: how it unlocked, Secure Boot state, PCR 7, initrd SSH logins) becomes metrics and alerts, and an **off-host audit trail** sends boots, deploys, SSH logins, Nomad ACL changes and canary hits to a Cloudflare Worker that only appends (see [Audit trail](#audit-trail)). Both are the node's own account. Nothing off the node sees a disk key released, so a machine that boots where it reaches neither leaves no record: see [A node left your control](#a-node-left-your-control).
 
@@ -220,63 +235,87 @@ Two records watch this: each node's **boot report** (`modules/boot-report.nix`: 
 | Thing | Where | Notes |
 | --- | --- | --- |
 | Topology, apps, hosts | `topology.nix`, `apps/`, `hosts/` | The site's description, in plain Nix. |
-| Vars ciphertext and public values | `secrets/`, `vars/` | See [Secrets](#secrets). `git add` and commit them before any install: flakes only see tracked files, and `avc boot preflight` refuses uncommitted vars. |
-| Age recipients | `recipients` in `flake.nix` | The operators, plus one **offline** recipient that exists only on paper or sealed media. After adding a recipient, run `clan vars fix <machine>` for each machine (`avc secrets fix` does every one): partitioning secrets are encrypted to each machine's key, and that key to the recipients. |
+| Secrets and public values | `secrets/shared/`, `secrets/per-machine/<node>/` | One file per generator file: `<generator>/<file>.age`, encrypted to the master identities, or `<generator>/<file>` in the clear for a public value. No node can read a `.age` file here. See [Secrets](#secrets). |
+| What each node reads | `secrets/rekeyed/<node>/` | `agenix rekey`'s output: each secret the node is given, re-encrypted to that node's recipient. These are the files in a node's closure. Commit them with the secret they came from. |
+| Each node's recipient | `secrets/recipients/<node>.pub` | The public half of the node's age identity (age-plugin-tpm), whose private half never leaves its TPM. `avc boot install` writes it, from the node's TPM, before the node's system is built. A node without one is given placeholders. |
+| Each node's identity file | `secrets/identities/<node>.age` | What `age-plugin-tpm --generate` wrote on that node: a handle to the key in its TPM, useless on any other machine. Encrypted to the master identities like every secret. The node's own copy is on its encrypted disk; this one is what a reinstall on the same machine puts back, so that nothing has to be rekeyed. |
+| Master identities | `masterIdentities` and `extraRecipients` in `flake.nix` | The operators' YubiKey identities: two, so that losing one loses nothing. `extraRecipients` is for an **offline** recipient that exists only on paper or sealed media; a site whose recovery keys are to be readable by the YubiKeys alone names none, because every secret is encrypted to it too. After changing them, `avc secrets fix` re-encrypts every secret to the new set and rekeys (`agenix update-masterkeys` would skip the ones no node is given). `secrets/.master-recipients` records the set the files are encrypted to. |
 | `secrets/policy.toml` | `avc`'s rotation policy | The template's marks `luks`, `volume-identity`, `juicefs-rsa` and `restic` never, and `nomad-ca`, `nomad-jwt`, `wg-ctrl` and `juicefs-pg` manual. `avc` refuses the never-ones in code too. |
 
-**Name a second unlocker for each site**: a second person with their own age identity in `recipients`, an SSH key in `admins`, and access to the provider's console, who has run `avc boot unlock` once. Unattended unlock depends on the TPM and an unchanged PCR 7; a typed passphrase depends on a person.
+**Name a second unlocker for each site**: a second person with their own YubiKey in `masterIdentities`, an SSH key in `admins`, and access to the provider's console, who has run `avc boot unlock` once. Unattended unlock depends on the TPM and an unchanged PCR 7; the recovery key depends on a person with a YubiKey.
 
 ### The offline kit
 
-Kept outside any repository, off the cluster, and away from the laptop that holds your age key:
+Kept outside any repository, off the cluster, and away from the laptop you work on:
 
-- the offline age identity, whose public key is in `recipients`;
+- the second YubiKey, when one operator holds both, and the offline age identity if `extraRecipients` names one;
 - a dated `git bundle` of the private repository (`git bundle create site-<date>.bundle --all`);
-- direct copies of each node's `luks/passphrase`, of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB), and the same two files of every `<app>-jfs`: each app's volume has its own key;
+- direct copies of `restic/password`, and of `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase` (the PEM is about 3.4 KB), and the same two files of every `<app>-jfs`: each app's volume has its own key;
 - `cloud-state/passphrase`, with `cloud`: without it OpenTofu's state is unreadable, and what it made has to be imported again by hand;
 - `ovh-s3/{access-key,secret-key}`, `backup-target/{access-key,secret-key}` and `backup-state-target/{access-key,secret-key}`, and from the topology `objectStorage`, `backup.target`, `backup.state.target` and `backup.repoSalt`.
 
-With the bundle and the offline identity, `clan vars get` gives back every other secret: `git clone site-<date>.bundle site`, then in it `AGE_KEYFILE=<offline identity> clan vars get <node> luks/passphrase`. To let a new operator in, add their public key to `recipients`, commit, and run `clan vars fix <machine>` for each machine with the offline identity; a key not yet in `recipients` reads nothing. With the JuiceFS key, the S3 pair and the bucket alone, the volume's metadata can be rebuilt anywhere (see [Restore without a node](#restore-without-a-node)).
+**No disk secret goes in the kit.** A node's recovery key (`luks/passphrase`) and its volume identity secret exist as ciphertext in the repository and nowhere else: the bundle carries them, and a master identity reads them. A copy in the clear, on paper or on a stick, would be a second way into every disk that nothing watches.
+
+With the bundle and one master identity, `avc` gives back every secret: `git clone site-<date>.bundle site`, `nix develop` in it, plug in a YubiKey, and `avc secrets reveal <node>:luks/passphrase`. With the offline identity instead: `AVC_AGE_IDENTITY=<offline identity file> avc secrets reveal …`. To let a new operator in, add their YubiKey's identity to `masterIdentities`, commit, and run `avc secrets fix` with a key that already reads: it re-encrypts every secret, the nodes' identity files included, to the new set and rekeys. A key not yet in `masterIdentities` reads nothing. With the JuiceFS key, the S3 pair and the bucket alone, the volume's metadata can be rebuilt anywhere (see [Restore without a node](#restore-without-a-node)).
 
 ### Opting out
 
 `nodes.<n>.insecurePlaintextBoot = "<reason>"` is the one switch, per node. That node gets plain disks, systemd-boot, no Secure Boot, no TPM binding, no initrd SSH and no volume identity. Every evaluation warns, the node exports `cluster_boot_insecure_optout 1`, and `BootSecurityOptedOut` fires. Nothing else changes: Nomad mTLS, the mesh, the raw_exec lockdown, default-deny and the encrypted JuiceFS volume have no opt-out.
 
-Like every node, an opted-out one holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) beside the age key that decrypts them, so one pulled drive of it reads every client's files and backups, whatever runs on it. The site has to say it knows: `insecureFleetKeysOnPlaintextDisk = "<reason>"` at the top level, or evaluation fails. The test fixtures opt out on every node; a real site should not.
+Like every node, an opted-out one holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) as ciphertext on its plaintext disk, and its TPM decrypts them for whatever is booted on the machine: the node's age identity is bound to the TPM, not to a boot state. So a rescue boot of it reads every client's files and backups, whatever runs on it. The site has to say it knows: `insecureFleetKeysOnPlaintextDisk = "<reason>"` at the top level, or evaluation fails. The test fixtures opt out on every node; a real site should not.
 
 Without the opt-out, evaluation fails unless the **resulting** configuration has LUKS under the pool, Lanzaboote, the TPM option on every leg, the identity check and the rest. The assertions read results, not intent: a host file that swaps the disk layout fails too.
 
 ### Never
 
-- **Never `clan vars generate --regenerate` `luks` or `volume-identity` on an installed node.** A new passphrase opens nothing, and a new identity halts the node at its next boot. `avc secrets rotate` refuses both.
+- **Never regenerate `luks` or `volume-identity` on an installed node.** A new recovery key opens nothing, and a new identity halts the node at its next boot. `avc secrets rotate` refuses both, and `avc secrets provision` makes neither anew on a node that has a recipient.
+- **Never copy a recovery key out of the repository.** It is read in two places: typed at a prompt (`avc boot unlock`, which names the command that prints it), and sent on stdin by `avc boot bind --recovery-key`. Nothing else needs it, and the kit does not hold it.
 - **Never enroll a TPM slot by hand.** A bare `systemd-cryptenroll` runs none of `cluster-boot-seal bind`'s checks (Setup Mode, the burn, a foreign authority, the identity), so it can seal to a PCR 7 that someone else can reproduce. Rebind with `avc boot bind <node> --replace`.
 - **Never bind in Setup Mode.** PCR 7 in Setup Mode is the same constant on every machine, so a seal taken then can be reproduced by anyone who clears the keys. `cluster-boot-seal bind` refuses.
+- **Never leave a node between its install and its bind.** The install's TPM slot is bound to no PCR: until `avc boot bind`, anything booted on the machine, the provider's rescue system included, can have its TPM open the disks. `TpmBindingUnsealed` fires after six hours of it, and no client data belongs on the node before S8.
+- **Never clear a node's TPM once it is installed**, unless you mean to: the disk key's slot and the node's age key are both in it. The recovery key gets you back in, and `avc boot identity` and a rebind put both back ([Recovery](#recovery)).
 - **A manual `juicefs dump` is plaintext**, file names included. The automatic dumps in the bucket are encrypted; one you take by hand is not. Keep it on an encrypted disk and delete it.
 
 ## Installing a node
 
-The order: install in Setup Mode, first boot with the passphrase, enroll the node's own keys from the running system, reboot enforcing with the passphrase, bind the TPM, reboot unattended. Each `avc boot` command runs one step and says what comes next. The sequence ran end to end in a VM, driven by the boot test harness rather than `avc` and `clan` (`checks.boot-install`); `avc boot preflight` and `clan vars generate` ran on a site made from the template; real firmware has its own [checklist](#real-hardware-checklist).
+The order: install in Setup Mode, a first boot nobody types into, enroll the node's own keys from the running system, reboot enforcing, bind the TPM slot to PCR 7, reboot. Nobody types a disk key at any step: the install leaves each leg a TPM slot that opens on this machine's TPM, and the bind seals it. Each `avc boot` command runs one step and says what comes next. The sequence ran end to end in VMs: the install through the real installer, with a software TPM, in `checks.install-node`, and S3 to S7 on the real seal tool in `checks.boot-install`. Real firmware, a real TPM and YubiKeys have their own [checklist](#real-hardware-checklist).
 
-Three rules behind the order:
+Four rules behind the order:
 
 - **Never bind in Setup Mode** (above).
+- **The bind follows the install by hours, not days.** Between them the TPM gives the disk key to any boot of the machine (above).
 - **Every signed generation carries the identity check and the PCR burn.** On a fresh install that is automatic: generation 1 has both, and evaluation fails without them.
-- **The identity's hash is known before the first build.** `clan vars generate` makes the secret and its hash together on your machine. The hash is a public value compiled into generation 1's initrd, signed at install; the secret is written to the new root by the install before the first boot. Read the ESP and you find the hash, not the secret.
+- **The identity's hash is known before the first build.** `avc secrets provision` makes the secret and its hash together on your machine. The hash is a public value compiled into generation 1's initrd, signed at install; the secret is written to the new root by the install before the first boot. Read the ESP and you find the hash, not the secret.
+
+Where each secret is, step by step:
+
+| Secret | Before the install | During it | Afterwards |
+| --- | --- | --- | --- |
+| The key each leg is formatted with | Does not exist | Made by the disk layout's hook in the installer's memory (`/run/cluster-install`), one per leg | Its slot is removed and the file deleted before the install goes on; the installer's reboot forgets the memory |
+| The disk key's TPM slot | Does not exist | Enrolled by the same hook, bound to this TPM and to no PCR | In each leg's header. Replaced at S6 by one sealed to PCR 7 |
+| The recovery key (`luks/passphrase`) | Ciphertext in the repository, encrypted to the YubiKeys | Decrypted on your machine into a tmpfs, sent over SSH into the installer's `/run`, given a slot on each leg | Ciphertext in the repository. The tmpfs copy is removed when the installer ends, the other at the reboot |
+| The volume identity secret, the initrd's SSH host key | As the recovery key | As the recovery key, then written to the new root by the layout's hook | On the node's encrypted root (the host key also inside the initrd, on the ESP), and ciphertext in the repository |
+| The node's age key | Does not exist | Made in the machine's TPM by `age-plugin-tpm`, in the installer | In the TPM. It never leaves it |
+| The node's identity file (a handle to that key) | Does not exist | Read from the installer, staged for the new root, encrypted to the YubiKeys into `secrets/identities/<node>.age` | On the node's encrypted root (`/var/lib/cluster-secrets/identity.txt`), and ciphertext in the repository |
+| What the node reads (its services' secrets) | Ciphertext to the YubiKeys | Rekeyed on your machine to the node's new recipient, before its system is built | In the node's closure and in `secrets/rekeyed/<node>/`, encrypted to its TPM's key |
+| The Secure Boot signing keys | Do not exist | Made on the new root by the layout's hook | On the node's encrypted root (`/var/lib/sbctl`), and nowhere else |
 
 ### S0. Prepare the private repository
 
 You, at your workstation, in `nix develop`. The node doesn't exist yet.
 
 ```sh
-age-keygen -o ~/.config/age/identities        # once per operator
-age-keygen -o /secure/offline-identity        # once; keep it offline, put its public key in `recipients`
+age-plugin-yubikey --generate                 # once per YubiKey: a key in a PIV slot
+age-plugin-yubikey --identity > secrets/master/yubikey-1.pub   # its identity file: no private key, committed
+$EDITOR flake.nix                             # masterIdentities (both YubiKeys), admins
 $EDITOR topology.nix                          # mesh, nodes.<n>.{initrdNicModules,disks}
-clan vars generate                            # every machine, placeholders too, so their mesh keys exist
-git add vars secrets topology.nix && git commit -m "vars"
+git add -A                                    # flakes only see tracked files
+avc secrets provision                         # every machine, placeholders too, so their mesh keys exist
+avc secrets check
 avc boot preflight <node>
 ```
 
-`avc boot preflight` must pass. It evaluates the node's system and disk script, so every posture assertion fires here and not on the server, and it prints the identity hash and the initrd host key's fingerprint for your records.
+`avc secrets provision` commits `secrets/` on a branch and opens the pull request; nothing is rekeyed yet, because no node has a recipient. `avc boot preflight` must pass. It evaluates the node's system and disk script, so every posture assertion fires here and not on the server, and it prints the identity hash and the initrd host key's fingerprint for your records.
 
 If it fails, nothing has touched a machine: fix and repeat.
 
@@ -286,7 +325,7 @@ At the provider's BMC console:
 
 - Enable the TPM and the IOMMU. CSM off.
 - Clear the Secure Boot keys, so the firmware is in Setup Mode.
-- Write down the BMC version and the TPM's state. Clear the TPM if the firmware offers it. If it can't be cleared, go on and write that down.
+- Write down the BMC version and the TPM's state. Clear the TPM if the firmware offers it. If it can't be cleared, go on and write that down. This is the last time it may be cleared: from S2 on it holds the node's keys.
 
 ### S2. Install
 
@@ -294,42 +333,55 @@ At the provider's BMC console:
 avc boot install <node> root@<rescue-address>
 ```
 
-From the provider's rescue system, with SSH, outbound network, and Secure Boot not enforcing. `avc` runs the preflight again, asks you to type the node's name, and runs `clan machines install <node> --target-host root@<rescue-address> --yes`: kexec into the NixOS installer, partition and format (both disks get an ESP, swap, and a LUKS2 leg made with the node's `luks/passphrase`), write the identity secret, the initrd's SSH host key and new Secure Boot keys to the new root, install and sign generation 1 onto both ESPs, and reboot.
+From the provider's rescue system, booted with your SSH key, with outbound network and Secure Boot not enforcing. `avc` runs the preflight again, asks you to type the node's name, and runs the site's installer for the node, `nix run .#install-<node>`: [nixos-install-helper](https://github.com/Avunu/nixos-install-helper)'s network install, which is nixos-anywhere in two runs with a step of `avc`'s between them.
 
-If it fails, run it again from rescue. It formats again; nothing is on the disks yet.
+1. **kexec.** The rescue system is replaced, in memory, by the NixOS installer (nixos-anywhere downloads nixos-images' release; `AVC_INSTALL_ARGS="--kexec <tarball>"` gives it one instead). Nothing on the disks has changed.
+2. **`avc boot stage`**, on your machine, against the installer:
+   - it copies `age` and `age-plugin-tpm` into the installer and makes the node's age identity on the machine's TPM. If the repository already holds an identity for this node and this TPM still answers for it (a reinstall), that one is kept and nothing is rekeyed;
+   - it writes the recipient to `secrets/recipients/<node>.pub` and the identity file, encrypted to the YubiKeys, to `secrets/identities/<node>.age`, and rekeys everything the node reads to the new recipient (`secrets/rekeyed/<node>/`);
+   - it stages the identity file for the new root, and decrypts the three partitioning secrets (the recovery key, the volume identity secret, the initrd's host key) into a tmpfs.
 
-### S3. First boot: Setup Mode, not enforcing
+   Your YubiKey is asked for one touch per file it decrypts: the three partitioning secrets, and each secret rekeyed to the node. The identity is made in the installer rather than in the provider's rescue system because that is the kernel and the TPM driver that enroll the disk's TPM slot a moment later, and it has Nix, so the plugin is the one this library pins and no static build has to be kept for a rescue system that may have no TPM driver at all.
+3. **Partition, install, reboot.** Only now is the node's system built, so the closure that is installed already holds the secrets its TPM decrypts. nixos-anywhere sends the partitioning secrets into the installer's `/run` and runs the disk layout: both disks get an ESP, swap, and a LUKS2 leg. Each leg is formatted with a key made on the spot, in memory; that key enrolls a TPM2 slot bound to no PCR and adds a slot for the recovery key, and is then removed and deleted. The layout's hook writes the identity secret, the initrd's SSH host key and new Secure Boot keys to the new root, the system is installed and generation 1 signed onto both ESPs, and the machine reboots.
+
+Then `avc` ships what the step wrote under `secrets/` (the recipient, the identity file, the rekeyed files) by pull request, like every change.
+
+If it fails before the partitioning, nothing on the disks has changed. After it, run it again from rescue: it formats again, and keeps the identity it made the first time. An installer without a TPM, or without the recovery key, refuses before it formats anything: the first node could never unlock itself and the second could never be recovered.
+
+The installer's SSH host key is made at each boot of it, so there is nothing to pin: this step trusts the address you gave it, as nixos-anywhere does ([Residual risks](#residual-risks)).
+
+### S3. First boot: Setup Mode, and nobody types
 
 ```sh
-avc boot unlock <node>        # types the passphrase over the initrd's SSH, port 2222
 avc boot status <node>
 ```
 
-Nothing is bound yet, so the prompt appears within seconds. `avc boot unlock` asks you for the passphrase (`clan vars get <node> luks/passphrase`); one passphrase opens both legs. Typing it at the console works as well. `avc boot unlock` checks the initrd's host key against the repository's copy, which protects against reaching the wrong machine by accident. It does **not** authenticate the machine: the key is readable on the ESP, so anyone who has read the ESP can impersonate the initrd. A passphrase can be typed into a tampered machine.
+The node comes up by itself, within about a minute of the installer's reboot: the install's TPM slot opens both legs, and its secrets decrypt with the identity made at S2. `avc boot status` should show Setup Mode, both legs `ONLINE`, `identity OK`, and for each leg `1 TPM slot(s), 0 sealed to PCR 7`.
 
-`avc boot status` should show Setup Mode, both legs `ONLINE`, and `identity OK`.
+That last line is the state to leave quickly. The slot is bound to this TPM and to nothing else, so any boot of this machine can ask the TPM for the disk key (`cluster_boot_tpm_unsealed_tokens`, `TpmBindingUnsealed` after six hours). It cannot be sealed yet: PCR 7 in Setup Mode is the same on every machine.
 
-A wrong passphrase asks again, for ever. If the node lands in emergency mode, its SSH, network and password prompts stay up: answer the prompts, then `systemctl restart zfs-import-rpool; systemctl --no-block default`. The emergency password is `clan vars get <node> emergency-access/password`.
+If the node waits at a prompt instead (a TPM cleared since S2, say), the recovery key opens it: `avc boot unlock <node>` types over the initrd's SSH, port 2222, and names the command that prints the key; one answer opens both legs. `avc boot unlock` checks the initrd's host key against the repository's copy, which protects against reaching the wrong machine by accident. It does **not** authenticate the machine: the key is readable on the ESP, so anyone who has read the ESP can impersonate the initrd. A recovery key can be typed into a tampered machine. Then S6 needs `--recovery-key`.
+
+A wrong key asks again, for ever. If the node lands in emergency mode, its SSH, network and password prompts stay up: answer the prompts, then `systemctl restart zfs-import-rpool; systemctl --no-block default`. The emergency password is `avc secrets reveal <node>:emergency-access/password`.
 
 ### S4. Enroll the node's own keys
 
 ```sh
 avc boot enroll <node>
-ssh root@<node> systemctl reboot
+avc boot reboot <node>
 ```
 
 This runs `cluster-boot-seal enroll` on the node: it refuses unless the firmware is in Setup Mode, and enrolls the node's own keys with `sbctl enroll-keys --tpm-eventlog`, which adds the option ROMs this boot measured (NIC, NVMe, RAID firmware) to the allowed list by hash, so they keep loading. Microsoft's keys are not enrolled; `cluster.boot.enrollMicrosoftKeys = true` in a host file does that instead, and then the node can't be bound at all if any of its option ROMs is Microsoft-signed (see [Residual risks](#residual-risks), D27).
 
-If enrollment is refused or the node won't boot afterwards, put the firmware back in Setup Mode. Nothing is bound yet, so the passphrase is all you need.
+If enrollment is refused or the node won't boot afterwards, put the firmware back in Setup Mode. The install's slot still opens the disks, and the recovery key does whatever happens.
 
 ### S5. Second boot: enforcing
 
 ```sh
-avc boot unlock <node>
 avc boot status <node>        # Secure Boot: enabled (user), PCR 7 different from S3's
 ```
 
-Some firmware needs Secure Boot switched on by hand at this point.
+Again nobody types: the install's slot is bound to no PCR, so the change of PCR 7 does not matter to it. Some firmware needs Secure Boot switched on by hand at this point.
 
 ### S6. Bind the TPM
 
@@ -337,7 +389,9 @@ Some firmware needs Secure Boot switched on by hand at this point.
 avc boot bind <node>
 ```
 
-`avc` runs `cluster-boot-seal bind` on the node, with the passphrase on stdin from `clan vars get`. It refuses unless Secure Boot is enforcing and Setup Mode is off; if PCR 7 was burned this boot (the node went through emergency mode: reboot first); unless PCR 7's event log shows only this node's own certificate (or hash entries) as the authority that let the boot run; unless the identity secret matches the hash; and if a leg is already bound. Then for each leg it enrolls a TPM2 key slot sealed to PCR 7 with `systemd-cryptenroll`, and finally checks that each slot opens. The passphrase slot is never touched.
+`avc` runs `cluster-boot-seal bind` on the node and sends it nothing. It refuses unless Secure Boot is enforcing and Setup Mode is off; if PCR 7 was burned this boot (the node went through emergency mode: reboot first); unless PCR 7's event log shows only this node's own certificate (or hash entries) as the authority that let the boot run; unless the identity secret matches the hash; and if a leg already has a slot sealed to PCR 7. Then for each leg it enrolls a TPM2 key slot sealed to PCR 7 with `systemd-cryptenroll`, authorised by the leg's own TPM slot, which must open now; removes the install's slot once the new one is written; and checks that each slot opens and that none is left unsealed. The recovery key's slot is never touched, and the recovery key never leaves the repository.
+
+A leg with no TPM slot that opens (the node was unlocked by hand at S3 or S5, a disk was replaced, PCR 7 has changed since a bind) has nothing on the node to authorise a new slot: `avc boot bind <node> --recovery-key` decrypts the recovery key with your YubiKey and sends it on stdin, to the node and nowhere that prints.
 
 To redo it: `avc boot bind <node> --replace` enrolls the new slot first and only then removes the leg's older TPM slots, so a failure loses nothing.
 
@@ -347,11 +401,11 @@ To redo it: `avc boot bind <node> --replace` enrolls the new slot first and only
 avc boot reboot <node>
 ```
 
-`avc boot reboot` refuses unless the next boot should come back by itself: the default entry's boot contract is the running one, the default entry is not on the rollback denylist ([Rolling back](#rolling-back-a-bad-closure)), an ESP is mounted, no automated hold is set, every leg has a TPM slot that opens now (`cluster-boot-seal check`), the identity secret is in place (`cluster-boot-seal identity`), and the last boot unlocked every leg from the TPM. A short TPM count is only a note in two cases. When `avc boot bind` succeeded this boot (it writes `/run/avc-boot-bound` only once the bind has returned 0; `/run` clears at boot), the last unlock was the typed one from before the binding, as at S7, and only this reboot can prove the binding; `cluster-boot-seal check` must still pass. When PCR 7 was burned this boot (emergency mode), no TPM slot can be tried, so the check says nothing about the binding and only the reboot shows it. Then it reboots the node and waits for a new boot.
+`avc boot reboot` refuses unless the next boot should come back by itself: the default entry's boot contract is the running one, the default entry is not on the rollback denylist ([Rolling back](#rolling-back-a-bad-closure)), an ESP is mounted, no automated hold is set, every leg has a TPM slot that opens now (`cluster-boot-seal check`), the identity secret is in place (`cluster-boot-seal identity`), and the last boot unlocked every leg from the TPM. It says so when a leg's slot is still the install's. A short TPM count is only a note in two cases. When `avc boot bind` succeeded this boot (it writes `/run/avc-boot-bound` only once the bind has returned 0; `/run` clears at boot), the last unlock was a typed one from before the binding, and only this reboot can prove the binding; `cluster-boot-seal check` must still pass. When PCR 7 was burned this boot (emergency mode), no TPM slot can be tried, so the check says nothing about the binding and only the reboot shows it. Then it reboots the node and waits for a new boot.
 
-Expect stage 2 within about a minute. On the node: `cluster_boot_unlock_tpm_devices` equal to the number of legs, `cluster_boot_secure_boot_enabled 1`, `cluster_boot_setup_mode 0`; and an email from the Worker, `[NOTICE] <site>: <node> booted (tpm)`.
+Expect stage 2 within about a minute. On the node: `cluster_boot_unlock_tpm_devices` equal to the number of legs, `cluster_boot_secure_boot_enabled 1`, `cluster_boot_setup_mode 0`, `cluster_boot_tpm_unsealed_tokens 0` for each leg; and an email from the Worker, `[NOTICE] <site>: <node> booted (tpm)`.
 
-If the TPM refuses, the prompt is there: type the passphrase, then go back to S6 with `--replace`.
+If the TPM refuses, the prompt is there: `avc boot unlock <node>` with the recovery key, then back to S6 with `--replace --recovery-key`.
 
 ### S8. Attack it, then seal it
 
@@ -359,7 +413,7 @@ Run the [real hardware checklist](#real-hardware-checklist) on the node with can
 
 ### The first deploy after an install
 
-A freshly installed node runs generation 1, which has a boot contract and a boot stack, so its pull deploys proceed. The first canary node of a new site has nothing to wait for. Each later node takes the stack the canary has booted; if your repository has moved on to a newer stack since, it waits until the canary reboots into that one (see [Deploying](#deploying)).
+A freshly installed node runs generation 1, built from your working tree with the recipient the install had just written, so it holds its secrets from its first boot. It has a boot contract and a boot stack, so its pull deploys proceed once the install's pull request has merged. The first canary node of a new site has nothing to wait for. Each later node takes the stack the canary has booted; if your repository has moved on to a newer stack since, it waits until the canary reboots into that one (see [Deploying](#deploying)).
 
 ## Recovery
 
@@ -368,15 +422,16 @@ A freshly installed node runs generation 1, which has a boot contract and a boot
 | Event | What it takes |
 | --- | --- |
 | A kernel update, a new generation | Nothing. PCR 7 does not change. |
-| Secure Boot toggled off; db or dbx changed; the TPM cleared | The signed loader still runs, but PCR 7 differs or the TPM's seal is gone, and the TPM refuses the disk key: type the passphrase at the next boot (`avc boot unlock <node>`), then `avc boot bind <node> --replace`. |
-| A firmware update **cleared** the keys (the firmware is in Setup Mode) | Bind refuses in Setup Mode. `avc boot unlock <node>`, `avc boot enroll <node>`, reboot, `avc boot unlock <node>` again, then `avc boot bind <node> --replace`. |
-| The firmware restored its **factory** keys | The node's own loader is refused (Access Denied), so no prompt appears. At the BIOS: put the firmware in Setup Mode (or turn Secure Boot off), boot with the passphrase, then `avc boot enroll <node>`, reboot, unlock, `avc boot bind <node> --replace`. How real firmware behaves here is on the [checklist](#real-hardware-checklist). |
+| Secure Boot toggled off; db or dbx changed | The signed loader still runs, but PCR 7 differs and the TPM refuses the disk key: type the recovery key at the next boot (`avc boot unlock <node>`), then `avc boot bind <node> --replace --recovery-key`. The key is needed because no TPM slot on the node opens any more. |
+| The TPM was cleared | As above, and the node's age key went with the seal: it boots on the recovery key and decrypts none of its secrets (`SecretsMissing`, and Nomad's agent is held). `avc boot unlock <node>`, `avc boot identity <node>`, `avc deploy break-glass <node>`, then `avc boot bind <node> --replace --recovery-key`. See [The node's age key is gone](#the-nodes-age-key-is-gone). |
+| A firmware update **cleared** the keys (the firmware is in Setup Mode) | Bind refuses in Setup Mode. `avc boot unlock <node>`, `avc boot enroll <node>`, reboot, `avc boot unlock <node>` again, then `avc boot bind <node> --replace --recovery-key`. |
+| The firmware restored its **factory** keys | The node's own loader is refused (Access Denied), so no prompt appears. At the BIOS: put the firmware in Setup Mode (or turn Secure Boot off), boot with the recovery key, then `avc boot enroll <node>`, reboot, unlock, `avc boot bind <node> --replace --recovery-key`. How real firmware behaves here is on the [checklist](#real-hardware-checklist). |
 | A disk died | The node boots on the other one, unattended and DEGRADED (`ZfsPoolUnhealthy`, `EspNotMounted`). See [Replacing a disk](#replacing-a-disk). |
 | The Secure Boot signing keys are lost (`/var/lib/sbctl` gone, root intact) | Every new generation fails to install (`DeployActivationFailing`), but the installed ones still boot. See [Signing keys lost, or rotated on purpose](#signing-keys-lost-or-rotated-on-purpose). |
 | The identity secret is damaged or missing | The node halts at boot (`volume-identity: MISMATCH`). See [Identity secret damaged](#identity-secret-damaged). `VolumeIdentityMissing` warns while the node is still running. |
 | An initrd authorized key must be retired, or a fix to the boot path must stick | Rotate the Secure Boot keys and rebind: [Signing keys lost, or rotated on purpose](#signing-keys-lost-or-rotated-on-purpose). Removing the key from `admins` alone is not enough (D26). |
-| The initrd's SSH host key | `avc secrets rotate` refuses it and prints the procedure: `clan vars generate <node> --generator initrd-ssh --regenerate`, then `clan vars get <node> initrd-ssh/ssh_host_ed25519_key \| ssh root@<node> install -m 0400 /dev/stdin /var/lib/initrd-ssh/ssh_host_ed25519_key`, then deploy. It takes effect at the next **new** generation; the ones already on the ESP keep the old key. |
-| The mainboard, or its TPM, was replaced | The new TPM holds no seal and the firmware none of the node's keys. At the BIOS: Setup Mode. Boot with the passphrase, `avc boot enroll <node>` (the keys are on the encrypted root), reboot, unlock, `avc boot bind <node> --replace`. Not rehearsed as one sequence. |
+| The initrd's SSH host key | `avc secrets rotate` refuses it and prints the procedure: a new pair from `ssh-keygen -t ed25519`, each half stored with `avc secrets set <node>:initrd-ssh/ssh_host_ed25519_key` (and `.pub`), then `avc -y secrets reveal <node>:initrd-ssh/ssh_host_ed25519_key \| ssh root@<node> install -m 0400 /dev/stdin /var/lib/initrd-ssh/ssh_host_ed25519_key`, then deploy. It takes effect at the next **new** generation; the ones already on the ESP keep the old key. |
+| The mainboard, or its TPM, was replaced | The new TPM holds no seal and no age key, and the firmware none of the node's keys. At the BIOS: Setup Mode. Boot with the recovery key (`avc boot unlock <node>`), `avc boot identity <node>` and `avc deploy break-glass <node>` ([The node's age key is gone](#the-nodes-age-key-is-gone)), `avc boot enroll <node>` (the signing keys are on the encrypted root), reboot, unlock, `avc boot bind <node> --replace --recovery-key`. `checks.install-node` shows the first step, the disks behind another TPM asking for the recovery key and holding their secrets shut; the rest is not rehearsed as one sequence. |
 | The machine is going back to the provider, or being retired | [Returning hardware](#returning-hardware), before it leaves. |
 | The machine left your control: stolen, seized, returned unwiped, or booted where you can't account for it | [A node left your control](#a-node-left-your-control). |
 | Everything lost | [Total loss](#total-loss). |
@@ -387,7 +442,7 @@ The boot menu's timeout is 0, so it shows only if you press a key (hold space) a
 
 1. **At the console:** press a key as the loader starts, choose the generation. Any signed generation still on the ESP boots and unlocks unattended.
 2. **From rescue:** mount the ESPs and set `default` in `/loader/loader.conf` on both (`default nixos-generation-<n>-*.efi`, the names are in `/EFI/Linux`). `loader.conf` is not signed.
-3. **When the provider's rescue can't boot under enforcing Secure Boot:** turn Secure Boot off at the BIOS, do the above from rescue, and turn it back on. That changes PCR 7 while it is off, so expect the passphrase at the next boot and run `avc boot bind <node> --replace` afterwards.
+3. **When the provider's rescue can't boot under enforcing Secure Boot:** turn Secure Boot off at the BIOS, do the above from rescue, and turn it back on. That changes PCR 7 while it is off, so expect the prompt at the next boot (`avc boot unlock <node>`) and run `avc boot bind <node> --replace --recovery-key` afterwards.
 
 ### Rolling back a bad closure
 
@@ -415,48 +470,73 @@ sgdisk -n1:0:+1G -t1:EF00 -c1:disk-nvme0-ESP -n2:0:+32G -c2:disk-nvme0-swap \
        -n3:0:0 -c3:disk-nvme0-luks /dev/disk/by-id/<new disk>
 udevadm settle
 mkfs.vfat -F 32 /dev/disk/by-partlabel/disk-nvme0-ESP     # before anything else: an unformatted ESP fails boot.mount
-cryptsetup luksFormat --type luks2 /dev/disk/by-partlabel/disk-nvme0-luks     # the node's luks/passphrase
-cryptsetup open --allow-discards /dev/disk/by-partlabel/disk-nvme0-luks crypt-a
+```
+
+The new leg is formatted with the node's recovery key, sent from your workstation on stdin, so that it is never on the node's disk or in its shell history (one YubiKey touch each):
+
+```sh
+avc -y secrets reveal <node>:luks/passphrase | ssh root@<node> \
+  cryptsetup -q luksFormat --type luks2 --key-file - /dev/disk/by-partlabel/disk-nvme0-luks
+avc -y secrets reveal <node>:luks/passphrase | ssh root@<node> \
+  cryptsetup open --allow-discards --key-file - /dev/disk/by-partlabel/disk-nvme0-luks crypt-a
+```
+
+Back on the node:
+
+```sh
 zpool replace -f rpool <dead leg's GUID> /dev/mapper/crypt-a
 zpool status rpool                         # wait for "resilvered"
 mount /boot && /run/current-system/bin/switch-to-configuration boot   # signs onto both ESPs again
 ```
 
-Then bind only the new leg: `avc boot bind <node> --device /dev/disk/by-partlabel/disk-nvme0-luks`. Not a bare `bind`, which refuses because the healthy leg is bound, and not `--replace`, which would rebind the healthy leg too. Release the hold. If the new disk enumerates differently, point `nodes.<n>.disks` at `/dev/disk/by-id/...`; the disks are in the boot contract, so that deploy waits for an approval on the node.
+Then bind only the new leg: `avc boot bind <node> --device /dev/disk/by-partlabel/disk-nvme0-luks --recovery-key`. The key, because the new leg has no TPM slot yet to authorise one. Not a bare `bind`, which refuses because the healthy leg is bound, and not `--replace`, which would rebind the healthy leg too. Release the hold. If the new disk enumerates differently, point `nodes.<n>.disks` at `/dev/disk/by-id/...`; the disks are in the boot contract, so that deploy waits for an approval on the node.
 
 ### Identity secret damaged
 
 The node halts at every boot until the secret is back; each attempt needs a power cycle from the BMC.
 
 1. Boot the provider's rescue system. Under enforcing Secure Boot that may need Secure Boot off at the BIOS first; turn it back on afterwards and expect a `--replace` rebind, because PCR 7 changed.
-2. Open both legs with the passphrase: `cryptsetup open /dev/disk/by-partlabel/disk-nvme0-luks crypt-a`, the same for `disk-nvme1-luks` and `crypt-b`.
+2. Open both legs with the recovery key, from your workstation: `avc -y secrets reveal <node>:luks/passphrase | ssh root@<rescue-address> cryptsetup open --key-file - /dev/disk/by-partlabel/disk-nvme0-luks crypt-a`, the same for `disk-nvme1-luks` and `crypt-b`. A rescue boot can't ask the TPM: its PCR 7 is not the node's.
 3. `zpool import -f -N -d /dev/mapper rpool` (`-f`, because the pool was last used by another host ID), then `mount -t zfs rpool/root /mnt`.
-4. From your workstation: `clan vars get <node> volume-identity/secret | ssh root@<rescue-address> install -m 0400 /dev/stdin /mnt/var/lib/volume-identity/secret`. `clan vars get` writes the bytes with no trailing newline, which is what the check hashes.
+4. From your workstation: `avc -y secrets reveal <node>:volume-identity/secret | ssh root@<rescue-address> install -m 0400 /dev/stdin /mnt/var/lib/volume-identity/secret`. Into a pipe, `avc secrets reveal` writes the bytes with no trailing newline, which is what the check hashes.
 5. **`umount /mnt` and `zpool export rpool`** before rebooting, then `cryptsetup close crypt-a` and `crypt-b`. A rescue interrupted before the export leaves a pool the node refuses to import at its next boot: boot rescue again and finish it.
 
 `checks.boot-degraded`'s `identity-repair-rehearsal` rehearses this sequence in a VM, including the interrupted rescue.
+
+### The node's age key is gone
+
+The TPM was cleared or replaced, or `/var/lib/cluster-secrets/identity.txt` was lost from the disk. The node boots (on its TPM slot if the TPM is the same, on the recovery key if not) and decrypts none of its secrets: `cluster-secrets.service` fails, `SecretsMissing` fires, Nomad's agent is held, and the pull loop can't fetch a private repository without its token. SSH still works.
+
+```sh
+avc boot identity <node>
+avc deploy break-glass <node>
+```
+
+`avc boot identity` does on the running node what the install does in the installer. If the TPM still holds the key the repository's identity file names, it puts that file back and nothing else changes: the secrets decrypt at the next activation. Otherwise it makes a new identity on the TPM, writes it to the node, commits the recipient and the encrypted identity file, rekeys everything the node reads (one YubiKey touch per secret) and opens the pull request. The node holds no secret until a closure built from that tree is on it, and can't pull one, so `avc deploy break-glass <node>` builds on your machine and switches the node over SSH. If the TPM changed, the disk's TPM slot went with it: `avc boot bind <node> --replace --recovery-key`.
+
+The old recipient's rekeyed files stay in the repository's history. They are encrypted to a key that no longer exists.
 
 ### Signing keys lost, or rotated on purpose
 
 Lost keys and a deliberate rotation are the same procedure. A rotation is what retires an initrd authorized key that was removed from `admins`, or makes a fix to the boot path irreversible: every older generation signed with the old keys still passes PCR 7 if someone kept a copy and puts it back on the ESP (D26). The deploy tick says so when `admins` changes. The order matters:
 
 1. At the BIOS, put the firmware in Setup Mode (this clears its keys).
-2. Boot, and type the passphrase (`avc boot unlock <node>`).
+2. Boot, and type the recovery key (`avc boot unlock <node>`).
 3. On the node, move the old keys away if they still exist (`mv /var/lib/sbctl /root/sbctl.old`), then `sbctl create-keys`.
 4. `avc boot enroll <node>`.
 5. **Sign again before any reboot:** `/run/current-system/bin/switch-to-configuration boot`, which writes both ESPs. Rebooting first would leave a loader the new keys refuse.
-6. Reboot, type the passphrase, then `avc boot bind <node> --replace`. Delete the old keys.
+6. Reboot, type the recovery key, then `avc boot bind <node> --replace --recovery-key`. Delete the old keys.
 
 ### A node left your control
 
-A whole machine that powers on unlocks itself: the TPM asks nobody. So when a node is stolen, seized, kept by the provider, returned without [its headers wiped](#returning-hardware), or booted somewhere you can't account for, assume it booted, and count everything on it as read. What stood in the way was the running system's logins and the attacks this design leaves [out of scope](#residual-risks), and nothing will tell you whether they held: a machine with no route to the Worker sends no boot report. Drives that left without their mainboard are a different case. They stay closed without the passphrase, and nothing here is needed for them.
+A whole machine that powers on unlocks itself: the TPM asks nobody. So when a node is stolen, seized, kept by the provider, returned without [its headers wiped](#returning-hardware), or booted somewhere you can't account for, assume it booted, and count everything on it as read. What stood in the way was the running system's logins and the attacks this design leaves [out of scope](#residual-risks), and nothing will tell you whether they held: a machine with no route to the Worker sends no boot report. Drives that left without their mainboard are a different case. They stay closed without the recovery key, which is in no place they could have come from, and nothing here is needed for them.
 
 What the node held, and what replaces it:
 
 | On the node | How it is replaced |
 | --- | --- |
 | Client data: every app's local state, since each node holds a copy of each app's ([Where an app runs](#where-an-app-runs)), and through its mount every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
-| The machine's age key (`/etc/secret-vars/key.txt`), which decrypts that machine's vars at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
+| The machine's age identity (the key in its TPM, and the identity file on its disk), which decrypts everything rekeyed to that machine at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
 | `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
 | `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
@@ -465,27 +545,27 @@ What the node held, and what replaces it:
 | Each app's own secrets, its tunnel credentials included (every app is a dormant container on every node) | `avc secrets rotate <generator>` for each, and a new tunnel credential from Cloudflare. |
 | `juicefs-rsa`, every `<app>-jfs`, `restic` | Bound to data. New volumes and new repositories: below. |
 | every `<app>-jfs-s3` | As `ovh-s3`: a new pair from the provider (`avc cloud apply` after removing the old key there), then delete the old one. |
-| `luks`, `volume-identity`, `initrd-ssh`, `emergency-access` and the Secure Boot keys | The lost machine's own, and they open nothing else. Its replacement is a new install, S0 to S8, under new values. |
+| `luks`, `volume-identity`, `initrd-ssh`, `emergency-access`, the node's identity file and the Secure Boot keys | The lost machine's own, and they open nothing else. With the node out of `nodes`, `git rm -r` its `secrets/per-machine/<node>`, `secrets/rekeyed/<node>`, `secrets/recipients/<node>.pub` and `secrets/identities/<node>.age`. Its replacement is a new install, S0 to S8, under new values. |
 
 The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
 
-**The data-bound keys.** `avc secrets rotate` refuses `juicefs-rsa` and `restic`, and goes on refusing: a new value opens nothing that exists. Here that is the purpose, so the new values are made by hand, and only once the old ones are safe. Before either procedure, compare the [offline kit](#the-offline-kit)'s `juicefs-rsa/rsa.pem`, `juicefs-rsa/rsa-passphrase` and `restic/password` with the repository's (`avc secrets reveal juicefs-rsa/rsa.pem`, and so on). The old volume and the old repositories open with those and with nothing else, and after a regeneration the repository holds them only in its history.
+**The data-bound keys.** `avc secrets rotate` and `avc secrets provision` refuse `juicefs-rsa`, every `<app>-jfs` and `restic`, and go on refusing: a new value opens nothing that exists. Here that is the purpose, and it has one command of its own, `avc secrets replace <generator>`. It takes only these generators, says what must already be true, and makes the new value only when you type `replace <generator>` back: `-y` does not answer it. It generates and rekeys and ships nothing: the new key belongs in one commit with the bucket or the salt it goes with, below. Before either procedure, compare the [offline kit](#the-offline-kit)'s `juicefs-rsa/rsa.pem`, `juicefs-rsa/rsa-passphrase` and `restic/password` with the repository's (`avc secrets reveal juicefs-rsa/rsa.pem`, and so on). The old volume and the old repositories open with those and with nothing else, and after a replacement the repository holds them only in its history.
 
 **A new JuiceFS volume.** A volume's key can't be changed, so this is a deliberate loss of the storage tier: a new, empty volume in a new bucket, and every app back from its backup.
 
 1. `cluster-backup` on a node, for each app running there (`avc app backup <app>` finds the node), and look at the result (`cluster-backup-list <app>`). These snapshots are what comes back.
 2. Hold every node (`avc deploy hold <node>`), and stop the apps (`nomad job stop app-<name>`) and then `juicefs-mount` on every node.
-3. Create a new, empty bucket. In one commit: its name in `objectStorage.juicefsBucket`, and a new key from `clan vars generate <node> --generator juicefs-rsa --regenerate`. Merge it.
+3. Create a new, empty bucket. In one commit: its name in `objectStorage.juicefsBucket`, and a new key from `avc secrets replace juicefs-rsa`. Ship it (`avc deploy ship`). An app's own volume is the same with its `<app>-jfs` and its bucket.
 4. On the node holding the metadata database's primary (`patronictl list` names it), empty the database (as `postgres`: `dropdb -p 5433 juicefs`, then `createdb -p 5433 -O juicefs juicefs`). This is the step that makes the volume new. With the old metadata still there, `juicefs-format` finds a volume it knows and keeps it, old bucket and old key.
 5. Release the nodes (`avc deploy release <node>`). The first `juicefs-format` to run finds no metadata and an empty bucket, which is a first bring-up: it formats an encrypted volume with the new key, and the others find it formatted.
 6. With each app's container running on the new volume, `cluster-restore <app> --yes` on the node it is running on (`avc app restore <app>`).
 7. When every app has been checked, delete the old bucket. Until then the old volume can be read from the kit ([Restore without a node](#restore-without-a-node)).
 
-**New restic repositories**, after the restores above, which read the old ones. `restic key add` and `restic key remove` change a repository's password but not its master key, and the old password has already given that away. In one commit: a new `backup.repoSalt`, and a new password from `clan vars generate <node> --generator restic --regenerate`. A repository's path is a hash of the salt and the app's name, so every app moves to a new, empty repository, and the first backup creates it under the new password. Run `cluster-backup` for every app at once, and check each. The old repositories stay where they were, readable with the old password, until you delete them.
+**New restic repositories**, after the restores above, which read the old ones. `restic key add` and `restic key remove` change a repository's password but not its master key, and the old password has already given that away. In one commit: a new `backup.repoSalt`, and a new password from `avc secrets replace restic`, shipped with `avc deploy ship`. A repository's path is a hash of the salt and the app's name, so every app moves to a new, empty repository, and the first backup creates it under the new password. Run `cluster-backup` for every app at once, and check each. The old repositories stay where they were, readable with the old password, until you delete them.
 
 Afterwards, put the new key, password, pairs, bucket and salt in the offline kit, with a new bundle.
 
-Two limits. A new key protects what is written from then on: whoever copied the old bucket or the old repositories while holding the old key can read that copy for good. And each step above follows from what the code does in that state (`checks.jfs-encrypted` proves `juicefs-format`'s states one at a time, `checks.backup-roundtrip` a restore), but neither migration has been rehearsed as a sequence, in a VM or on machines. Rehearse it on a scratch site before you need it.
+Two limits. A new key protects what is written from then on: whoever copied the old bucket or the old repositories while holding the old key can read that copy for good. And each step above follows from what the code does in that state (`checks.jfs-encrypted` proves `juicefs-format`'s states one at a time, `checks.backup-roundtrip` a restore, `checks.avc` that `replace` makes a key for its name typed back and for nothing else), but neither migration has been rehearsed as a sequence, in a VM or on machines. Rehearse it on a scratch site before you need it.
 
 ### Returning hardware
 
@@ -500,11 +580,11 @@ Before a machine goes back to the provider or is retired, while it is still your
    cryptsetup luksDump /dev/disk/by-partlabel/disk-nvme0-luks   # no key slot is left
    ```
 
-   `erase` destroys every key slot, the passphrase's and the TPM's, so from here no passphrase and no TPM opens these disks. The running system still has the volume key in memory.
+   `erase` destroys every key slot, the recovery key's and the TPM's, so from here no key and no TPM opens these disks. The running system still has the volume key in memory.
 3. Power it off. It can't unlock again.
-4. At the firmware, clear the TPM and the Secure Boot keys. A copy of a header made before step 2 still carries a TPM slot, which opens only on this TPM with this PCR 7. Clearing ends that, and leaves such a copy the passphrase alone.
+4. At the firmware, clear the TPM and the Secure Boot keys. A copy of a header made before step 2 still carries a TPM slot, which opens only on this TPM with this PCR 7. Clearing ends that, and leaves such a copy the recovery key alone. It also destroys the node's age key, so what was rekeyed to it, at any commit, decrypts nowhere.
 5. From the provider's rescue, discard both whole disks (`blkdiscard /dev/nvme0n1`, then `nvme1n1`). The ESPs are plaintext and hold the initrd's SSH host key and the emergency password's hash.
-6. Take the node out of `nodes`, ship it, and push `AUDIT_TOKENS` again without it.
+6. Take the node out of `nodes`, `git rm -r` its `secrets/per-machine/<node>`, `secrets/rekeyed/<node>`, `secrets/recipients/<node>.pub` and `secrets/identities/<node>.age`, ship it, and push `AUDIT_TOKENS` again without it.
 
 `checks.boot-attack` shows that a cleared TPM withholds the disk key. The header wipe is `cryptsetup`'s own and is not in the VM tests.
 
@@ -512,13 +592,13 @@ Before a machine goes back to the provider or is retired, while it is still your
 
 All nodes gone, or a rebuild from scratch, in this order:
 
-1. The private repository from the offline kit: `git clone site-<date>.bundle site`, `AGE_KEYFILE=<offline identity>`, a new operator key added to `recipients`, and `clan vars fix <machine>` for each machine.
+1. The private repository from the offline kit: `git clone site-<date>.bundle site`, and a master identity that reads it: a YubiKey, or the offline identity (`AVC_AGE_IDENTITY=<offline identity file>`). A new operator's YubiKey goes into `masterIdentities`, and `avc secrets fix` re-encrypts everything to the new set. The old nodes' recipients, identity files and rekeyed files name TPMs that are gone: `git rm -r secrets/recipients secrets/identities secrets/rekeyed`, so that every node is a node not yet installed.
 2. The first node installed and sealed, S0 to S8.
 3. The JuiceFS metadata restored from the bucket with the PEM and its passphrase: the first node does it from a recent dump once you tell it to start an empty database ([below](#when-every-copy-of-the-juicefs-metadata-is-lost)), or by hand ([Restore without a node](#restore-without-a-node)).
 4. Nomad bootstraps itself on the first voter, which registers every job.
 5. `cluster-restore <app> --yes` per app.
 
-`checks.jfs-encrypted`'s `total-loss-escrow-only` proves step 3 from the kit alone, and `checks.boot-install` the mechanism of step 2; the whole chain has not been rehearsed on real machines.
+`checks.jfs-encrypted`'s `total-loss-escrow-only` proves step 3 from the kit alone, and `checks.install-node` and `checks.boot-install` the mechanism of step 2; the whole chain has not been rehearsed on real machines.
 
 ## Real hardware checklist
 
@@ -532,8 +612,19 @@ A VM can't prove these. Run each on the first real node, with canary data only, 
 - The TPM's lockout state and leftover handles; whether a TPM clear is offered. Whether the TPM is a discrete chip or part of the firmware, from the board's documentation: it decides what a [bus attack](#residual-risks) can reach.
 - The provider's own signed software: its rescue with Secure Boot on (netboot, iPXE). Record what happens.
 - After install, read the raw disks: no canary. Rescue boot, a BIOS toggle, key changes: the TPM refuses. A volume swap, if the provider allows one.
+- **Between S3 and S6, on purpose:** boot the provider's rescue system and ask the TPM for a leg (`cryptsetup open --test-passphrase --token-only`). It opens: that is the window the install leaves, and what `avc boot bind` closes. Repeat after S6: it must not.
 - A kernel update and a reboot: unlocks by itself.
 - `kexec` from the provider's rescue before enrollment.
+
+**The TPM, at the install**
+- In the kexec'd installer: `/dev/tpmrm0` is there (the driver the nixos-images release carries, `tpm_crb` or `tpm_tis`, binds to this board's TPM), and `age-plugin-tpm --generate` and `systemd-cryptenroll --tpm2-device=auto` both work on it. `avc boot install` refuses a machine without one before it formats anything.
+- The identity made in the installer decrypts on the installed node: the same TPM, reached by another kernel. `avc boot stage` checks a round trip in the installer; the first boot's `cluster-secrets.service` is the other half.
+- A second `avc boot install` on the same machine keeps the identity; one after a TPM clear makes a new one and rekeys.
+- The installer's ZFS (the release's kernel module) accepts the pool the node's own `zpool` creates there.
+
+**YubiKeys**
+- `age-plugin-yubikey` with each of the two keys: `avc secrets provision`, `avc secrets reveal`, and an install with the other operator's key plugged in (`AGENIX_REKEY_PRIMARY_IDENTITY` names the one that is). Count the touches an install asks for, and whether the PIN policy asks once or every time.
+- SSH with the operators' `ed25519-sk` keys: to the rescue system (nixos-anywhere copies a temporary key of its own after the first connection), to a node, and to the initrd (`avc boot unlock`). The initrd's sshd accepts such a key in a VM (`checks.boot-fallback`, with OpenSSH's software authenticator); a real key adds the touch.
 
 **Network**
 - The WAN NIC's real name and driver in the initrd (`lspci -k`), so `initrdNicModules` is right and `avc boot unlock` reaches the prompt.
@@ -548,9 +639,9 @@ A VM can't prove these. Run each on the first real node, with canary data only, 
 - A physically absent NVMe, device timeouts, and `nofail` with both ESPs on real disks.
 
 **Install route and provider**
-- `clan machines install` through kexec from the provider's rescue (`avc boot install`).
+- `avc boot install` through kexec from the provider's rescue: a Debian-based system, where the VM test's is NixOS. That root logs in with your key there, that the kexec keeps the address and the key, and how long the provider leaves a rescue system up.
 - The Worker on real Cloudflare, the R2 bucket's lock, event rates, and its cron within the 15-minute grace.
-- An offline-kit drill with the real kit: from the offline identity to a machine key to `clan vars get`, including adding a recipient and `clan vars fix`. The same drill ran on a scratch site made from the template; yours proves your kit.
+- An offline-kit drill with the real kit: from the bundle and the second YubiKey (or the offline identity) to `avc secrets reveal <node>:luks/passphrase`, including adding an operator to `masterIdentities` and `avc secrets fix`. Then the recovery key itself: type it at a node's prompt.
 
 ## Residual risks
 
@@ -566,11 +657,14 @@ Accepted, and written here so they are accepted knowingly.
 - **An older signed generation passes PCR 7 for as long as the Secure Boot keys are the same (D26, accepted by the user).** `configurationLimit` bounds only what stays on the ESP. Anyone with the disk can copy a generation off and put it back later, and `loader.conf` is unsigned, so it can be made the default. So an initrd authorized key removed from `admins` still opens every older signed initrd anyone kept, and a fix to the boot path can be undone the same way. Retiring either needs new signing keys and a rebind ([procedure](#signing-keys-lost-or-rotated-on-purpose)). The tick says so when `admins` changes. A forward-moving seal (systemd-pcrlock, or a signed PCR 11 policy) would close this, and is not built.
 - **Own Secure Boot keys only, no Microsoft keys (D27, chosen by the user).** Option ROMs are enrolled by hash from this boot's event log. An option ROM whose hash changes with a firmware update no longer runs. `bind` refuses when PCR 7 records any authority but the node's own, because anything a Microsoft-signed component lets run could replay PCR 7. `cluster.boot.enrollMicrosoftKeys = true` is a written risk acceptance: it lets the provider's Microsoft-signed rescue images run under Secure Boot, and makes binding impossible on a node with a Microsoft-signed option ROM.
 - **`loader.conf` on the ESP is unsigned.** An attacker can pick any signed entry. Production closures have no specialisations; that is asserted.
-- **The ESP is readable by the provider:** the initrd's SSH host key, the emergency password's hash, the identity hash and the authorized keys, though not the secret. The host key doesn't prove the machine before a passphrase is typed into it.
-- **The emergency password** still opens a root shell in the initrd that can read whatever is unlocked and destroy data, even with PCR 7 burned. It is 32 random bytes and is held like the passphrase (D3).
+- **The ESP is readable by the provider:** the initrd's SSH host key, the emergency password's hash, the identity hash and the authorized keys, though not the secret. The host key doesn't prove the machine before a recovery key is typed into it.
+- **The emergency password** still opens a root shell in the initrd that can read whatever is unlocked and destroy data, even with PCR 7 burned. It is 32 random bytes and is held like the recovery key (D3).
 - **A forged pool is parsed by the kernel's ZFS before the identity check.** A crafted pool could attack the kernel; that needs an exploit and is beyond conventional access.
-- **An old LUKS header copy with the old passphrase stays valid** until `cryptsetup reencrypt`; changing the passphrase does not change the volume key.
-- **The passphrase's ciphertext is in git for good,** decryptable with an operator's age key or the machine's. The answer to a lost operator key is `cryptsetup reencrypt`.
+- **Between the install and the bind, the TPM answers any boot of the machine.** The install's TPM slot is bound to no PCR, because no PCR 7 worth sealing to exists before the node's own Secure Boot keys are enrolled. For those hours a rescue boot of the machine, by you or by the provider, opens the disks; the emergency shell's burn of PCR 7 protects nothing either. The node holds its secrets from its first boot, and no client data until S8. `cluster-boot-seal status` and `check` say when a slot is not sealed, `avc boot reboot` notes it, and `TpmBindingUnsealed` fires after six hours.
+- **The installer is reached without a host key to check.** A rescue system and the installer it is kexec'd into make their SSH host keys at boot. `avc boot install` and nixos-anywhere trust the address: someone answering there in the node's place would be sent its recovery key, its volume identity secret and its initrd host key, and would have to hold the machine's address at the provider to do it.
+- **An old LUKS header copy with the old recovery key stays valid** until `cryptsetup reencrypt`; changing the recovery key does not change the volume key.
+- **The recovery key's ciphertext is in git for good,** decryptable with an operator's master identity (or the offline one, where a site names one); it is rekeyed to no machine. The answer to a lost YubiKey is to take it out of `masterIdentities` and `avc secrets fix`, and `cryptsetup reencrypt` with a new recovery key if the lost one could be used.
+- **A node's identity file is on its disk and in the repository.** It is a handle: only the machine's TPM can use the key, and the TPM puts no condition on that use. So whatever boots on the machine and has the file decrypts the node's secrets. The disk keeps the file from a rescue boot, which is one more reason the bind must follow the install.
 - **`allowDiscards`** shows which blocks are free.
 - **A stolen gossip key plus a server's certificate makes a Nomad voter** within about 20 seconds, with the tokens in raft state. That is why both stay off workers. Root on a server can always mint a management token.
 - **A stolen client certificate can register a Nomad client,** and the scheduler can place work on it. Job specs hold only store paths and names. A machine's pre-signed login JWTs are long-lived; retiring them means a new `nomad-jwt` signing key.
@@ -615,16 +709,16 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `backup.retention` | `{ daily; weekly; monthly; }`. |
 | `backup.uploadLimitKiB` | restic upload limit. `0` means unlimited. |
 | `stateVersion` | `system.stateVersion` for the whole fleet. |
-| `insecureFleetKeysOnPlaintextDisk` | Required, as `"<reason>"`, once any node sets `nodes.<n>.insecurePlaintextBoot`. Every node holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) beside the age key that decrypts them, so one opted-out node's disk reads every client's files and backups, whatever runs on it. Test fixtures only. |
+| `insecureFleetKeysOnPlaintextDisk` | Required, as `"<reason>"`, once any node sets `nodes.<n>.insecurePlaintextBoot`. Every node holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) as ciphertext its TPM decrypts for whatever is booted on the machine, so a rescue boot of one opted-out node reads every client's files and backups, whatever runs on it. Test fixtures only. |
 | `insecureSingleMemberEtcd` | Test fixtures only: `"<reason>"` lets exactly one node carry `etcd`. Such an etcd can never grow (see the tag table below). Leave it out of a real site. |
 | `nodes.<name>` | One per machine. See below. |
 
-The attribute key under `nodes` is the machine name everywhere: the clan machine, the `--flake .#<key>` target, the name Nomad knows the node by. It must equal `hostName`.
+The attribute key under `nodes` is the machine name everywhere: the directory its secrets are kept under, the `--flake .#<key>` target, the name Nomad knows the node by. It must equal `hostName`.
 
 | Node field | Meaning |
 | --- | --- |
 | `index` | Small unique integer. Selects the node's app-VLAN address, app subnet and mesh address. |
-| `hostName`, `fqdn` | Host name, and the name in the clan inventory. |
+| `hostName`, `fqdn` | Host name (equal to the key under `nodes`), and the fully qualified name. |
 | `deployHost` | SSH target, and the address `avc boot unlock` reaches the initrd on. |
 | `roleTag` | Nomad client `meta.role`, a scheduling label. Not a cluster role. |
 | `tags` | Cluster roles, below. |
@@ -635,7 +729,7 @@ The attribute key under `nodes` is the machine name everywhere: the clan machine
 | `controlIp`, `storageIp` | Addresses on the control and storage VLANs. |
 | `appBridgeIp`, `appSubnet` | `br-app`'s address and the containers' subnet. |
 | `appDhcpPoolOffset`, `appDhcpPoolSize` | The containers' DHCP pool. Addresses below the offset are free for static use, such as `wpdb.address`. |
-| `initrdNicModules` | Kernel modules for the WAN NIC in the initrd, such as `[ "igb" ]`, so the passphrase can be typed over SSH. Not detectable at evaluation; `lspci -k` on the node names them. Required unless opted out. |
+| `initrdNicModules` | Kernel modules for the WAN NIC in the initrd, such as `[ "igb" ]`, so the recovery key can be typed over SSH. Not detectable at evaluation; `lspci -k` on the node names them. Required unless opted out. |
 | `disks` | `{ a; b; }`, the two disk devices. Default `/dev/nvme0n1` and `/dev/nvme1n1`. Use `/dev/disk/by-id/...` on hardware whose enumeration swaps. |
 | `swapPerDiskGiB` | The swap partition on each disk, in GiB; the node's swap is twice this. Default 32. Fixed at install: a new value takes a reinstall. |
 | `insecurePlaintextBoot` | `"<reason>"`: the one opt-out from disk encryption and Secure Boot. See [Opting out](#opting-out). |
@@ -697,7 +791,7 @@ Beside the kind, every generic `clusterApps` option stays available (`modules/ap
 An app with `juicefsPaths` has a JuiceFS volume of its own: a bucket (`<appBucketPrefix>-<app>`), an S3 pair that opens that bucket and no other, an encryption key, and a database and role of its own in the [metadata database](#the-juicefs-metadata-database). Nothing of one app's files is in another's bucket or database.
 
 - **Mounted where the app runs.** The app's container starts its mount (`juicefs-mount-<app>`, at `/mnt/jfs-app/<app>`) and the mount goes when the container does. The first start anywhere formats the volume; every later one finds it formatted. A mount that dies takes its container with it, and Nomad starts the app again.
-- **A new app needs its bucket first.** `avc cloud apply` makes the bucket and writes the S3 pair into the site's vars ([Providers](#providers)); without `topology.cloud`, make the bucket and its key by hand and `clan vars generate` prompts for them. The key and role password are generated. Until the bucket exists the app's start fails and Nomad retries it.
+- **A new app needs its bucket first.** `avc cloud apply` makes the bucket and writes the S3 pair into the site's secrets ([Providers](#providers)); without `topology.cloud`, make the bucket and its key by hand and `avc secrets provision` prompts for them. The key and role password are generated. Until the bucket exists the app's start fails and Nomad retries it.
 - **A preview's files are a clone inside the app's volume** (`previews/<slot>` beside `data`), so a preview needs no bucket and shares none of its writes with production.
 - **Two apps can share one volume** by naming it (`juicefsVolume`): a WordPress site's two faces do.
 - **Removing an app** leaves its bucket and database. The bucket carries `prevent_destroy`, so `avc cloud plan` fails on it and names it; delete it by hand once you are sure, and its database with `dropdb -p 5433 jfs_<app>` on the primary.
@@ -727,15 +821,15 @@ A site with one Nomad server and no `etcd` tag has one PostgreSQL, on that serve
 ### Adding an app
 
 1. Add its flake input if it has one.
-2. Write `apps/<name>.nix`, run `clan vars generate <node>` for the kind's generated secrets, and ship it (`avc deploy ship`). Nomad starts it. With no `tunnel.id` it has no ingress yet.
+2. Write `apps/<name>.nix`, `git add` it, and run `avc secrets provision` for the kind's generated secrets: it generates them, rekeys them for the nodes and ships the lot. Nomad starts the app. With no `tunnel.id` it has no ingress yet.
 3. Wire the tunnel:
    ```sh
    cloudflared tunnel create <name>
-   # set tunnel.id in the file; the var exists once the id is set
-   clan vars set <node> <name>-cf/cloudflared < ~/.cloudflared/<id>.json
+   # set tunnel.id in the file and `git add` it; the secret exists once the id is set
+   avc secrets set <name>-cf/cloudflared      # "A file": ~/.cloudflared/<id>.json
    cloudflared tunnel route dns <name> <hostname>
    ```
-4. Ship the id and the var together (`avc deploy ship`), then run `nomad job restart app-<name>`, because the credentials are a new bind mount.
+4. `avc secrets set` ships the id and the credentials together and restarts the app, because the credentials are a new bind mount. With `topology.cloud`, `avc cloud apply` does steps 3 and 4.
 
 Odoo and Frappe databases are not initialised for you. Restore or create one after the first start. Deploys then migrate it.
 
@@ -745,18 +839,21 @@ Odoo and Frappe databases are not initialised for you. Restore or create one aft
 
 ### First install
 
-Minimum before the first node: an operator age identity and the offline one in `recipients`, the topology filled in, and the `ovh-s3` and `github-token` generators. Then [Installing a node](#installing-a-node), S0 to S8:
+Minimum before the first node: both operators' YubiKey identities in `masterIdentities`, your SSH keys in `admins`, the topology filled in, and the `ovh-s3` and `github-token` generators. Then [Installing a node](#installing-a-node), S0 to S8:
 
 ```sh
 nix develop
-age-keygen -o ~/.config/age/identities     # once per operator; add the public key to `recipients`
-clan vars generate                         # prompts for what third parties issue
-git add vars secrets && git commit -m vars
+age-plugin-yubikey --identity > secrets/master/yubikey-1.pub   # once per YubiKey; name it in `masterIdentities`
+git add -A
+avc secrets provision                      # prompts for what third parties issue; commits and opens the pull request
 avc boot preflight node1
-avc boot install node1 root@<rescue-address>
+avc boot install node1 root@<rescue-address>   # the node's TPM identity, its disks, its first closure
+avc boot status node1                      # up by itself, in Setup Mode
+avc boot enroll node1
+avc boot reboot node1                      # enforcing, still on the install's TPM slot
 ```
 
-Then, after S5 (`avc boot unlock` and `avc boot enroll`) and before S6 and S7 (`avc boot bind`, `avc boot reboot`), deploy the [watchdog Worker](#dead-man), set `alerting.heartbeatUrl` and `alerting.auditUrl`, and push `AUDIT_TOKENS`. S7's boot report and the `booted (tpm)` email that says S7 worked both go there.
+Then, before S6 and S7 (`avc boot bind`, `avc boot reboot`), deploy the [watchdog Worker](#dead-man), set `alerting.heartbeatUrl` and `alerting.auditUrl`, and push `AUDIT_TOKENS`. S7's boot report and the `booted (tpm)` email that says S7 worked both go there. Do not let that take the day: until the bind, the node's TPM opens its disks for any boot of the machine.
 
 ### Secrets
 
@@ -764,11 +861,11 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 
 | Generator | Consumer | Origin |
 | --- | --- | --- |
-| `luks/passphrase` | The disks' LUKS passphrase, per machine. Used at install, then only by people: the typed fallback and `avc boot bind`. **Never regenerate it** on an installed node | Generated |
+| `luks/passphrase` | The node's recovery key, per machine: the one thing besides its TPM that opens its disks. Given a slot on each leg at install, then read only to recover: typed at a prompt, or sent by `avc boot bind --recovery-key`. Rekeyed to no node and kept nowhere but here. **Never regenerate it** on an installed node | Generated |
 | `volume-identity/{secret,hash}` | The volume identity, per machine. The secret goes on the root at install; the hash is compiled into the signed initrd. **Never regenerate it** on an installed node | Generated |
 | `initrd-ssh/ssh_host_ed25519_key` | The initrd's SSH host key, per machine. Placed at install; the public half is what `avc boot unlock` expects. Rotation by hand (see [Recovery](#recovery)) | Generated |
 | `emergency-access/{password,hash}` | The initrd emergency shell, per machine. The password never leaves the repository; the hash is in every signed initrd | Generated |
-| `ovh-s3/{access-key,secret-key}` | JuiceFS on all nodes. The volume keeps its own copy in its settings, which every mount reads; `juicefs-format` puts a new pair there when the vars change, and running mounts pick it up | Prompt, from your S3 provider |
+| `ovh-s3/{access-key,secret-key}` | JuiceFS on all nodes. The volume keeps its own copy in its settings, which every mount reads; `juicefs-format` puts a new pair there when the secrets change, and running mounts pick it up | Prompt, from your S3 provider |
 | `juicefs-rsa/{rsa.pem,rsa-passphrase}` | The cluster's own JuiceFS volume's encryption key. Never regenerate it: the volume's data can't be read without it, and `avc` refuses to rotate it | Generated |
 | `<app>-jfs/{rsa.pem,rsa-passphrase,pg-password}` | One app's JuiceFS volume: its encryption key and its metadata role's password. Never regenerate it, as above, for that app's files | Generated |
 | `<app>-jfs-s3/{access-key,secret-key}` | The S3 pair that opens that app's bucket and no other | Prompt, or written by `avc cloud apply` |
@@ -801,21 +898,65 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
 
+**How a secret reaches a node.** A generator's file that is secret, deployed and read by services is an agenix secret on every node that declares it, at `/run/secrets/shared/<generator>/<file>` or `/run/secrets/per-machine/<node>/<generator>/<file>`. Its source in the repository is encrypted to the master identities; `agenix rekey` re-encrypts it to each such node's recipient under `secrets/rekeyed/<node>/`, and activation decrypts that with the node's TPM into a tmpfs that never swaps. A file marked never deployed (an operator's secret, or one only another generator reads) and a file read only at install (`luks`, `volume-identity`, `initrd-ssh`) are rekeyed to no node and are in no closure.
+
+**When it does not.** agenix carries on past a file it cannot decrypt, so the boot completes without it. `cluster-secrets.service` then fails, Nomad and the units that wait for it are not started on that boot (`cluster.secrets.gate`), and `cluster_secrets_missing` counts the files (`SecretsMissing`); SSH, the network and the pull loop are untouched, so the node can be reached and can pull the commit that repairs it. A check every minute keeps the count current on a running node, where a failed switch removes the previous values too.
+
+**The commands.** `avc secrets` is the one way a secret is made, read or changed. Each command that writes ends by rekeying and shipping (a commit on a branch, a pull request, the deploy, a restart of the apps that read the value).
+
 ```sh
-clan vars list node1
-clan vars generate node1
-clan vars generate node1 --generator ovh-s3 --regenerate   # rotate one
-clan vars get node1 <generator>/<file>
+avc secrets provision                   # generate what is missing or outdated, on every machine; asks for prompted values
+avc secrets inventory                   # every generator: scope, consumers, age, rotation policy, state
+avc secrets rotate <generator>          # regenerate one, and everything that reads its files
+avc secrets set <generator>/<file>      # store a value by hand (an issued token), typed or from a file
+avc -y secrets reveal <generator>/<file>   # print a value; without -y it asks first
+avc secrets fix                         # after masterIdentities or extraRecipients changed: re-encrypt every source
+avc secrets rekey                       # after a source changed outside avc (an install rekeys by itself)
+avc secrets replace <generator>         # a new juicefs-rsa, <app>-jfs or restic, after a node left your control; typed back
+avc secrets check                       # would a deploy of this tree give every node its secrets? `avc secrets check <node>` for one
 ```
 
-`avc secrets inventory` shows every secret's age, consumers and rotation policy; `avc secrets rotate <generator>` regenerates one, ships it and restarts what reads it. It refuses `luks`, `volume-identity`, `juicefs-rsa` and `restic` in code, refuses `initrd-ssh` and `emergency-access` with their manual procedures, and follows `secrets/policy.toml` for the rest. Per-machine vars are named `<machine>:<generator>/<file>` in `avc secrets set` and `avc secrets reveal`.
+A per-machine value is named `<machine>:<generator>/<file>` in `avc secrets set` and `avc secrets reveal`. `avc secrets inventory` shows every secret's age, consumers and rotation policy; `avc secrets rotate <generator>` regenerates one, ships it and restarts what reads it. It refuses `luks`, `volume-identity`, `juicefs-rsa`, `restic` and every `<app>-jfs` in code, refuses `initrd-ssh` and `emergency-access` with their manual procedures, and follows `secrets/policy.toml` for the rest. `avc secrets provision` makes none of those anew for an installed node (one with a recipient) either: a file of theirs that went missing comes back from git.
+
+**How a generator runs** (`tools/avc/avc/core/secretstore.py`). `avc` reads the generators from the flake (`clusterSecrets`), orders them by their dependencies, and runs one when a declared file is missing or its `validation` changed, along with every generator that reads its files. A shared generator runs once for the fleet, a per-machine one once per node. Each script runs under bubblewrap with no network, an empty environment and nothing of your machine but the Nix store, in a directory of its own (mode 0700) on a tmpfs, `$XDG_RUNTIME_DIR` or else `/dev/shm`, which is removed when the script ends, however it ends; a machine with no tmpfs is refused. `$in` holds the files of the generators it depends on, `$prompts` what you were asked, and it must write every declared file to `$out` and nothing else. Only when every generator of the run has done so is anything written: each secret encrypted to the master recipients, each public file as it is, each by rename. A run that fails, at a script or at a prompt, leaves the repository as it was. Plaintext is never written to a disk.
+
+Beside a generator's files, `secrets/<scope>/<generator>/.validation-hash` records the `validationHash` they were made from; when the flake's is another, or there is no record, the generator is outdated and `avc secrets provision` runs it again. `AVC_SANDBOX=none` runs the scripts without bubblewrap, for a machine that cannot make a user namespace.
+
+**Rekeying.** A node is given the files under `secrets/rekeyed/<node>/` and nothing else, so a value that was generated and not rekeyed is a value no node has: the node builds, switches, and runs short of it. Every `avc secrets` command that writes a source therefore writes the rekeyed files for it, from the plaintext it already holds, removes the ones nothing names any more, and then runs the flake's own `agenix rekey -a`, which is the authority and finds nothing left to do. A node with no recipient is skipped. `avc secrets check` fails when a declared secret is not generated, was made from other inputs than it declares now, or has no current rekeyed file for a node that has a recipient; `avc deploy ship` and `avc deploy break-glass` run it first and refuse.
+
+**YubiKey touches.** Reading a secret is one `age -d` with a master identity, which age-plugin-yubikey answers after a touch (and the PIN, as the key's PIN policy asks). `avc` decrypts a file at most once per run, and never one that the same run made or wrote. Set `AGENIX_REKEY_PRIMARY_IDENTITY` to the recipient of the key that is plugged in, and age asks for that one first.
+
+| Operation | Decryptions (touches) |
+| --- | --- |
+| `avc secrets provision` on a new site | None: every input was made in the run |
+| `avc secrets provision`, `avc secrets rotate` | One per stored secret that a generator being run reads through `$in`, however many generators read it; none when there is none |
+| `avc secrets set` | None |
+| The rekey after any of the above | None |
+| `avc secrets reveal`, `avc boot bind --recovery-key`, `avc audit tokens`, `avc ci tokens` | One per value read (one per node for the tokens) |
+| `avc boot bind` | None: the node's own TPM slot authorises the new one |
+| `avc boot install` | Three for the partitioning secrets, and one per secret the new node is given (none of those when the machine's TPM still holds the identity in the repository, and they are already rekeyed) |
+| `avc boot identity` | One for the identity file in the repository, and one per secret the node is given when a new identity is made |
+| `avc cloud plan`, `avc cloud apply`, `avc cloud tofu` | One per credential: the state's passphrase, and up to four for the providers |
+| `avc secrets rekey` | One per secret a node lacks; a source that several nodes lack is decrypted once for all of them. An install rekeys by itself |
+| `avc secrets fix` | One per secret in the repository |
+| `avc secrets check`, `avc secrets inventory` | None |
+
+`agenix rekey` run by hand decrypts once per secret per node instead, which is why `avc secrets rekey` fills in the files first. `AVC_AGE_IDENTITY=<file>` puts an identity file before the flake's master identities, for a key the flake names only as a recipient: the offline one.
+
+agenix-rekey's own commands still work on a source, and none of them knows about generators or policy; follow one that writes with `avc secrets rekey`:
+
+```sh
+nix run .#agenix -- rekey -a               # what `avc secrets rekey` ends with
+nix run .#agenix -- edit secrets/shared/<generator>/<file>.age
+nix run .#agenix -- view secrets/shared/<generator>/<file>.age
+```
 
 Rotation notes:
 
-- **`nomad-gossip`:** Nomad copies the key into `<data_dir>/server/serf.keyring` on first start, so a new `gossip.hcl` changes nothing on a running server. Rotate with `nomad operator gossip keyring` (install, use, remove), then regenerate the var to match.
+- **`nomad-gossip`:** Nomad copies the key into `<data_dir>/server/serf.keyring` on first start, so a new `gossip.hcl` changes nothing on a running server. Rotate with `nomad operator gossip keyring` (install, use, remove), then regenerate the secret to match (`avc secrets rotate nomad-gossip`).
 - **`nomad-ca`:** regenerating reissues every machine's certificates: a hard cut, every node at once. `security.nomadTlsRotation` reissues the agent certificates alone. `NomadTlsCertExpiring` and `NomadTlsCaExpiring` warn first.
 - **`nomad-jwt`:** regenerating reissues every node's logins, and each server's `nomad-acl-init` updates the auth method on its next switch. Manual in the policy.
-- **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots, and its mesh services retry.
+- **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots and stays reachable, and its mesh services retry; like any node short of a secret it starts no Nomad on that boot ([Secrets](#secrets)).
 - **`audit`:** a new token must reach the Worker (`avc audit tokens | wrangler secret put AUDIT_TOKENS`), or that node's events are refused (`AuditEventRejected`).
 - **`ci`:** a new token must reach the Worker (`avc ci tokens | wrangler secret put AGENT_TOKENS`), or that node's agent is refused: it then deploys on the timer alone, and its previews stand still.
 - **`canary`:** harmless to regenerate; the next scan plants the new value.
@@ -839,20 +980,20 @@ What a tick does (`lib/cluster-upgrade.nix`), in order:
 
 Pull deploys never reboot. A node running a closure it has not booted shows `cluster_reboot_pending 1`, and `RebootPendingTooLong` after two weeks. Reboot one node at a time, with `avc boot reboot <node>`.
 
-`clan machines update` is break-glass only (`avc deploy break-glass <node>`). It builds from your working tree, so the next pull would silently revert it, and it bypasses every gate above. Hold the loop first:
+A push is break-glass only (`avc deploy break-glass <node>`): `nixos-rebuild switch --target-host` builds the node from your working tree on your machine and switches it over SSH. The next pull would silently revert it, and it bypasses every gate above. The node needs nothing from your machine but the closure: its secrets are the rekeyed files in it, so `avc deploy break-glass` runs `avc secrets check <node>` first. Hold the loop first:
 
 ```sh
 ssh root@node1 touch /run/cluster-upgrade.hold     # or: avc deploy hold node1
-clan machines update node1
+nixos-rebuild switch --flake .#node1 --target-host root@<node1's address>
 # get the same change merged into main (avc deploy ship), and only then:
 ssh root@node1 rm /run/cluster-upgrade.hold          # or: avc deploy release node1
 ```
 
 The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (a backup dumping a database, a restore) use one file each in `/run/cluster-upgrade.hold.d/`, so they cannot release each other, and `avc boot reboot` refuses while any is set. Keep a console open for changes to `br-wan` or the WAN stanza: on a remote machine a mistake there is a lockout.
 
-**New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, clan-core, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
+**New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, agenix, agenix-rekey, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. A pushed `nixos-rebuild` bypasses this, as it bypasses the pull loop.
 
-Bump `clan-core` alone, as one reviewable commit. It tracks clan's unstable channel, and `checks.clan-coexist` is what catches an upstream change to host configuration. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
+Bump `agenix` and `agenix-rekey` alone, each as one reviewable commit: they decide what every node decrypts at activation, and `checks.secrets-tpm` is what runs them for real. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
 
 ### Previews and continuous deployment
 
@@ -905,7 +1046,7 @@ Setting it up, once per site:
    wrangler secret put CF_API_TOKEN          # Cloudflare Tunnel: Edit, and DNS: Edit on the preview zone
    ```
    Point the App's webhook at the Worker's `/webhook/github`.
-3. Set `ci.url` in `topology.nix`, run `clan vars generate` for each node's `ci/token`, ship it, and give the Worker the tokens: `avc ci tokens | wrangler secret put AGENT_TOKENS`.
+3. Set `ci.url` in `topology.nix`, run `avc secrets provision` for each node's `ci/token` (it ships them), and give the Worker the tokens: `avc ci tokens | wrangler secret put AGENT_TOKENS`.
 4. Add `preview` to an app and ship it. The slots exist once the nodes have deployed.
 
 The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previews` by `state`. No alert rule reads them yet.
@@ -943,7 +1084,7 @@ No user may delete an object version, so on the versioned bucket a node that is 
 
 **The state** is `cloud/terraform.tfstate` in your repository, committed with each apply. It holds every key the providers issued, so OpenTofu encrypts it (and every saved plan) with `cloud-state/passphrase`, enforced: without the passphrase it refuses to read the state, and it never writes one in the clear. Put the passphrase in the [offline kit](#the-offline-kit). Two operators applying at once would each commit a state; the pull request of the second conflicts, which is the lock.
 
-To turn it on: `cloud` in the topology; `clan vars generate` for `cloud-state`, and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
+To turn it on: `cloud` in the topology; `avc secrets provision` for `cloud-state`, and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
 
 Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket (the site provisioner's), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
 
@@ -958,7 +1099,7 @@ One app of kind `attic` gives the cluster a binary cache, an [Attic](https://git
 }
 ```
 
-Then `avc cloud apply` (the bucket and its key), `clan vars generate <node>` (`cache-token`, `cache-signing`, `cache-push`), and ship. The nodes ask the cache once `cache-signing/public` is in the repository, which generating the vars puts there.
+Then `avc cloud apply` (the bucket and its key) and `avc secrets provision` (`cache-token`, `cache-signing`, `cache-push`), which ships. The nodes ask the cache once `cache-signing/public` is in the repository, which generating the secrets puts there.
 
 - **What goes in.** Each node pushes the closure of the system it runs after every switch and once a day (`cluster-cache-push`), and that closure holds every app container the node was built with. The CI agent pushes each preview it builds. Attic leaves out what cache.nixos.org already signed, so the bucket holds what the cluster built and nothing else. With pull-deploy the canary node builds first and pushes; the others fetch.
 - **What comes out.** Every node has the cache as a substituter at its own loopback (port 8732). HAProxy there passes the request over the mesh (port 8733) to whichever node has the container, found by health check. The container takes a fixed address in the app subnet of the node it starts on (`attic.hostOctet`, 9), so no node has to be told where it went.
@@ -971,7 +1112,7 @@ Then `avc cloud apply` (the bucket and its key), `clan vars generate <node>` (`c
 
 - **Every store path the cluster built**, to anyone who knows or can compute its name. That includes each node's whole system closure: the rendered configuration of every service and every app, which is your private repository's `apps/` and topology in built form (hostnames, addresses, firewall rules, job specifications, package versions).
 - **Your apps' own code**, as built packages, if the projects are private.
-- **Not the secrets.** They are clan vars, decrypted on the node into `/run/secrets` and never part of a store path. That holds for what this library writes; a value you put in an app's `module` as a string is in the store, and so in the cache.
+- **Not the secrets in the clear.** A node's rekeyed files are in its closure, encrypted to the key in its TPM; what is decrypted goes to `/run/secrets` and is never part of a store path. That holds for what this library writes; a value you put in an app's `module` as a string is in the store, and so in the cache.
 
 Attic does not list a cache's contents, and a store path's name starts with a hash of everything it was built from, so a path is fetched by someone who has its name: from a deployed system's closure, or by evaluating the same flake. Treat that as slowing a reader down, not stopping one. If other people should have the apps' packages and not your cluster's configuration, a public cache is the wrong tool as it stands: it pushes whole system closures.
 
@@ -1054,16 +1195,17 @@ Prometheus (lib/alert-rules.nix) -> Alertmanager -> alert-email-bridge
 Setup, once:
 
 1. Onboard the sender's domain (`alerting.from`) to Cloudflare Email Sending, including SPF and DKIM.
-2. Create an API token with the Email Sending permission only, and run `clan vars set <node> alerting/cf-email-token`.
+2. Create an API token with the Email Sending permission only, and run `avc secrets set alerting/cf-email-token`.
 3. After the deploy, run `cluster-alert-test` on any node. It fires a real alert through the whole path, which resolves by itself after 5 minutes.
 
 A weekly report emails each app's last backup, rehearsal and repository check. It is a positive signal: if it stops arriving, that tells you something.
 
 | Alert | Severity | Means |
 | --- | --- | --- |
-| `BootUnlockedByPassphrase` | critical | The last boot was unlocked by a typed passphrase, not from the TPM. Expected only after an attended recovery. |
+| `BootUnlockedByPassphrase` | critical | The last boot was unlocked by the typed recovery key, not from the TPM. Expected only after an attended recovery. |
 | `UnlockTpmFailing` | critical | The TPM did not unlock every leg on the last boot: fix the binding before the next reboot. |
-| `TpmBindingMissing` | critical | A leg has no TPM binding (after a disk replacement, until `avc boot bind <node> --device <device>`). |
+| `TpmBindingMissing` | critical | A leg has no TPM binding (after a disk replacement, until `avc boot bind <node> --device <device> --recovery-key`). |
+| `TpmBindingUnsealed` | critical | A leg's TPM slot has been the install's, bound to no PCR, for six hours: any boot of the machine can open the disks. Finish the install (`avc boot enroll`, reboot, `avc boot bind`). |
 | `SecureBootOff` | critical | The node booted without Secure Boot enforcing. |
 | `Pcr7Changed` | critical | PCR 7 changed within the last day: firmware, keys or Secure Boot state changed. |
 | `VolumeIdentityMissing` | critical | The identity secret is missing or wrong: the next boot would halt. |
@@ -1084,6 +1226,7 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `CanaryFound` | critical | The canary turned up in plaintext somewhere it must never be: find the writer. |
 | `CanaryScanStale` | warning | The canary scan has not run for 8 days. |
 | `JuiceFSVolumeNotEncrypted` | critical | A node refused a JuiceFS volume that is not encrypted. |
+| `SecretsMissing` | critical | Secrets the node was given did not decrypt: its TPM does not hold the identity they were rekeyed to. A boot that began this way did not start Nomad. |
 | `JuiceFSUnwritable` | critical | `/mnt/jfs` is not writable. |
 | `JuiceFSProbeStale` | warning | The JuiceFS probe has not run. |
 | `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old, or a volume has gone that long without writing its first. |
@@ -1144,7 +1287,7 @@ Alerting runs on the cluster, so it can't report the cluster's own death. `worke
 cd workers/cluster-watchdog
 wrangler kv namespace create WATCHDOG          # put the printed id in wrangler.toml
 wrangler r2 bucket create <bucket_name in wrangler.toml>   # the audit trail; add a bucket lock rule
-clan vars get <node> alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
+avc -y secrets reveal alerting-watchdog/token | wrangler secret put WATCHDOG_TOKEN
 wrangler secret put CF_EMAIL_TOKEN             # the Email-Sending-only token
 avc audit tokens | wrangler secret put AUDIT_TOKENS
 wrangler deploy
@@ -1171,6 +1314,7 @@ Grafana queries Loki with labels `node`, `app`, `site`, `service` and `level`. T
 This version is written for fresh installs. A cluster running an earlier version of this library can't take it as an ordinary deploy, because several changes are hard cuts:
 
 - **Disk encryption needs a reinstall.** A running plaintext node can only stay as it is with `insecurePlaintextBoot` (and the site's `insecureFleetKeysOnPlaintextDisk`), or be reinstalled through [Installing a node](#installing-a-node).
+- **A node's secrets are its TPM's.** A node installed before has no age identity: `avc boot identity <node>` makes one on its TPM, commits the recipient and rekeys, and `avc deploy break-glass <node>` puts the first closure that carries them on it ([The node's age key is gone](#the-nodes-age-key-is-gone) is the same state). Its disks need nothing: the passphrase they were formatted with is the `luks/passphrase` that is now called the recovery key, and a TPM slot an earlier `avc boot bind` sealed to PCR 7 is what this version's makes. Not rehearsed on a node installed by an earlier version.
 - **The first deploy of this code waits on every node.** The running closures have no boot contract, so the contract gate refuses until `/run/cluster-upgrade.approve` lists the new closure, node by node. And they have no boot stack, so every node but the canary also waits until the canary has rebooted into it.
 - **Nomad TLS and the gossip key.** Rolled out node by node by the pull loop, servers with and without the key can't gossip, and plaintext and TLS RPC can't talk. All servers must switch together.
 - **Scoped tokens.** One server's `nomad-acl-init` has to run before any other node's logins succeed; until then those retry every 10 seconds, and a non-leader's deploy may report an activation failure once and then recover.
@@ -1179,18 +1323,18 @@ This version is written for fresh installs. A cluster running an earlier version
 - **Loki's dataset.** A node installed before has no `rpool/loki`, and disko creates datasets only at install. Create it first, on every node: `zfs create -o mountpoint=legacy -o quota=50G -o com.sun:auto-snapshot=false rpool/loki`. Required mounts are in the boot contract, so the closure waits for approval anyway; create the dataset before approving. The old Loki bucket is no longer used.
 - **Hashed backup paths.** Apps with repositories at `apps/<app>` get new, empty ones at the hashed path; the old ones stay untouched. Deploy before the first backup, or `restic copy` each app across.
 - **Every container restarts once.** Each job now runs as `nomad-apps` with a new wrapper, so each allocation is replaced. Containers with `peerAccess` get a new veth, which a reload cannot apply: `nomad job restart app-<name>`. Containers' WAN MACs become fixed (`02:76:77:<node index>:<iid>`); if your provider pins MACs per port or address, check before rollout.
-- **The `nomad-leader` tag is gone.** Remove it from the node that had it (evaluation warns while it is there). Every `nomad-server` node now holds `nomad-acl` and a `registrar` login: `clan vars generate` for each server that did not have them, and add `nomad_acl` to those servers' kinds in the watchdog Worker's `AUDIT_TOKENS` (`avc audit tokens` prints the new value), or the Worker refuses their ACL events and they stay in the spool.
+- **The `nomad-leader` tag is gone.** Remove it from the node that had it (evaluation warns while it is there). Every `nomad-server` node now holds `nomad-acl` and a `registrar` login: `avc secrets provision` makes them for each server that did not have them, and add `nomad_acl` to those servers' kinds in the watchdog Worker's `AUDIT_TOKENS` (`avc audit tokens` prints the new value), or the Worker refuses their ACL events and they stay in the spool.
 - **`homeNode` is gone, and local state moves into datasets.** Remove `homeNode` from every app (evaluation refuses it). An app's database is then a plain directory on the node it was pinned to, and the app has to start there once more: that start copies the directory into `<pool>/state/apps/<app>` (as long as the copy takes, inside `startTimeout`) and keeps the original as `/state/clients/.<app>.before-datasets`, to remove by hand. Started on any other node first, it refuses and Nomad tries again elsewhere, so an app may take a few attempts to land. To choose instead of waiting: `nomad node eligibility -disable` the other nodes, `nomad job restart app-<name>`, and enable them again. Each other node then receives a whole copy, which needs the disk. `/state` must be ZFS, as the installer makes it. Not rehearsed on a site with data.
 - **The scheduler algorithm.** New clusters spread apps over nodes. One bootstrapped before keeps Nomad's packing until told, once, on a server: `nomad operator scheduler set-config -scheduler-algorithm=spread`.
 - **The `backup` tag does nothing now.** Each app is backed up by the node running it. Leave the tag or remove it.
 - **The database archive is gone.** `archive.*` on an app, `objectStorage.dbArchiveBucket` and the `<app>-db-archive*` vars no longer exist: remove them, and the archive bucket and its keys at the provider when its last week is no longer wanted. What replaces it is replication between the nodes and, off them, `backup.state`.
-- **The `metrics` tag does nothing now, and the autoscaler is gone.** Every node runs Prometheus, Loki and Alertmanager. The node that had the tag keeps its history; the others start empty and fill from then on, and each needs `rpool/loki` (above). Remove the tag or leave it. The Nomad autoscaler ran on that node and never acted, since no job carries a scaling policy; its `autoscaler` login role went with it, so `clan vars generate` reissues each node's `nomad-login`.
+- **The `metrics` tag does nothing now, and the autoscaler is gone.** Every node runs Prometheus, Loki and Alertmanager. The node that had the tag keeps its history; the others start empty and fill from then on, and each needs `rpool/loki` (above). Remove the tag or leave it. The Nomad autoscaler ran on that node and never acted, since no job carries a scaling policy; its `autoscaler` login role went with it, so `avc secrets provision` reissues each node's `nomad-login`.
 
 ## Testing
 
 Everything runs against the **fixture cluster** in [`tests/fixtures`](tests/fixtures), which is built through `mkCluster` the way a consumer's is. Its public addresses are documentation-only (RFC 5737, RFC 3849) and its names are under `example.com` and `example.net`. Its internal VLANs are RFC 1918, because the documentation ranges have no /16 to split into per-node subnets. It has `node1` with every role, placeholders `node2` and `node3`, and neutral apps of every kind, with stub packages for Odoo and Frappe. Every fixture node opts out of boot security, because a VM test of a cluster has no TPM; the `boot-*` checks install and boot the encrypted layout themselves, and `tests/fixtures/secure` is node1 with boot security on, evaluated by `security-policy` and `boot-closure`.
 
-No secret is committed. `tests/fixtures/secrets` holds placeholders that are not ciphertext, because `lib/mk-app-container.nix` asserts that every secret an app mounts exists. `tests/fixtures/update-secrets.sh` regenerates them after you add a fixture app or change a generator.
+No secret is committed. `tests/fixtures/secrets` holds placeholders that are not ciphertext, because a secret with no file is not given to a node and `lib/mk-app-container.nix` asserts that every secret an app mounts exists. `tests/fixtures/agenix` is the exception that proves nothing: real ciphertext for `checks.secrets-tpm`, with its master key and its software TPM's state beside it in the clear. `tests/fixtures/update-secrets.sh` regenerates them after you add a fixture app or change a generator.
 
 ```sh
 nix build -L .#checks.x86_64-linux.<name>        # one check
@@ -1211,16 +1355,17 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 
 | Check | What it proves |
 | --- | --- |
-| `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets, audit and pipeline flows. |
+| `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets, audit and pipeline flows. And the generator runner for real, with a plain age key where a site has a YubiKey: order and `$in`, prompts, shared and per-machine, a changed `validation`, a failing script leaving nothing, no plaintext in the repository or off the tmpfs, the sandbox, one decryption per source, rekeyed files under agenix-rekey's names, and `avc secrets check` refusing what is ungenerated or not rekeyed. |
 | `cluster-ci` | The pipeline's Worker: a pull request becomes one preview per app and branch with its own tunnel and hostname, a fork gets nothing, a node's report reaches the pull request only for the commit it is about, a preview's tunnel is deleted only after its node let go of it, and which push deploys and which updates the site's lock. |
 | `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
 | `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
 | `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
-| `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that `clan vars generate` can read every generator of a new site. Evaluation only. |
+| `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that every generator of a new site can be read. Evaluation only. |
 | `security-policy-fixture` | The posture checks that need a whole fixture system per node. |
 | `boot-closure` | What can be proven about an encrypted closure without booting it: the ESP budget, the initrd's contents (one without TPM support fails the build), and when the boot contract moves (not on a kernel bump; on every field an unlock depends on). |
-| `boot-install` | An encrypted node installed with the real disko script, under Secure Boot with keys made on the node: unattended unlock from the TPM on both legs, with and without a network, bind refused in Setup Mode, one leg rebound, a second kernel and generation on both ESPs. |
-| `boot-fallback` | The TPM refuses: the prompt within seconds, typing on serial, tty0 and SSH; wrong passphrases ask again; one leg waiting does not import the pool degraded; the boot report counts the passphrase. |
+| `boot-install` | An encrypted node installed with the real disko script on its own TPM, under Secure Boot with keys made on the node: each leg left with a TPM slot bound to no PCR and the recovery key's, and nothing else; unattended unlock on that slot in Setup Mode and enforcing; bind refused in Setup Mode; the bind sealing to PCR 7 with nothing sent to the node, and refused on a leg with no slot that opens unless the recovery key comes; unattended unlock on both legs, with and without a network; one leg rebound; a second kernel and generation. |
+| `install-node` | A node installed the way `avc boot install` does it, in VMs with a software TPM: nixos-install-helper's `deploy` and nixos-anywhere's kexec from a rescue system, `avc`'s step between the kexec and the partitioning making the age identity on the machine's TPM, the recipient and the encrypted identity file in the site, the secret the node reads rekeyed to it, the partitioning secrets through a tmpfs into the installer's memory. Then the node boots unattended, decrypts with that identity, and holds no install-time secret; the same disks behind another TPM ask for the recovery key and decrypt nothing; and a rescue boot opens them with the recovery key from the site and not with its TPM. |
+| `boot-fallback` | The TPM refuses: the prompt within seconds, typing on serial, tty0 and SSH; the initrd's sshd accepts an operator's FIDO2 (`ed25519-sk`) key and refuses another's; wrong keys ask again; one leg waiting does not import the pool degraded; the boot report counts the typed unlock. |
 | `boot-degraded` | A dead, absent or corrupt disk boots unattended and DEGRADED; each ESP boots alone; a full or unmounted ESP refuses a new generation without writing to the root; a disk replacement onto a new LUKS leg; signing keys lost and recovered; the identity repair from rescue; no plain vdev. |
 | `boot-attack` | A swapped volume with forged identifiers halts before it can steal anything (and steals the keys with the check removed); the emergency shell burns PCR 7; a tampered initrd or unsigned loader is refused; Secure Boot off, a db certificate added, keys cleared, another signed loader or a cleared TPM all withhold the disk key; a foreign authority in PCR 7 refuses bind. |
 | `deploy-safety` | What a pull deploy does with a closure that fails, one whose boot contract changed, a refused one after a rollback (by hand and at boot), a held node, and a frozen PID 1 under the hardware watchdog. |
@@ -1234,7 +1379,8 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `jfs-encrypted` | The JuiceFS volume is encrypted; a plaintext one is refused at format and at mount; restore works with the key, only with the key, and from the offline kit alone; stale dumps, interrupted loads, S3 key rotation. |
 | `canary-scan` | Per class: plant the canary, scan, found; remove it, scan, not found. Swap plain against dm-crypt, a plaintext bucket against an encrypted one, a real compressed core a grep can't see into. |
 | `container-tunnel` | The generated container, tunnel and firewall wiring. |
-| `clan-coexist` | clan-core is not overriding the host configuration it must not touch. Run it on every clan bump. |
+| `secrets` | What a node is given of the site's secrets and what it is not (an operator's, an install-time one), each at the path the modules read; what the gate holds and what it must not; a node with a recipient and an unrekeyed secret does not evaluate. Evaluation only. |
+| `secrets-tpm` | The real path, in VMs with a software TPM: agenix-rekey's own app rekeys two master-encrypted secrets to a node's TPM recipient, the node decrypts them at boot at their paths and with their owners, what `avc`'s runner rekeyed from the same site's `clusterSecrets` has the same names and decrypts on that TPM too, a secret removed on the running node is counted and comes back with an activation, and the same system on another TPM decrypts nothing, fails `cluster-secrets`, starts no Nomad and says so in its metric, with SSH up. |
 | `backup` | What the fixture apps generate: engine detection, units, salted repository paths, target URLs. |
 | `freeipa` | FreeIPA's wiring, and Authelia's own `validate-config` over its generated config. |
 | `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool). |
@@ -1251,7 +1397,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 
-The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths clan's age backend would decrypt to, NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
+The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths agenix would decrypt to (`checks.secrets-tpm` is the one test that decrypts), NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
 
 ### Continuous integration
 

@@ -1,7 +1,7 @@
 # modules/backup-core.nix — per-app backups, restore and restore rehearsal.
 #
-# The clan-independent half of the backup system. modules/backup.nix imports
-# it and supplies the credentials from clan vars; tests/backup-roundtrip.nix
+# The half of the backup system that knows no secret store. modules/backup.nix imports
+# it and supplies the credentials; tests/backup-roundtrip.nix
 # imports it directly with plain files and an S3 server inside the VM.
 #
 # ── what an app's backup is ─────────────────────────────────────────────────
@@ -52,12 +52,6 @@
 # pull-deploys are held
 # (/run/cluster-upgrade.hold.d, modules/pull-deploy-core.nix): a deploy reloads the
 # container, which restarts the very units a dump is reading from.
-#
-# ── not the clan backups provider ───────────────────────────────────────────
-# clan's contract is "restore these folders from this snapshot": no app
-# argument, and no way to say "stop the app's units, drop and re-import the
-# database, start them again". Delegating to it would be lossy, so the verbs
-# are ours: cluster-backup, cluster-backup-list, cluster-restore.
 {
   config,
   lib,

@@ -55,7 +55,7 @@
 # ── first start ─────────────────────────────────────────────────────────────
 #   apps/<name>.nix with `attic.bucket`
 #   avc cloud apply                   # the bucket, its key into cache-s3/*
-#   clan vars generate <node>         # cache-token, cache-signing, cache-push
+#   generate the secrets              # cache-token, cache-signing, cache-push
 #   -> deploy. The first node to switch after the container is up fills it.
 {
   config,
@@ -63,13 +63,14 @@
   pkgs,
   topology,
   clusterLib,
+  clusterSite,
   node,
   ...
 }:
 let
   inherit (lib) mkOption types;
   net = clusterLib.net;
-  gens = config.clan.core.vars.generators;
+  gens = config.cluster.secrets.generators;
   hostApps = config.clusterApps;
   apps = lib.filterAttrs (_: a: a.attic != null) hostApps;
   enabled = apps != { };
@@ -597,7 +598,7 @@ in
       };
     };
 
-    clan.core.vars.generators = {
+    cluster.secrets.generators = {
       # What atticd checks every token with. Its tokens are made from it offline
       # (`cache-push` below) and by the container for itself. Every node holds it, as
       # it holds every app's secrets: the app may start on any of them.
@@ -618,7 +619,7 @@ in
         runtimeInputs = [ pkgs.nix ];
         script = ''
           nix --extra-experimental-features nix-command key generate-secret \
-            --key-name ${lib.escapeShellArg "${config.clan.core.settings.name}-cache-1"} > "$out/secret"
+            --key-name ${lib.escapeShellArg "${clusterSite.name}-cache-1"} > "$out/secret"
           nix --extra-experimental-features nix-command key convert-secret-to-public \
             < "$out/secret" > "$out/public"
         '';

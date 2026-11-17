@@ -32,7 +32,7 @@ let
 in
 {
   app, # one clusterApps.<name> submodule value
-  config, # host config (for clan vars file paths)
+  config, # host config (for the secrets' paths)
   pkgs,
   topology,
   node, # THIS host's topology node — the container's IPv6 GUA comes from the
@@ -185,35 +185,20 @@ let
   };
 
   # Where a secret appears INSIDE the container. The host-side path is wherever
-  # the age vars backend decrypted it to (/run/secrets/...); the guest path is
+  # agenix decrypted it to (/run/secrets/...); the guest path is
   # stable and short so the payload flakes' *File options stay readable.
   secretsGuestDir = "/run/secrets";
 
-  # Resolve guest name -> host path through clan vars.
-  secretHostPath = s: config.clan.core.vars.generators.${s.generator}.files.${s.file}.path;
+  # Resolve guest name -> host path through the generators.
+  secretFile = s: config.cluster.secrets.generators.${s.generator}.files.${s.file};
+  secretHostPath = s: (secretFile s).path;
 
-  # Whether a declared secret has actually been generated. Unlike the sops
-  # backend (whose `.path` fell back to a "/no-such-path" sentinel for a
-  # missing secret), the age backend's fileModule
-  # (clan-core: nixosModules/clanCore/vars/secret/age.nix) always returns a
-  # real-looking /run/secrets/... path regardless of whether the ciphertext
-  # exists — so an ungenerated secret would otherwise be cheerfully
-  # bind-mounted from a path that just isn't there at runtime. Check the
-  # repo directly instead, mirroring clan-core's own on-disk convention
-  # (nixosModules/clanCore/vars/secret/age-source-path.nix):
-  #   {directory}/secrets/clan-vars/{rel_dir}/{name}/{name}.age
-  # The agenix setup this replaced could not express "declared but
-  # ungenerated" at all (it derived its declarations FROM the files on
-  # disk), so this is a genuinely new failure mode and is asserted below
-  # rather than discovered at runtime.
-  secretCiphertextPath =
-    s:
-    let
-      f = config.clan.core.vars.generators.${s.generator}.files.${s.file};
-    in
-    config.clan.core.settings.directory + "/secrets/clan-vars/${f.rel_dir}/${f.name}/${f.name}.age";
-
-  ungenerated = lib.filterAttrs (_g: s: !(builtins.pathExists (secretCiphertextPath s))) appSecrets;
+  # Whether a declared secret has actually been generated. Its `.path` is the same
+  # /run/secrets/... string either way, and a secret with no ciphertext in the
+  # repository is simply not on the node (modules/secrets.nix), so an ungenerated one
+  # would otherwise be cheerfully bind-mounted from a path that isn't there at
+  # runtime. Asserted below rather than discovered then.
+  ungenerated = lib.filterAttrs (_g: s: !(secretFile s).exists) appSecrets;
 
   secretMounts = mapAttrs' (
     guest: s:
@@ -510,7 +495,7 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
 {
   # A NixOS assertion rather than a bare `assert`, deliberately: a bare assert
   # here fires whenever ANY attribute of this fragment is forced, including
-  # during the evaluation `clan vars generate` performs to discover which
+  # during the evaluation that discovers which
   # generators exist — which would deadlock (cannot generate without evaluating,
   # cannot evaluate until generated). As an assertion it blocks building the
   # system, which is the thing that actually must not happen, and leaves
@@ -520,10 +505,10 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
       assertion = ungenerated == { };
       message =
         "clusterApps.${n}: secret(s) ${lib.concatStringsSep ", " (lib.attrNames ungenerated)}"
-        + " have no generated value (no ciphertext under secrets/clan-vars/), so they would be"
+        + " have no generated value (no ciphertext under secrets/), so they would be"
         + " bind-mounted from a path that does not exist and the app would start with an empty"
         + " credential."
-        + " Run: clan vars generate ${node.hostName}";
+        + " Generate ${node.hostName}'s secrets and commit them.";
     }
   ];
 
@@ -561,9 +546,6 @@ assert lib.assertMsg (hasTunnel -> app.tunnel.credentials != null)
           innerNetworking
           wanLinkLocalOnly
           guestLogging
-          # A guest has its own nixpkgs: the host's overlays do not reach it, so
-          # a pin made on the host would be ignored here.
-          ../modules/nixpkgs-overlays.nix
         ]
         ++ optional hasTunnel tunnelModule
         ++ optional isPreview previewModule;

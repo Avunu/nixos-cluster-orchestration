@@ -9,10 +9,10 @@
   pkgs,
   lib,
   clusterLib,
-  clanSystem,
+  nodeSystem,
 }:
 let
-  c = clanSystem.config;
+  c = nodeSystem.config;
   svc = c.systemd.services;
   bt = clusterLib.backupTarget;
 
@@ -20,7 +20,7 @@ let
 
   # The fixture's salt, read from the node's own topology argument, so a salt changed
   # in the fixture moves the expectation with it.
-  salt = clanSystem._module.specialArgs.topology.backup.repoSalt;
+  salt = nodeSystem._module.specialArgs.topology.backup.repoSalt;
   repoOf = app: bt.appRepoPath salt app;
 
   checks = [
@@ -39,11 +39,7 @@ let
         && c.systemd.timers ? cluster-backup-verify;
     }
     {
-      name = "the old clan provider is gone (its restore could not stop an app)";
-      ok = !(c.clan.core.backups.providers ? s3);
-    }
-    {
-      name = "credentials come from vars, not the store";
+      name = "credentials come from the secrets, not the store";
       ok = lib.all (
         cr: !(lib.hasInfix "/nix/store" cr)
       ) svc.cluster-backup-demo-odoo.serviceConfig.LoadCredential;

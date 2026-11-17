@@ -10,7 +10,7 @@
 # unlock to report: it writes cluster_boot_insecure_optout 1 and the report's
 # timestamp, and sends nothing. BootSecurityOptedOut fires on it.
 #
-# Clan-independent: nothing here reads topology or vars. The boot VM tests import it
+# Nothing here reads topology or secrets. The boot VM tests import it
 # directly, and a mutant takes a control out of the script through cluster.bootReport.script.
 {
   config,

@@ -1,4 +1,4 @@
-# modules/audit-ship.nix — the audit trail's wiring: topology and clan vars into
+# modules/audit-ship.nix — the audit trail's wiring: topology and the site's secrets into
 # modules/audit-ship-core.nix (which says what is sent and how).
 #
 #   topology.alerting.auditUrl   the watchdog Worker's /event URL. Null turns the trail
@@ -28,7 +28,7 @@
 }:
 let
   url = topology.alerting.auditUrl or null;
-  gens = config.clan.core.vars.generators;
+  gens = config.cluster.secrets.generators;
   isServer = clusterLib.net.hasTag "nomad-server" node;
   tls = clusterLib.nomadPki.cliTlsFor gens;
 in

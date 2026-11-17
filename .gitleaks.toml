@@ -7,6 +7,12 @@ useDefault = true
 description = "test fixtures, not secrets"
 paths = [
   '''tests/lib/fixture-wg\.nix''',
+  # A master key that protects nothing, beside the two fixture values it encrypts
+  # (tests/fixtures/agenix/default.nix explains why it is in a file).
+  '''tests/fixtures/agenix/master-identity\.txt''',
+  # Two "security keys" made with OpenSSH's software one (tests/lib/sk-dummy.nix): the
+  # initrd's sshd is tested against an `ed25519-sk` key, and no hardware holds these.
+  '''tests/fixtures/sk-key/(operator|other)''',
 ]
 
 # The boot harness's volume identity secret: a sequential-hex placeholder that only the
