@@ -27,7 +27,7 @@ ALERT_FROM = "alerts@example.com"
 ALERT_TO = "ops@example.com"
 
 # Secrets (wrangler secret put):
-#   WATCHDOG_TOKEN  = `clan vars get <node> alerting-watchdog/token`
+#   WATCHDOG_TOKEN  = `avc secrets reveal alerting-watchdog/token`
 #   CF_EMAIL_TOKEN  = the Email-Sending-only token (same as alerting/cf-email-token)
 #   AUDIT_TOKENS    = `avc audit tokens`: {"<token>": {"sender": "<node>", "kinds": [...]}},
 #                     one per node from its `audit/token`
