@@ -505,6 +505,27 @@ in
       ];
     }
     {
+      # A node's read access to the site's GitHub repositories (modules/github-access.nix,
+      # cluster_github_token.prom): tokens of an hour, from the cluster-ci Worker, asked
+      # for every ten minutes and before each pull. The Worker hands out nothing with
+      # under half an hour left, so twenty minutes without an answer, held for five, is
+      # still inside the life of the tokens the node holds: the alert comes before the
+      # pull loop stops being able to read a private repository, not after. Only nodes
+      # of a site with `ci.url` write the metric. 0 is a node that has had no answer
+      # since it booted.
+      name = "github";
+      rules = [
+        (rule {
+          alert = "GitHubTokenStale";
+          expr = "time() - cluster_github_token_last_success_timestamp_seconds > 1200";
+          for = "5m";
+          severity = "warning";
+          summary = "{{ $labels.instance }} has had no GitHub tokens from the cluster-ci Worker for {{ $value | humanizeDuration }}";
+          description = "The tokens it holds last an hour from when they were made, and then its pull loop and its previews can read public repositories only. `journalctl -u cluster-github-token` on the node says what the Worker answered: 401 is its `ci/token` missing from the Worker's AGENT_TOKENS (`avc ci tokens`), 502 is the Worker's own trouble with GitHub or its SITE_FLAKE, and no answer is the Worker or the node's way out. README, Previews and continuous deployment.";
+        })
+      ];
+    }
+    {
       # The off-host audit trail's sender (modules/audit-ship-core.nix, audit.prom). A
       # trail that stopped arriving looks exactly like a quiet cluster from the Worker.
       name = "audit";
