@@ -7,6 +7,18 @@ REFUSED_PROMPT_SECONDS = 20
 SSHD_ACCEPTED = "journalctl -b -o cat --no-pager _COMM=sshd-session _COMM=sshd _UID=0 | grep -c '^Accepted ' || true"
 
 
+def fido2_initrd_ssh(key):
+    """(rc, output) of a command in the initrd, logged in with a FIDO2 (`ed25519-sk`) key
+    from the peer. OpenSSH's software security key answers where a YubiKey would be touched."""
+    peer.succeed(f"install -m 0600 {key} /root/sk")
+    return peer.execute(
+        f"{SK_SSH} -n -v -o SecurityKeyProvider={SK_PROVIDER} -o IdentitiesOnly=yes -o IdentityAgent=none "
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes "
+        f"-i /root/sk -p {SSH_PORT} root@{WAN_ADDRESS} 'test -e /etc/initrd-release && echo in-the-initrd' 2>&1",
+        timeout=60,
+    )
+
+
 def report_initrd_ssh_logins():
     """The operator's logins to the initrd are counted, and told apart from a login after
     it. The report reads both from this boot's journal and keeps those from before stage 2's
@@ -82,6 +94,17 @@ def refused_console(bound, firmware):
 
     # The prompt is up, so the initrd's network is too, or it never will be.
     control("initrd-ssh-on-the-wan-nic", wait_initrd_ssh(), f"no ssh to {WAN_ADDRESS}")
+    # An operator whose key is on a YubiKey (`ed25519-sk`) reaches the same prompt: the
+    # initrd's sshd takes an sk-ssh-ed25519@openssh.com key from authorized_keys and
+    # verifies its signature. A security key that is not an operator's is refused, so it
+    # is the key that was accepted and not the key type.
+    rc_sk, out_sk = fido2_initrd_ssh(SK_KEY)
+    rc_other, out_other = fido2_initrd_ssh(SK_OTHER_KEY)
+    control(
+        "initrd-ssh-accepts-a-fido2-key",
+        rc_sk == 0 and "in-the-initrd" in out_sk and rc_other != 0 and "in-the-initrd" not in out_other,
+        f"operator's: rc={rc_sk} {out_sk.strip()[-300:]}; another: rc={rc_other} {out_other.strip()[-200:]}",
+    )
     rc, scanned = peer.execute(f"ssh-keyscan -p {SSH_PORT} -t ed25519 {WAN_ADDRESS} 2>/dev/null")
     initrd_key = scanned.split()[-2:] if rc == 0 else []
 
