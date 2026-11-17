@@ -234,20 +234,33 @@ def test_unlock_pins_the_repositorys_host_key(ctx, monkeypatch):
     assert argv[-3:] == ["root@192.0.2.1", "systemd-tty-ask-password-agent", "--query"]
 
 
+RESCUE_KEY = ("ssh-ed25519", "AAAAC3NzaC1lZDI1NTE5AAAAIFixtureRescueHostKeyNotARealOne".ljust(68, "0"))
+RESCUE_FP = boot_flow.hostpin.fingerprint(RESCUE_KEY)
+
+
 @pytest.fixture
 def installer_runs(ctx, monkeypatch):
     """`avc boot install` with its preflight answered and the site's installer recorded:
     (argv, env) per run, the exit status it is given, and what was shipped after."""
-    state = {"runs": [], "rc": 0, "shipped": []}
+    state = {"runs": [], "rc": 0, "shipped": [], "scans": [], "ssh": []}
     monkeypatch.setattr(repo, "changes", lambda root: [])
     monkeypatch.setattr(boot_flow.proc, "out", lambda *a, **k: '{"toplevel": "t", "disko": "d", "identity": "i"}')
     monkeypatch.setattr(boot_flow.proc, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", ""))
+    # The rescue system: the host key it presents, and the one in its /etc/ssh, which the
+    # kexec carries (here the same).
+    monkeypatch.setattr(boot_flow.hostpin, "scan", lambda host, port=None: state["scans"].append((host, port)) or [RESCUE_KEY])
 
-    def fake_run(argv, cwd=None, env=None, **k):
+    def fake_ssh(argv, **k):
+        state["ssh"].append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, " ".join(RESCUE_KEY) + " root@rescue\n", "")
+
+    def fake_installer(argv, cwd, env, pin):
         state["runs"].append((list(argv), dict(env or {}), cwd))
-        return subprocess.CompletedProcess(argv, state["rc"])
+        state["known_hosts"] = pin.known_hosts.read_text()
+        return state["rc"]
 
-    monkeypatch.setattr(boot_flow.subprocess, "run", fake_run)
+    monkeypatch.setattr(boot_flow.subprocess, "run", fake_ssh)
+    monkeypatch.setattr(boot_flow.hostpin, "run_watched", fake_installer)
     monkeypatch.setattr(boot_flow.ship, "ship", lambda ctx, message, **k: state["shipped"].append((message, k.get("paths"))) or True)
     monkeypatch.delenv(boot_flow.INSTALL_ARGS_ENV, raising=False)
     return state
@@ -256,7 +269,7 @@ def installer_runs(ctx, monkeypatch):
 def test_install_asks_then_runs_the_sites_installer_and_ships_the_identity(ctx, installer_runs):
     from avc import ui
 
-    with ui.scripted(["node1"]):
+    with ui.scripted([True, "node1"]):
         run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity="/keys/rescue")
     ((argv, env, cwd),) = installer_runs["runs"]
     # The site's own app for this node (lib/mk-cluster.nix); what follows the target is nixos-anywhere's.
@@ -264,9 +277,12 @@ def test_install_asks_then_runs_the_sites_installer_and_ships_the_identity(ctx, 
     assert cwd == ctx.root
     # Asked here, once, by name; the installer does not ask again.
     assert env["IH_ASSUME_YES"] == "1"
-    # The hook is this program, and reaches the installer the way nixos-anywhere does.
+    # The hook is this program, and reaches the installer with the same key, under the
+    # same pin (tests/test_install_pin.py is what the pin does).
     assert os.path.isabs(env[boot_flow.SELF_ENV])
-    assert shlex.split(env[boot_flow.INSTALL_SSH_ENV]) == [*boot_flow.EPHEMERAL_HOST, "-i", "/keys/rescue"]
+    assert shlex.split(env[boot_flow.INSTALL_SSH_ENV]) == ["-i", "/keys/rescue"]
+    assert env["PATH"].split(os.pathsep)[0] == os.path.join(env[boot_flow.hostpin.PIN_ENV], "bin")
+    assert installer_runs["known_hosts"] == f"avc-install-node1 {' '.join(RESCUE_KEY)}\n"
     # What the hook wrote is the node's recipient and what was rekeyed to it.
     assert installer_runs["shipped"] == [("feat(secrets): node1's age identity, and what it reads rekeyed to it", ["secrets/"])]
 
@@ -275,25 +291,36 @@ def test_install_passes_a_sites_extra_arguments_to_nixos_anywhere(ctx, installer
     from avc import ui
 
     monkeypatch.setenv(boot_flow.INSTALL_ARGS_ENV, "--kexec /tmp/kexec.tar.gz --ssh-option Port=2200")
-    with ui.scripted(["node1"]):
+    with ui.scripted([True, "node1"]):
         run(ctx, "boot", "install", node="node1", target="root@192.0.2.9", identity=None)
     assert installer_runs["runs"][0][0][4:] == ["root@192.0.2.9", "--kexec", "/tmp/kexec.tar.gz", "--ssh-option", "Port=2200"]
+
+
+def test_install_reads_the_host_key_on_the_port_nixos_anywhere_is_given(ctx, installer_runs, monkeypatch):
+    from avc import ui
+
+    monkeypatch.setenv(boot_flow.INSTALL_ARGS_ENV, "--ssh-port 2200 --kexec /tmp/kexec.tar.gz")
+    with ui.scripted([True, "node1"]):
+        run(ctx, "boot", "install", node="node1", target="root@192.0.2.9", identity=None)
+    assert installer_runs["scans"] == [("192.0.2.9", 2200)]
+    (carry,) = installer_runs["ssh"]
+    assert carry[carry.index("-p") + 1] == "2200"
 
 
 def test_install_runs_nothing_unless_the_nodes_name_is_typed(ctx, installer_runs):
     from avc import ui
     from avc.errors import Aborted
 
-    with ui.scripted(["node2"]), pytest.raises(Aborted):
+    with ui.scripted([True, "node2"]), pytest.raises(Aborted):
         run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity=None)
-    assert installer_runs["runs"] == [] and installer_runs["shipped"] == []
+    assert installer_runs["runs"] == [] and installer_runs["shipped"] == [] and installer_runs["ssh"] == []
 
 
 def test_a_failed_install_ships_nothing(ctx, installer_runs):
     from avc import ui
 
     installer_runs["rc"] = 1
-    with ui.scripted(["node1"]), pytest.raises(AvcError, match="ended with status 1"):
+    with ui.scripted([True, "node1"]), pytest.raises(AvcError, match="ended with status 1"):
         run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity=None)
     assert installer_runs["shipped"] == []
 
@@ -306,7 +333,7 @@ def test_install_of_an_opted_out_node_skips_what_it_does_not_have(ctx, installer
     ctx.index.nodes["node1"]["boot"] = {"enabled": False}
     evaluated = []
     monkeypatch.setattr(boot_flow.proc, "out", lambda cmd, **k: evaluated.append(cmd[-1]) or "{}")
-    with ui.scripted(["node1"]):
+    with ui.scripted([True, "node1"]):
         run(ctx, "boot", "install", node="node1", target="192.0.2.9", identity=None)
     assert evaluated == [boot_flow.PLAIN_PREFLIGHT_APPLY]
     assert installer_runs["runs"][0][0][:4] == ["nix", "run", ".#install-node1", "--"]
@@ -314,7 +341,7 @@ def test_install_of_an_opted_out_node_skips_what_it_does_not_have(ctx, installer
 
 
 def test_stage_is_the_installers_hook_and_says_so_when_run_by_hand(ctx, monkeypatch):
-    for v in ("IH_TARGET", "IH_EXTRA_FILES", "IH_DISK_KEYS"):
+    for v in ("IH_TARGET", "IH_EXTRA_FILES", "IH_DISK_KEYS", boot_flow.hostpin.PIN_ENV):
         monkeypatch.delenv(v, raising=False)
     with pytest.raises(AvcError, match="avc boot install node1"):
         run(ctx, "boot", "stage", node="node1")

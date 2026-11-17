@@ -13,6 +13,7 @@ import dataclasses
 import os
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 from pathlib import Path
@@ -759,7 +760,14 @@ def staging(site, scratch, tmp_path, monkeypatch):
     extra.mkdir()
     keys = scratch / "disk-keys"
     keys.mkdir()
+    # A new recipient is confirmed by a person (the tests below this block are that
+    # question's own): here it is answered, and what was asked is kept.
+    confirmed.clear()
+    monkeypatch.setattr(boot_flow, "confirm_recipient", lambda node, recipient, where: confirmed.append((node, recipient, where)))
     return store, FakeInstaller(tmp_path), extra, keys
+
+
+confirmed: list[tuple[str, str, str]] = []
 
 
 def files_under(d: Path) -> dict[str, bytes]:
@@ -775,6 +783,7 @@ def test_stage_makes_the_identity_rekeys_to_it_and_stages_what_the_install_reads
     assert installer.generated == 1 and installer.copied == [["/nix/store/age", "/nix/store/age-plugin-tpm"]]
     identity = installer.keys[0]
     assert recipient in identity
+    assert confirmed == [("node2", recipient, "root@192.0.2.9")]
     # In the repository: the recipient in the clear, the identity file as ciphertext that
     # the operators' key opens.
     assert (site.root / "secrets/recipients/node2.pub").read_text() == recipient + "\n"
@@ -810,6 +819,8 @@ def test_stage_keeps_the_identity_of_a_tpm_that_still_answers_for_it(site, stagi
     again = site.store()
     assert boot_flow.stage_node(again, "node2", installer, extra, keys, rekey=again.fill_rekeyed) == first
     assert installer.generated == 1 and site.snapshot() == before
+    # Asked once, for the identity that was new: the one the repository holds asks nothing.
+    assert len(confirmed) == 1
     assert files_under(extra)["var/lib/cluster-secrets/identity.txt"].decode().strip() == installer.keys[0]
 
 
@@ -855,6 +866,80 @@ def test_stage_refuses_before_anything_is_written(site, staging, tmp_path):
     assert files_under(extra) == {} and files_under(keys) == {}
 
 
+class Tty:
+    """A terminal, to a program that asks whether its stdin is one."""
+
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def asked(monkeypatch):
+    """The real question about a new recipient, with the operator's answer given: what was
+    asked, and what the repository and the rekeying looked like at that moment."""
+    state = {"answer": True, "questions": []}
+
+    class Question:
+        def __init__(self, question, default=None):
+            state["questions"].append((question, default))
+
+        def ask(self):
+            return state["answer"]
+
+    import questionary
+
+    monkeypatch.setattr(questionary, "confirm", Question)
+    monkeypatch.setattr(boot_flow, "confirm_recipient", REAL_CONFIRM)
+    return state
+
+
+REAL_CONFIRM = boot_flow.confirm_recipient
+
+
+def test_a_new_recipient_is_confirmed_before_anything_is_rekeyed_or_written(site, staging, asked, monkeypatch):
+    store, installer, extra, keys = staging
+    before = site.snapshot()
+    rekeys = []
+    seen = {}
+
+    def confirm(node, recipient, where):
+        # At the question: the repository is as it was, and nothing is rekeyed or staged.
+        seen.update(snapshot=site.snapshot(), rekeys=list(rekeys), staged=files_under(extra) | files_under(keys), recipient=recipient)
+
+    recipient = boot_flow.stage_node(store, "node2", installer, extra, keys, rekey=lambda: rekeys.append(1), confirm=confirm)
+    assert seen == {"snapshot": before, "rekeys": [], "staged": {}, "recipient": recipient}
+    assert rekeys == [1] and site.snapshot() != before
+
+
+def test_a_recipient_that_is_not_confirmed_changes_nothing(site, staging, asked, monkeypatch):
+    store, installer, extra, keys = staging
+    before = site.snapshot()
+    rekeys = []
+    stage = lambda: boot_flow.stage_node(site.store(), "node2", installer, extra, keys, rekey=lambda: rekeys.append(1))  # noqa: E731
+
+    # No terminal: refused, with or without --yes.
+    for yes in (False, True):
+        monkeypatch.setattr(ui, "assume_yes", yes)
+        with pytest.raises(AvcError, match="confirmed at a terminal"):
+            stage()
+    assert asked["questions"] == []
+
+    # A terminal: asked, whatever --yes says, with "no" as what Enter gives.
+    monkeypatch.setattr(sys, "stdin", Tty())
+    asked["answer"] = False
+    with pytest.raises(AvcError, match="not confirmed"):
+        stage()
+    ((question, default),) = asked["questions"]
+    assert "node2" in question and default is False
+
+    assert site.snapshot() == before and rekeys == [] and files_under(extra) == {} and files_under(keys) == {}
+
+    # And "yes" is what lets it through.
+    asked["answer"] = True
+    recipient = stage()
+    assert rekeys == [1] and (site.root / "secrets/recipients/node2.pub").read_text() == recipient + "\n"
+
+
 def test_a_nodes_identity_file_follows_the_master_recipients(site, staging, tmp_path):
     # `avc secrets fix` after an operator's key changes: the identity files are sources too.
     store, installer, extra, keys = staging
@@ -891,16 +976,26 @@ def test_identity_on_a_running_node_puts_the_file_back_or_makes_a_new_one(cluste
     # node1's TPM has nothing for the recipient in the repository (the fixture's is a
     # plain key): a new identity, committed, rekeyed, shipped, and the file on the node.
     old = store.recipient("node1")
-    actions.find("boot", "identity").run(ctx, {"node": "node1"})
+    before = site.snapshot()
+    # A new recipient is a person's to confirm: --yes does not, and "no" leaves the node,
+    # the repository and every secret as they were.
+    monkeypatch.setattr(ui, "assume_yes", True)
+    with pytest.raises(AvcError, match="confirmed at a terminal"):
+        actions.find("boot", "identity").run(ctx, {"node": "node1"})
+    with ui.scripted([False]), pytest.raises(AvcError, match="not confirmed"):
+        actions.find("boot", "identity").run(ctx, {"node": "node1"})
+    assert written == [] and site.snapshot() == before and calls["agenix"] == 0 and calls["shipped"] == []
+    with ui.scripted([True]):
+        actions.find("boot", "identity").run(ctx, {"node": "node1"})
     new = store.recipient("node1")
-    assert new != old and node.generated == 1
-    assert written == [("/var/lib/cluster-secrets/identity.txt", node.keys[0] + "\n")]
-    assert site.plain("secrets/identities/node1.age").strip() == node.keys[0]
+    assert new != old and node.generated == 3
+    assert written == [("/var/lib/cluster-secrets/identity.txt", node.keys[-1] + "\n")]
+    assert site.plain("secrets/identities/node1.age").strip() == node.keys[-1]
     assert calls["agenix"] == 1 and store.readiness("node1").ok
     assert calls["shipped"][-1] == ("feat(secrets): node1's new age identity, and what it reads rekeyed to it", ["secrets/"])
 
     # The file alone was lost: the same identity goes back, and the repository does not move.
     before, shipped = site.snapshot(), len(calls["shipped"])
     actions.find("boot", "identity").run(ctx, {"node": "node1"})
-    assert node.generated == 1 and site.snapshot() == before and len(calls["shipped"]) == shipped
-    assert written[-1] == ("/var/lib/cluster-secrets/identity.txt", node.keys[0] + "\n")
+    assert node.generated == 3 and site.snapshot() == before and len(calls["shipped"]) == shipped
+    assert written[-1] == ("/var/lib/cluster-secrets/identity.txt", node.keys[-1] + "\n")
