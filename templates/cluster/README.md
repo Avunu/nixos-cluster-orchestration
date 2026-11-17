@@ -10,8 +10,9 @@ A private flake on top of [nixos-cluster-orchestration](https://github.com/Avunu
 | `topology.nix` | Nodes, roles, VLANs, object storage, backup target, alert addresses |
 | `apps/<name>.nix` or `.json` | One file per app |
 | `hosts/<node>.nix` | Optional per-node hardware quirks |
-| `vars/`, `secrets/` | Written by `clan vars generate` and committed. Secrets are age-encrypted |
-| `inventory.json` | Written by clan when it installs a machine |
+| `secrets/shared/`, `secrets/per-machine/<node>/` | One file per secret, age-encrypted to the operators' master identities, and public values in the clear. Committed |
+| `secrets/rekeyed/<node>/` | What `nix run .#agenix -- rekey` made of them for each node: the files a node decrypts with its TPM. Committed with the secret they came from |
+| `secrets/recipients/<node>.pub` | Each node's age recipient, from its TPM |
 
 Keep this repository private: it names your addresses and customers, and it holds your encrypted secrets.
 

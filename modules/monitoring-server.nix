@@ -39,7 +39,7 @@ let
   # Prometheus nor the autoscaler runs as root, which the vars files are readable by.
   # So each gets them as systemd credentials, at the path systemd puts them for that
   # unit, and names that path in its configuration.
-  tls = clusterLib.nomadPki.cliTlsFor config.clan.core.vars.generators;
+  tls = clusterLib.nomadPki.cliTlsFor config.cluster.secrets.generators;
   nomadCreds = [
     "nomad-ca.crt:${tls.caCert}"
     "nomad-cli.crt:${tls.clientCert}"

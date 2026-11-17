@@ -30,11 +30,11 @@
 {
   pkgs,
   lib,
-  clan,
+  site,
   harness,
 }:
 let
-  machine = clan.config.nixosConfigurations.node1;
+  machine = site.nixosConfigurations.node1;
   inherit (machine._module.specialArgs) topology;
   node = topology.nodes.node1;
   apps = lib.attrNames machine.config.clusterApps;
@@ -58,7 +58,7 @@ pkgs.testers.runNixOSTest {
 
     node1 = {
       imports = [
-        clan.config.nixosModules."clan-machine-node1"
+        site.machineModules.node1
         (harness.nodeModule { memoryMB = 4096; })
       ];
 
@@ -90,7 +90,7 @@ pkgs.testers.runNixOSTest {
         with subtest("boot reaches multi-user"):
             node1.wait_for_unit("multi-user.target")
 
-        with subtest("secrets land where clan's age backend puts them"):
+        with subtest("secrets land at the paths the modules read"):
             node1.succeed("test \"$(stat -c %a:%U /run/secrets/shared/nomad-acl/token)\" = 400:root")
             node1.succeed("grep -qx ${harness.nomadToken} /run/secrets/shared/nomad-acl/token")
             # node1 is a server: its agent certificate names server.global.nomad, and

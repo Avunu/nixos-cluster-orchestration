@@ -1,5 +1,5 @@
 {
-  description = "NixOS module library for clusters of systemd-nspawn containers, run by Nomad, on JuiceFS, behind Cloudflare Tunnels, on clan-core";
+  description = "NixOS module library for clusters of systemd-nspawn containers, run by Nomad, on JuiceFS, behind Cloudflare Tunnels";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -9,22 +9,23 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # clan-core — the fleet substrate (machine registry + role tags, vars/secrets,
-    # state+backup contract). Pinned BY REV, not by branch: `main` is clan's
-    # unstable channel (their VERSION file literally says "unstable") and a fleet
-    # built on this library auto-applies from git, so the lock file is the only
-    # thing standing between an upstream push and every node. Bump this input
-    # ALONE, never alongside others, so each bump is one reviewable commit —
-    # and `nix flake check` runs tests/clan-coexist.nix against it.
-    clan-core = {
-      url = "git+https://git.clan.lol/clan/clan-core?rev=7b287df580ac32a1e14c5ca62df708e3f501216b";
+    # Secrets: agenix decrypts on the node, agenix-rekey re-encrypts each secret from the
+    # operators' master identities to the one host that reads it (modules/secrets.nix).
+    # Pinned BY REV like Lanzaboote below: the nodes apply this flake from git on a
+    # timer, and what decrypts their secrets at activation must change in one
+    # reviewable commit.
+    agenix = {
+      url = "github:ryantm/agenix/5e5b88a0c8e56f291a108c2fe9934054d9745b2e";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    agenix-rekey = {
+      url = "github:oddlama/agenix-rekey/87e5d5f2ca5de294eb5386c2773b94d58ec9773b";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
-      inputs.disko.follows = "disko";
     };
 
     # Lanzaboote: Secure Boot for encrypted nodes (modules/boot-security-core.nix).
-    # Pinned BY REV for the same reason as clan-core: nodes auto-apply, so a bump
+    # Pinned BY REV: nodes auto-apply, so a bump
     # must be one reviewable commit. This rev, not a release, because it is the one
     # carrying `protectedSystem`, and the one the boot tests ran against.
     lanzaboote = {
@@ -60,12 +61,21 @@
       self,
       nixpkgs,
       flake-parts,
-      clan-core,
       ...
     }:
     let
       inherit (nixpkgs) lib;
       clusterLib = import ./lib { inherit lib; };
+
+      # modules/secrets.nix lowers every secret to agenix, so it comes with agenix and
+      # agenix-rekey: a test that imports a few modules directly imports this.
+      secretsModule = {
+        imports = [
+          inputs.agenix.nixosModules.default
+          inputs.agenix-rekey.nixosModules.default
+          ./modules/secrets.nix
+        ];
+      };
 
       # Everything mkCluster imports on every machine, and what `nixosModules` exports.
       clusterModuleSet = {
@@ -84,7 +94,10 @@
         # Prometheus, Alertmanager and Loki, on every node (it imports the other two).
         monitoringServer = ./modules/monitoring-server.nix;
         logging = ./modules/logging.nix;
+        # What the cluster's secrets are (vars), and how one is declared, kept and
+        # brought to a node (secrets).
         vars = ./modules/vars.nix;
+        secrets = secretsModule;
         pullDeploy = ./modules/pull-deploy.nix;
         appContainer = ./modules/app-container.nix;
         # The app catalogue (apps/, one file per app) and the kinds an
@@ -120,42 +133,43 @@
         # Deploys the moment the site's branch moves, and a preview per pull request:
         # the node's half of workers/cluster-ci.
         ciAgent = ./modules/ci-agent.nix;
-        nixpkgsOverlays = ./modules/nixpkgs-overlays.nix;
       };
       nixosModules = clusterModuleSet;
 
-      # `lib.mkCluster` (lib/mk-cluster.nix): a consumer's clan, from these modules.
-      # clanCore already imports sops-nix and disko into every machine, so
-      # neither is listed here.
+      # `lib.mkCluster` (lib/mk-cluster.nix): a consumer's machines, from these modules.
       mkCluster = import ./lib/mk-cluster.nix {
         inherit lib clusterLib;
         libraryInputs = inputs;
         # Lanzaboote's module only acts under `boot.lanzaboote.enable`, so it changes
         # nothing on a node that opts out of boot security.
-        clusterModules = lib.attrValues clusterModuleSet ++ [ inputs.lanzaboote.nixosModules.lanzaboote ];
+        # disko: the disk layout (modules/zfs-host.nix) is its `disko.devices`.
+        clusterModules = lib.attrValues clusterModuleSet ++ [
+          inputs.lanzaboote.nixosModules.lanzaboote
+          inputs.disko.nixosModules.default
+        ];
       };
 
       # What the operations tool reads (lib/ops-index.nix): nodes, apps, and
       # which vars generators each app consumes.
       mkOpsIndex =
-        { clan, topology }:
+        { site, topology }:
         import ./lib/ops-index.nix {
           inherit lib topology clusterLib;
-          inherit (clan.config) nixosConfigurations;
+          inherit (site) nixosConfigurations;
         };
 
       # What the site needs from its providers, as an OpenTofu configuration
       # (lib/cloud.nix), and where each thing they hand back goes. `avc cloud` runs it.
       mkCloud =
-        { clan, topology }:
+        { site, topology }:
         import ./lib/cloud.nix {
           inherit lib topology clusterLib;
-          inherit (clan.config) nixosConfigurations;
+          inherit (site) nixosConfigurations;
         };
 
       # The fixture cluster (tests/fixtures): what this flake's checks and its
       # nixosConfigurations are built from. A function of the topology so
-      # tests/cluster.nix can build the SAME clan over a test topology. Nothing
+      # tests/cluster.nix can build the SAME site over a test topology. Nothing
       # forces it unless a check or its outputs do, so a consumer never pays.
       fixtureTopology = import ./tests/fixtures/topology.nix;
       mkFixtureCluster = import ./tests/fixtures { inherit self mkCluster; };
@@ -202,7 +216,7 @@
             import ./tests/control-plane-attack.nix (
               {
                 inherit pkgs lib;
-                clan = fixtureCluster;
+                site = fixtureCluster;
                 harness = fixtureHarness;
               }
               // args
@@ -226,7 +240,7 @@
             import ./tests/cluster.nix (
               {
                 inherit pkgs lib;
-                mkClan = mkFixtureCluster;
+                mkSite = mkFixtureCluster;
                 topology = fixtureTopology;
                 harnessFor =
                   topology:
@@ -244,7 +258,7 @@
             import ./tests/voter-growth.nix (
               {
                 inherit pkgs lib;
-                mkClan = mkFixtureCluster;
+                mkSite = mkFixtureCluster;
                 topology = fixtureTopology;
                 harnessFor =
                   harnessArgs: import ./tests/lib/cluster-harness.nix ({ inherit pkgs lib; } // harnessArgs);
@@ -259,14 +273,14 @@
             import ./tests/container-isolation.nix (
               {
                 inherit pkgs lib;
-                mkClan = mkFixtureCluster;
+                mkSite = mkFixtureCluster;
                 topology = fixtureTopology;
                 harnessFor =
                   topology:
                   import ./tests/lib/cluster-harness.nix {
                     inherit pkgs lib topology;
                   };
-                clanCoreModule = clan-core.nixosModules.clanCore;
+                inherit secretsModule;
               }
               // args
             );
@@ -284,7 +298,7 @@
                   import ./tests/lib/cluster-harness.nix {
                     inherit pkgs lib topology;
                   };
-                clanCoreModule = clan-core.nixosModules.clanCore;
+                inherit secretsModule;
               }
               // args
             );
@@ -302,43 +316,21 @@
                   import ./tests/lib/cluster-harness.nix {
                     inherit pkgs lib topology;
                   };
-                clanCoreModule = clan-core.nixosModules.clanCore;
+                inherit secretsModule;
               }
               // args
             );
-
-          # clan-core passes "--unset LD_LIBRARY_PATH" as ONE makeWrapperArgs
-          # element, which only worked through word-splitting. nixpkgs now
-          # enables __structuredAttrs for Python apps, which keeps it as a
-          # single arg and makeWrapper dies ("doesn't understand the arg
-          # --unset ..."), so the devShell never builds. Split such elements
-          # here; drop this once clan-core does.
-          #
-          # The pinned clan-core also builds clan-cli with nixVersions.nix_2_31
-          # (an A/B pin of theirs), which nixpkgs has since removed; give it
-          # nixpkgs' default nix. Drop this with a clan-core bump that no
-          # longer pins it.
-          clan-cli =
-            (clan-core.packages.${system}.clan-cli.override { nix = pkgs.nix; }).overrideAttrs
-              (old: {
-                makeWrapperArgs = pkgs.lib.concatMap (
-                  arg:
-                  if pkgs.lib.hasPrefix "--unset " arg then
-                    [
-                      "--unset"
-                      (pkgs.lib.removePrefix "--unset " arg)
-                    ]
-                  else
-                    [ arg ]
-                ) old.makeWrapperArgs;
-              });
         in
         {
           _module.args.pkgs = pkgs;
 
           # The operations tool: status, sites, apps, secrets, deploys.
           # `.override { siteProvisioner = …; }` enables `avc site …` (lib/avc.nix).
-          packages.avc = pkgs.callPackage ./lib/avc.nix { inherit clan-cli; };
+          packages.avc = pkgs.callPackage ./lib/avc.nix { };
+
+          # `nix run .#agenix -- rekey | edit | view`: agenix-rekey's command, which reads
+          # the flake it is run in (its `agenix-rekey` output, from mkCluster).
+          packages.agenix = inputs.agenix-rekey.packages.${system}.default;
           packages.default = self'.packages.avc;
 
           # Its tests (policy gate, ship ordering, registry) run in the build.
@@ -346,9 +338,10 @@
 
           devShells.default = pkgs.mkShell {
             packages = [
-              # Fleet: machine registry, secrets (vars), install, backups.
-              # Replaces colmena (deploy) and the old per-file secret scripts.
-              clan-cli
+              # Secrets: rekey, edit, view (modules/secrets.nix).
+              self'.packages.agenix
+              pkgs.age-plugin-yubikey
+              pkgs.age-plugin-tpm
               pkgs.nomad
               pkgs.juicefs
               pkgs.jq
@@ -360,9 +353,9 @@
               self'.packages.avc
             ];
             shellHook = ''
-              echo "nixos-cluster-orchestration devshell — clan / nomad / juicefs"
+              echo "nixos-cluster-orchestration devshell — agenix / nomad / juicefs"
               echo "  avc           → start here: status, sites, apps, secrets, deploys"
-              echo "  clan          → machines, vars (secrets), backups, install"
+              echo "  agenix        → secrets: rekey, edit, view"
             '';
           };
 
@@ -377,7 +370,7 @@
               lib = nixpkgs.lib;
               topology = fixtureTopology;
               clusterLib = import ./lib { inherit (nixpkgs) lib; };
-              clanCoreModule = clan-core.nixosModules.clanCore;
+              inherit secretsModule;
               appContainerModule = ./modules/app-container.nix;
               overlayNetworkModule = ./modules/overlay-network.nix;
             }
@@ -390,7 +383,7 @@
               inherit pkgs;
               lib = nixpkgs.lib;
               clusterLib = import ./lib { inherit (nixpkgs) lib; };
-              clanSystem = self.nixosConfigurations.node1;
+              nodeSystem = self.nixosConfigurations.node1;
             }
           );
 
@@ -402,7 +395,7 @@
               lib = nixpkgs.lib;
               clusterLib = import ./lib { inherit (nixpkgs) lib; };
               topology = fixtureTopology;
-              clanSystem = self.nixosConfigurations.node1;
+              nodeSystem = self.nixosConfigurations.node1;
             }
           );
 
@@ -498,7 +491,7 @@
             _:
             let
               cloud = mkCloud {
-                clan = fixtureCluster;
+                site = fixtureCluster;
                 topology = fixtureTopology;
               };
               tofu = pkgs.opentofu.withPlugins (ps: [
@@ -568,21 +561,6 @@
             }
           );
 
-          # Guards the clan-core adoption. clan-core is pinned to `main` — their
-          # unstable channel — and every node applies its flake from git on a
-          # timer, so this check is what makes each clan bump a reviewable diff
-          # instead of a remote surprise. Run it on every bump.
-          checks.clan-coexist = detach (
-            _:
-            import ./tests/clan-coexist.nix {
-              inherit pkgs;
-              lib = nixpkgs.lib;
-              topology = fixtureTopology;
-              clusterLib = import ./lib { inherit (nixpkgs) lib; };
-              clanSystem = self.nixosConfigurations.node1;
-            }
-          );
-
           # Boots the fixture node1 (its real machine module, fixture secrets, a
           # stand-in internet) twice and requires the whole cold-start chain to
           # converge: network, etcd, JuiceFS on S3, Nomad + ACLs + every app's job,
@@ -591,7 +569,7 @@
             _:
             import ./tests/cluster-single.nix {
               inherit pkgs lib;
-              clan = fixtureCluster;
+              site = fixtureCluster;
               harness = fixtureHarness;
             }
           );
@@ -622,7 +600,7 @@
             _:
             import ./tests/attic.nix {
               inherit pkgs lib;
-              mkClan = mkFixtureCluster;
+              mkSite = mkFixtureCluster;
               topology = fixtureTopology;
             }
           );
@@ -639,7 +617,7 @@
             _:
             import ./tests/control-plane-failure.nix {
               inherit pkgs lib;
-              mkClan = mkFixtureCluster;
+              mkSite = mkFixtureCluster;
               topology = fixtureTopology;
               harnessFor =
                 topology:
@@ -688,7 +666,8 @@
                 ;
               libraryInputs = {
                 inherit (inputs)
-                  clan-core
+                  agenix
+                  agenix-rekey
                   lanzaboote
                   disko
                   nixpkgs
@@ -1461,7 +1440,7 @@
               _:
               import ./tests/control-plane-failure.nix {
                 inherit pkgs lib;
-                mkClan = mkFixtureCluster;
+                mkSite = mkFixtureCluster;
                 topology = fixtureTopology;
                 harnessFor =
                   topology:
@@ -1932,14 +1911,15 @@
         # The FIXTURE cluster, not anyone's fleet: what this flake's checks run
         # against. A consumer takes these from its own mkCluster call. Keyed by
         # machine name == topology key == hostName (node1, node2, …).
-        inherit (fixtureCluster.config) nixosConfigurations clanInternals;
+        inherit (fixtureCluster) nixosConfigurations agenix-rekey;
+        clusterSecrets = fixtureCluster.secrets;
 
         opsIndex = mkOpsIndex {
-          clan = fixtureCluster;
+          site = fixtureCluster;
           topology = fixtureTopology;
         };
         cloud = mkCloud {
-          clan = fixtureCluster;
+          site = fixtureCluster;
           topology = fixtureTopology;
         };
       };

@@ -22,7 +22,7 @@
 }:
 let
   jfs = clusterLib.juicefs;
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
 
   os = topology.objectStorage;
   system = jfs.systemVolume os;
@@ -359,7 +359,7 @@ in
       #
       # NEVER regenerate the key: as `juicefs-rsa` (modules/vars.nix), for this app's
       # files alone.
-      clan.core.vars.generators = lib.listToAttrs (
+      cluster.secrets.generators = lib.listToAttrs (
         lib.concatMap (app: [
           (lib.nameValuePair (jfs.appKeyGenerator app) {
             share = true;

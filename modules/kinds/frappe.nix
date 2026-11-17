@@ -47,7 +47,7 @@ let
         };
         description = ''
           Non-secret keys merged into site_config.json (frappe-nix's
-          sites.<site>.settings). Secrets go in the clan-var secrets above,
+          sites.<site>.settings). Secrets go in the secrets above,
           never here: this is a Nix value and lands in the store.
         '';
       };
@@ -89,7 +89,7 @@ let
   # i.e. { "cloud_storage_settings": { region, endpoint_url, access_key,
   # secret, bucket, folder, ... } } -- see cloud_storage/docs/configuration.md.
   # Set it BEFORE the first deploy that references it, or the build fails:
-  #   clan vars set node1 <name>-cloud-storage/cloud-storage < settings.json
+  #   agenix edit -i settings.json secrets/shared/<name>-cloud-storage/cloud-storage.age
   cloudStorageGenerators = lib.mapAttrs' (
     name: _:
     lib.nameValuePair "${name}-cloud-storage" {
@@ -218,7 +218,7 @@ in
   # key must never change (a per-machine generator would mint a new one the
   # first time the app moved), and the tier ladder ends with the app running
   # on any node.
-  config.clan.core.vars.generators =
+  config.cluster.secrets.generators =
     cloudStorageGenerators
     // lib.mapAttrs (_: _: {
       share = true;

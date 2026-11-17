@@ -434,7 +434,7 @@ in
           for = "1d";
           severity = "warning";
           summary = "{{ $labels.instance }} has waited a day for the canary to boot a new boot stack";
-          description = "A nixpkgs, kernel, Lanzaboote, clan or library bump is held back until the canary node reboots into it and unlocks from the TPM. `avc boot reboot <canary>`, and watch it. If the canary cannot be rebooted, list the closure in /run/cluster-upgrade.skip-canary on each node instead.";
+          description = "A nixpkgs, kernel, Lanzaboote, agenix or library bump is held back until the canary node reboots into it and unlocks from the TPM. `avc boot reboot <canary>`, and watch it. If the canary cannot be rebooted, list the closure in /run/cluster-upgrade.skip-canary on each node instead.";
         })
         (rule {
           alert = "CanaryBootUnproven";
@@ -472,6 +472,23 @@ in
           severity = "critical";
           summary = "{{ $labels.instance }} refused a JuiceFS volume that is not encrypted";
           description = "juicefs-mount found no key in the volume's settings and did not mount it. Nothing is written in plaintext, but nothing is written at all.";
+        })
+      ];
+    }
+    {
+      # A node's own secrets (modules/secrets.nix, cluster_secrets.prom). agenix carries
+      # on when a file does not decrypt, so the node looks well and what reads the file
+      # finds nothing.
+      name = "secrets";
+      rules = [
+        (rule {
+          alert = "SecretsMissing";
+          expr = "cluster_secrets_missing > 0";
+          # The check runs every minute: two in a row, so not the moment of a switch.
+          for = "2m";
+          severity = "critical";
+          summary = "{{ $labels.instance }} is missing {{ $value }} of the secrets it was given";
+          description = "They did not decrypt at activation: the files in its closure are not encrypted to the identity its TPM holds, or the TPM is not the one they were rekeyed for. `journalctl -u cluster-secrets-watch` on the node names each, and `journalctl -b | grep 'age: error'` says why. A boot that began this way did not start Nomad. `agenix rekey`, commit, and the node's next switch decrypts again; then `systemctl start default.target`.";
         })
       ];
     }

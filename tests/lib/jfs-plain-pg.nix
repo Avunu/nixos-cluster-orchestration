@@ -51,7 +51,7 @@ in
       RemainAfterExit = true;
       User = "postgres";
       LoadCredential = [
-        "pgpass:${config.clan.core.vars.generators.juicefs-pg.files.password.path}"
+        "pgpass:${config.cluster.secrets.generators.juicefs-pg.files.password.path}"
       ];
       ExecStart = pkgs.writeShellScript "juicefs-pg-setup" ''
         set -euo pipefail

@@ -62,7 +62,7 @@
 let
   net = clusterLib.net;
   jfs = clusterLib.juicefs;
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
 
   scope = "jfs-meta";
   namespace = "/patroni";
@@ -169,9 +169,8 @@ let
     gen: file:
     let
       f = vars.${gen}.files.${file};
-      p = config.clan.core.settings.directory + "/secrets/clan-vars/${f.rel_dir}/${f.name}/${f.name}.age";
     in
-    lib.optional (builtins.pathExists p) (builtins.hashFile "sha256" p);
+    lib.optional f.exists (builtins.hashFile "sha256" f.source);
 
   curl = "${pkgs.curl}/bin/curl";
   psql = "${package}/bin/psql";

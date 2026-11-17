@@ -194,10 +194,10 @@ check("alert texts and avc point at the README, not at the design or plans/", pr
 
 
 def generators(text: str) -> set[str]:
-    names = set(re.findall(r"clan\.core\.vars\.generators\.([a-z][\w-]*) =", text))
+    names = set(re.findall(r"cluster\.secrets\.generators\.([a-z][\w-]*) =", text))
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        m = re.match(r"^(\s*)clan\.core\.vars\.generators = \{$", line)
+        m = re.match(r"^(\s*)cluster\.secrets\.generators = \{$", line)
         if not m:
             continue
         indent = len(m.group(1))
@@ -217,7 +217,7 @@ print(f"parsed: {len(gens)} generators: {' '.join(sorted(gens))}")
 secret_rows = table(readme, "Generator")
 in_table = {re.split(r"[/ ]", s)[0] for r in secret_rows for s in SPAN.findall(r[0])}
 check(
-    "every vars generator the modules declare has a row in the README's secrets table",
+    "every generator the modules declare has a row in the README's secrets table",
     [f"no row for generator {g}" for g in sorted(gens - in_table)]
     + [f"row `{g}` names no generator" for g in sorted(in_table - gens) if not g.startswith("<")]
     + ([] if len(gens) > 15 else [f"only {len(gens)} generators parsed: this test proves nothing"]),

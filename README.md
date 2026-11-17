@@ -1,6 +1,6 @@
 # nixos-cluster-orchestration
 
-A NixOS module library for running application containers on a small cluster of bare-metal machines: `systemd-nspawn` containers, started and stopped by HashiCorp Nomad, sharing state through an encrypted JuiceFS volume, each reaching the internet through its own outbound Cloudflare Tunnel, on top of [clan-core](https://clan.lol). Every node's disks are encrypted and unlock unattended only into the node's own signed boot.
+A NixOS module library for running application containers on a small cluster of bare-metal machines: `systemd-nspawn` containers, started and stopped by HashiCorp Nomad, sharing state through an encrypted JuiceFS volume, each reaching the internet through its own outbound Cloudflare Tunnel. Every node's disks are encrypted and unlock unattended only into the node's own signed boot.
 
 There is no Kubernetes, image registry or load balancer. Each node compiles its own closure locally from a flake, Nomad only turns pre-built dormant containers on and off, and no inbound port is opened for any application.
 
@@ -15,13 +15,12 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 ## Architecture
 
 - **The topology is the single source of truth.** Nodes, VLANs, addressing, object storage and role tags are one plain Nix attrset. Every module derives its networkd units, nftables ruleset, Nomad settings, quorum membership and Prometheus targets from it.
-- **clan-core is the fleet substrate.** It owns the machine registry, role assignment, the secret lifecycle (`vars`) and bare-metal install. It has no analogue for the orchestration below, which this library owns. The clan inventory is a mechanical projection of the topology.
 - **Bootstrap is push, steady state is pull.** `clan machines install` installs a node (through `avc boot install`, see [Installing a node](#installing-a-node)). After that, every node rebuilds itself from your flake on a timer (`modules/pull-deploy.nix`), so deploying means pushing a commit.
 - **Every node is encrypted unless it says why not.** Both disks are LUKS2 under the ZFS mirror, the boot is signed with keys made on the node, and the TPM releases the disk key only to that signed boot. A node that sets nothing fails to evaluate. See [Encryption](#encryption).
 - **Apps are one short file each.** `apps/<name>.nix` is one `clusterApps.<name>` entry, and its [kind](#kinds) fills in the container, paths, sockets, secrets, backups and ingress. Each entry becomes a dormant container on every node, plus a Nomad job that starts and stops it. No entry names a node: Nomad places every app, and an app's data is where Nomad puts it ([Where an app runs](#where-an-app-runs)).
 - **Ingress is a tunnel per app, over a unix socket.** Each container runs its own `cloudflared` against a unix socket. See [Ingress](#ingress).
 - **Storage has two tiers, and both follow the app.** Local ZFS (`modules/zfs-host.nix`) holds anything latency-sensitive, such as database directories: each app's is a dataset of its own, replicated to every node (`modules/app-state.nix`). JuiceFS over S3 (`modules/storage-juicefs.nix`) holds files: each app has a volume of its own, in a bucket of its own, mounted on the node the app runs on ([An app's files](#an-apps-files)). Its metadata is a PostgreSQL database with a member on every node, which survives the loss of the node holding its primary ([The JuiceFS metadata database](#the-juicefs-metadata-database)). The volume is encrypted, and every mount refuses one that is not.
-- **Secrets are `clan vars`** on clan's plain `age` backend. Values are generated offline, committed encrypted, and decrypted on the host at activation. Containers never hold a key: the plaintext is bind-mounted in.
+- **Secrets are age files, rekeyed per node.** Each is committed encrypted to the operators' master identities (YubiKeys), and [agenix-rekey](https://github.com/oddlama/agenix-rekey) re-encrypts what a node reads to that node's own recipient, whose private half is in the node's TPM. The rekeyed files are committed too, so a node decrypts at activation from its own closure, with no operator and no operator key. A node whose secrets did not all decrypt does not start Nomad, and says so (`SecretsMissing`). Containers never hold a key: the plaintext is bind-mounted in. See [Secrets](#secrets).
 - **No service belongs to one node.** A tag says what a node votes in (`nomad-server`, `etcd`) or that it runs apps (`worker`). Everything else, the JuiceFS metadata database, job registration, Prometheus, Alertmanager and Loki included, runs on every node or every Nomad server.
 - **The private network is not trusted.** Nomad speaks mTLS with a gossip key on the control VLAN. Everything else between nodes (etcd, Loki, Prometheus and its exporters, Vector, the JuiceFS metadata database) listens only on a WireGuard mesh, `wg-ctrl`, over that VLAN. See [The control plane](#the-control-plane).
 
@@ -128,7 +127,7 @@ The network modules were written for bare-metal hosts on OVHcloud's model, and s
 
 ## The interface
 
-The library's flake exports `lib.mkCluster`, which returns the clan-core clan result. A consumer's flake looks like this ([`templates/cluster`](templates/cluster) is a complete one):
+The library's flake exports `lib.mkCluster`, which returns the site's machines and what `agenix rekey` reads. A consumer's flake looks like this ([`templates/cluster`](templates/cluster) is a complete one):
 
 ```nix
 {
@@ -142,19 +141,21 @@ The library's flake exports `lib.mkCluster`, which returns the clan-core clan re
   outputs = inputs@{ self, cluster, ... }:
     let
       topology = import ./topology.nix;
-      clan = cluster.lib.mkCluster {
+      site = cluster.lib.mkCluster {
         inherit self inputs topology;
         directory = ./.;
-        meta = { name = "my-cluster"; domain = "example.com"; };
-        recipients = [ "age1..." ];
+        meta.name = "my-cluster";
+        masterIdentities = [ ./secrets/master/yubikey-1.pub ];
+        extraRecipients = [ "age1..." ];
         admins = [ "ssh-ed25519 AAAA... me@laptop" ];
         appsDir = ./apps;
         hostsDir = ./hosts;
       };
     in
     {
-      inherit (clan.config) nixosConfigurations clanInternals;
-      opsIndex = cluster.lib.mkOpsIndex { inherit clan topology; };
+      inherit (site) nixosConfigurations agenix-rekey;
+      clusterSecrets = site.secrets;
+      opsIndex = cluster.lib.mkOpsIndex { inherit site topology; };
       inherit (cluster) packages devShells;
     };
 }
@@ -162,12 +163,13 @@ The library's flake exports `lib.mkCluster`, which returns the clan-core clan re
 
 | Argument | Required | Meaning |
 | --- | --- | --- |
-| `self` | yes | Your flake. clan builds with `self.inputs.nixpkgs`, falling back to the library's. Use `nixpkgs.follows = "cluster/nixpkgs"` to stay on the tested revision. |
+| `self` | yes | Your flake. The machines are built with `self.inputs.nixpkgs`, falling back to the library's. Use `nixpkgs.follows = "cluster/nixpkgs"` to stay on the tested revision. `agenix rekey` writes below its root. |
 | `inputs` | no | Your flake's inputs, merged with the library's and passed to modules and app files as `inputs`. Yours win, so you can bring your own `frappe-nix`, `odoo-nix` or `wordpress-nix`. Any you don't set come from the library. |
-| `directory` | yes | Where the site's clan state lives (`vars/`, `secrets/`, `inventory.json`). Use `./.`, a path, so each secret's ciphertext joins the system closure. |
+| `directory` | yes | Where the site's secrets live, under `secrets/` (see [Secrets](#secrets)). Use `./.`, a path at your flake's root: `agenix rekey` finds where each node's rekeyed files go by it. |
 | `topology` | yes | See [Topology schema](#topology-schema). |
-| `meta` | yes | `{ name; domain; }`, handed to clan. `name` also signs alert emails. |
-| `recipients` | yes | The operators' age public keys, plus one offline recipient (see [The offline kit](#the-offline-kit)). Anyone listed can decrypt every secret. |
+| `meta` | yes | `{ name; }`. The name signs alert emails and names the binary cache's signing key. Other attributes are ignored. |
+| `masterIdentities` | yes | The operators' age identities, as agenix-rekey's `age.rekey.masterIdentities` takes them: a path to an identity file, or `{ identity; pubkey; }`. Every secret in the repository is encrypted to all of them, and `agenix rekey` decrypts with any one. For a YubiKey, the file `age-plugin-yubikey --identity` prints, which holds no private key and is committed. Anyone holding one can decrypt every secret. |
+| `extraRecipients` | no | age recipients every secret is also encrypted to and that nothing decrypts with day to day: the offline one (see [The offline kit](#the-offline-kit)). |
 | `admins` | yes | The operators' SSH public keys, for `root` and `admin` on every node, and for the initrd's SSH. Empty is an evaluation error, because it would lock you out. |
 | `appsDir` | no | One file per app. `null` means no apps. |
 | `hostsDir` | no | `<name>.nix` per machine, each optional. |
@@ -178,17 +180,27 @@ Other exports:
 
 | Output | What it is |
 | --- | --- |
-| `lib.mkOpsIndex { clan, topology; }` | What `avc` reads, exposed as your flake's `opsIndex`. |
+| `lib.mkOpsIndex { site, topology; }` | What `avc` reads, exposed as your flake's `opsIndex`. `site` is what `mkCluster` returned. |
 | `lib.net`, `lib.juicefs`, `lib.backupTarget`, `lib.mkAppContainer`, `lib.nomad` | The pure helpers the modules use. |
 | `nixosModules.*` | The modules. They read `topology`, `clusterLib` and `clusterSite` from `specialArgs`, which `mkCluster` provides. |
-| `packages.avc`, `devShells.default` | The operations tool, and a shell with `avc`, `clan`, `nomad`, `juicefs`, `age` and friends. |
+| `packages.avc`, `packages.agenix`, `devShells.default` | The operations tool; agenix-rekey's command (`nix run .#agenix -- rekey`, `edit`, `view`), which reads the flake it is run in; and a shell with both, `nomad`, `juicefs`, `age` and its YubiKey and TPM plugins. |
 | `templates.default` | The consumer flake skeleton. |
-| `nixosConfigurations`, `clanInternals`, `opsIndex` | The **fixture** cluster's, for this repository's checks. Yours come from your own `mkCluster` call. |
+| `nixosConfigurations`, `agenix-rekey`, `clusterSecrets`, `opsIndex` | The **fixture** cluster's, for this repository's checks. Yours come from your own `mkCluster` call. |
+
+`mkCluster` returns:
+
+| Attribute | What it is |
+| --- | --- |
+| `nixosConfigurations` | One NixOS system per key of `topology.nodes`. |
+| `agenix-rekey` | What `agenix rekey`, `edit` and `view` read. Export it under that name. |
+| `secrets` | Every machine's secret generators as data (script, prompts, dependencies, and where each file is kept), for the tool that runs them. `nix eval --json .#clusterSecrets.<node>`. |
+| `machineModules` | Each machine as a NixOS module, which the VM tests boot. |
 
 Three things are easy to get wrong:
 
-- **`nix flake check --no-build` evaluates read-only.** With `directory` as a path, clan's interpolation names a store path that a read-only run never adds, so that command fails on a consumer flake whose current source no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures pass a string to get past it, which a real site must not do: a string would keep the secrets out of the closure.
-- **Flakes only see tracked files.** Run `git add` on new apps and vars before you evaluate.
+- **`nix flake check --no-build` evaluates read-only.** agenix-rekey reads a node's rekeyed files through a copy of their directory in the store, which a read-only run never makes (`error: path '/nix/store/…' is not valid`), so that command fails on a flake whose rekeyed files no normal evaluation has copied yet. Plain `nix flake check`, `nix eval` and real builds are unaffected. This repository's fixtures have no recipients and pass `directory` as a string to stay clear of it.
+- **Flakes only see tracked files.** Run `git add` on new apps, secrets and rekeyed files before you evaluate.
+- **A rekeyed file that is missing stops the build.** A node with a recipient whose secret was added or changed and not rekeyed fails to evaluate, with agenix-rekey's "please run `agenix rekey`". A node with no recipient yet evaluates with placeholders that decrypt nowhere, and a warning.
 
 ## Encryption
 
@@ -210,6 +222,7 @@ Conventional access to the hosting provider's side of a machine must not be enou
 | Backups | restic, with each app's repository at a salted hash of its name. |
 | The state backup | Restic, like the nightly backup and under the same password, at a salted hash of the app's name that is not the nightly repository's. See [Backups and restore](#backups-and-restore). |
 | Between nodes | Nomad mTLS and gossip key; everything else on the WireGuard mesh. |
+| A node's secrets | In its closure and in the repository, each encrypted to an age identity whose private half is in that node's TPM. The identity file that names the key to the TPM is on the node's encrypted disk and not in the repository: the TPM key is bound to no boot state, so the disk is what keeps a rescue boot from using it. In memory once decrypted, on a tmpfs that never swaps. |
 
 Unattended unlock needs no person and no network, and never stands in a person's way. A typed passphrase always works: on the console, a BMC KVM, or over SSH into the initrd (`avc boot unlock`). If the TPM refuses, the node waits at the prompt.
 
@@ -220,8 +233,10 @@ Two records watch this: each node's **boot report** (`modules/boot-report.nix`: 
 | Thing | Where | Notes |
 | --- | --- | --- |
 | Topology, apps, hosts | `topology.nix`, `apps/`, `hosts/` | The site's description, in plain Nix. |
-| Vars ciphertext and public values | `secrets/`, `vars/` | See [Secrets](#secrets). `git add` and commit them before any install: flakes only see tracked files, and `avc boot preflight` refuses uncommitted vars. |
-| Age recipients | `recipients` in `flake.nix` | The operators, plus one **offline** recipient that exists only on paper or sealed media. After adding a recipient, run `clan vars fix <machine>` for each machine (`avc secrets fix` does every one): partitioning secrets are encrypted to each machine's key, and that key to the recipients. |
+| Secrets and public values | `secrets/shared/`, `secrets/per-machine/<node>/` | One file per generator file: `<generator>/<file>.age`, encrypted to the master identities, or `<generator>/<file>` in the clear for a public value. No node can read a `.age` file here. See [Secrets](#secrets). |
+| What each node reads | `secrets/rekeyed/<node>/` | `agenix rekey`'s output: each secret the node is given, re-encrypted to that node's recipient. These are the files in a node's closure. Commit them with the secret they came from. |
+| Each node's recipient | `secrets/recipients/<node>.pub` | The public half of the node's age identity (age-plugin-tpm), whose private half never leaves its TPM. A node without one is given placeholders. |
+| Master identities | `masterIdentities` and `extraRecipients` in `flake.nix` | The operators' YubiKey identities, plus one **offline** recipient that exists only on paper or sealed media. After changing them, `agenix update-masterkeys` re-encrypts every secret to the new set. |
 | `secrets/policy.toml` | `avc`'s rotation policy | The template's marks `luks`, `volume-identity`, `juicefs-rsa` and `restic` never, and `nomad-ca`, `nomad-jwt`, `wg-ctrl` and `juicefs-pg` manual. `avc` refuses the never-ones in code too. |
 
 **Name a second unlocker for each site**: a second person with their own age identity in `recipients`, an SSH key in `admins`, and access to the provider's console, who has run `avc boot unlock` once. Unattended unlock depends on the TPM and an unchanged PCR 7; a typed passphrase depends on a person.
@@ -242,7 +257,7 @@ With the bundle and the offline identity, `clan vars get` gives back every other
 
 `nodes.<n>.insecurePlaintextBoot = "<reason>"` is the one switch, per node. That node gets plain disks, systemd-boot, no Secure Boot, no TPM binding, no initrd SSH and no volume identity. Every evaluation warns, the node exports `cluster_boot_insecure_optout 1`, and `BootSecurityOptedOut` fires. Nothing else changes: Nomad mTLS, the mesh, the raw_exec lockdown, default-deny and the encrypted JuiceFS volume have no opt-out.
 
-Like every node, an opted-out one holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) beside the age key that decrypts them, so one pulled drive of it reads every client's files and backups, whatever runs on it. The site has to say it knows: `insecureFleetKeysOnPlaintextDisk = "<reason>"` at the top level, or evaluation fails. The test fixtures opt out on every node; a real site should not.
+Like every node, an opted-out one holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) as ciphertext on its plaintext disk, and its TPM decrypts them for whatever is booted on the machine: the node's age identity is bound to the TPM, not to a boot state. So a rescue boot of it reads every client's files and backups, whatever runs on it. The site has to say it knows: `insecureFleetKeysOnPlaintextDisk = "<reason>"` at the top level, or evaluation fails. The test fixtures opt out on every node; a real site should not.
 
 Without the opt-out, evaluation fails unless the **resulting** configuration has LUKS under the pool, Lanzaboote, the TPM option on every leg, the identity check and the rest. The assertions read results, not intent: a host file that swaps the disk layout fails too.
 
@@ -456,7 +471,7 @@ What the node held, and what replaces it:
 | On the node | How it is replaced |
 | --- | --- |
 | Client data: every app's local state, since each node holds a copy of each app's ([Where an app runs](#where-an-app-runs)), and through its mount every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
-| The machine's age key (`/etc/secret-vars/key.txt`), which decrypts that machine's vars at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
+| The machine's age identity (the key in its TPM, and the identity file on its disk), which decrypts everything rekeyed to that machine at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
 | `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
 | `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
@@ -570,7 +585,7 @@ Accepted, and written here so they are accepted knowingly.
 - **The emergency password** still opens a root shell in the initrd that can read whatever is unlocked and destroy data, even with PCR 7 burned. It is 32 random bytes and is held like the passphrase (D3).
 - **A forged pool is parsed by the kernel's ZFS before the identity check.** A crafted pool could attack the kernel; that needs an exploit and is beyond conventional access.
 - **An old LUKS header copy with the old passphrase stays valid** until `cryptsetup reencrypt`; changing the passphrase does not change the volume key.
-- **The passphrase's ciphertext is in git for good,** decryptable with an operator's age key or the machine's. The answer to a lost operator key is `cryptsetup reencrypt`.
+- **The passphrase's ciphertext is in git for good,** decryptable with an operator's master identity or the offline one; it is rekeyed to no machine. The answer to a lost operator key is `cryptsetup reencrypt`.
 - **`allowDiscards`** shows which blocks are free.
 - **A stolen gossip key plus a server's certificate makes a Nomad voter** within about 20 seconds, with the tokens in raft state. That is why both stay off workers. Root on a server can always mint a management token.
 - **A stolen client certificate can register a Nomad client,** and the scheduler can place work on it. Job specs hold only store paths and names. A machine's pre-signed login JWTs are long-lived; retiring them means a new `nomad-jwt` signing key.
@@ -615,7 +630,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `backup.retention` | `{ daily; weekly; monthly; }`. |
 | `backup.uploadLimitKiB` | restic upload limit. `0` means unlimited. |
 | `stateVersion` | `system.stateVersion` for the whole fleet. |
-| `insecureFleetKeysOnPlaintextDisk` | Required, as `"<reason>"`, once any node sets `nodes.<n>.insecurePlaintextBoot`. Every node holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) beside the age key that decrypts them, so one opted-out node's disk reads every client's files and backups, whatever runs on it. Test fixtures only. |
+| `insecureFleetKeysOnPlaintextDisk` | Required, as `"<reason>"`, once any node sets `nodes.<n>.insecurePlaintextBoot`. Every node holds the fleet's shared keys (`juicefs-rsa`, `ovh-s3`, `restic`, `backup-target`) as ciphertext its TPM decrypts for whatever is booted on the machine, so a rescue boot of one opted-out node reads every client's files and backups, whatever runs on it. Test fixtures only. |
 | `insecureSingleMemberEtcd` | Test fixtures only: `"<reason>"` lets exactly one node carry `etcd`. Such an etcd can never grow (see the tag table below). Leave it out of a real site. |
 | `nodes.<name>` | One per machine. See below. |
 
@@ -801,6 +816,18 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
 
+**How a secret reaches a node.** A generator's file that is secret, deployed and read by services is an agenix secret on every node that declares it, at `/run/secrets/shared/<generator>/<file>` or `/run/secrets/per-machine/<node>/<generator>/<file>`. Its source in the repository is encrypted to the master identities; `agenix rekey` re-encrypts it to each such node's recipient under `secrets/rekeyed/<node>/`, and activation decrypts that with the node's TPM into a tmpfs that never swaps. A file marked never deployed (an operator's secret, or one only another generator reads) and a file read only at install (`luks`, `volume-identity`, `initrd-ssh`) are rekeyed to no node and are in no closure.
+
+**When it does not.** agenix carries on past a file it cannot decrypt, so the boot completes without it. `cluster-secrets.service` then fails, Nomad and the units that wait for it are not started on that boot (`cluster.secrets.gate`), and `cluster_secrets_missing` counts the files (`SecretsMissing`); SSH, the network and the pull loop are untouched, so the node can be reached and can pull the commit that repairs it. A check every minute keeps the count current on a running node, where a failed switch removes the previous values too.
+
+```sh
+nix run .#agenix -- rekey -a               # after a secret or a recipient changed; commit the result
+nix run .#agenix -- edit secrets/shared/<generator>/<file>.age
+nix run .#agenix -- view secrets/shared/<generator>/<file>.age
+```
+
+The commands below are the previous tooling's and no longer exist; `avc` still calls them (see [Known limitations](#known-limitations)).
+
 ```sh
 clan vars list node1
 clan vars generate node1
@@ -815,7 +842,7 @@ Rotation notes:
 - **`nomad-gossip`:** Nomad copies the key into `<data_dir>/server/serf.keyring` on first start, so a new `gossip.hcl` changes nothing on a running server. Rotate with `nomad operator gossip keyring` (install, use, remove), then regenerate the var to match.
 - **`nomad-ca`:** regenerating reissues every machine's certificates: a hard cut, every node at once. `security.nomadTlsRotation` reissues the agent certificates alone. `NomadTlsCertExpiring` and `NomadTlsCaExpiring` warn first.
 - **`nomad-jwt`:** regenerating reissues every node's logins, and each server's `nomad-acl-init` updates the auth method on its next switch. Manual in the policy.
-- **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots, and its mesh services retry.
+- **`wg-ctrl`:** both ends of a link must switch: a node with a new key is cut off from each peer until that peer lists the new public key, and back within seconds after. Manual in the policy. A node with no mesh key still boots and stays reachable, and its mesh services retry; like any node short of a secret it starts no Nomad on that boot ([Secrets](#secrets)).
 - **`audit`:** a new token must reach the Worker (`avc audit tokens | wrangler secret put AUDIT_TOKENS`), or that node's events are refused (`AuditEventRejected`).
 - **`ci`:** a new token must reach the Worker (`avc ci tokens | wrangler secret put AGENT_TOKENS`), or that node's agent is refused: it then deploys on the timer alone, and its previews stand still.
 - **`canary`:** harmless to regenerate; the next scan plants the new value.
@@ -850,9 +877,9 @@ ssh root@node1 rm /run/cluster-upgrade.hold          # or: avc deploy release no
 
 The hold lives in `/run`, so a forgotten one clears on reboot. Automated holds (a backup dumping a database, a restore) use one file each in `/run/cluster-upgrade.hold.d/`, so they cannot release each other, and `avc boot reboot` refuses while any is set. Keep a console open for changes to `br-wan` or the WAN stanza: on a remote machine a mistake there is a lockout.
 
-**New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, clan-core, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
+**New boot stacks go to the canary first.** What a boot is built from and every node shares, the nixpkgs source, the kernel, agenix, agenix-rekey, Lanzaboote, disko and this library's `modules/` and `lib/`, is written into each closure as `boot-stack`, each named by its lock's narHash or a content-addressed store path, so every node renders the same file whichever Nix it evaluates with, lazy trees or not. A bump of any of them changes no boot contract, reaches every node within the pull interval, and first runs at the next reboot, on all of them. So the node with `canary = true` activates a new boot stack at once, like any closure, and every other node builds it and waits: nothing activated, its profile and boot entry left on the old stack, `cluster_deploy_canary_wait 1` (`DeployWaitingForCanary` after a day). Reboot the canary, `avc boot reboot <canary>`, and watch it. Once that boot has unlocked from the TPM on every leg, and the boot report says so, it writes `/mnt/jfs/.cluster-deploy/canary-booted/<sha256 of boot-stack>`, and the others activate the stack at their next tick. A switch is not a boot, and a boot someone had to type the passphrase for proves nothing (`CanaryBootUnproven`), so neither publishes. App releases and topology edits on the same stack never wait. If the canary cannot be rebooted, list the closure's basename in `/run/cluster-upgrade.skip-canary` on each node you accept it on; it clears at reboot. `clan machines update` bypasses this, as it bypasses the pull loop.
 
-Bump `clan-core` alone, as one reviewable commit. It tracks clan's unstable channel, and `checks.clan-coexist` is what catches an upstream change to host configuration. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
+Bump `agenix` and `agenix-rekey` alone, each as one reviewable commit: they decide what every node decrypts at activation. A site's private repository should merge library and lock bumps only through its merge gate: see "Merging safely" in [`templates/cluster/README.md`](templates/cluster/README.md).
 
 ### Previews and continuous deployment
 
@@ -971,7 +998,7 @@ Then `avc cloud apply` (the bucket and its key), `clan vars generate <node>` (`c
 
 - **Every store path the cluster built**, to anyone who knows or can compute its name. That includes each node's whole system closure: the rendered configuration of every service and every app, which is your private repository's `apps/` and topology in built form (hostnames, addresses, firewall rules, job specifications, package versions).
 - **Your apps' own code**, as built packages, if the projects are private.
-- **Not the secrets.** They are clan vars, decrypted on the node into `/run/secrets` and never part of a store path. That holds for what this library writes; a value you put in an app's `module` as a string is in the store, and so in the cache.
+- **Not the secrets in the clear.** A node's rekeyed files are in its closure, encrypted to the key in its TPM; what is decrypted goes to `/run/secrets` and is never part of a store path. That holds for what this library writes; a value you put in an app's `module` as a string is in the store, and so in the cache.
 
 Attic does not list a cache's contents, and a store path's name starts with a hash of everything it was built from, so a path is fetched by someone who has its name: from a deployed system's closure, or by evaluating the same flake. Treat that as slowing a reader down, not stopping one. If other people should have the apps' packages and not your cluster's configuration, a public cache is the wrong tool as it stands: it pushes whole system closures.
 
@@ -1084,6 +1111,7 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `CanaryFound` | critical | The canary turned up in plaintext somewhere it must never be: find the writer. |
 | `CanaryScanStale` | warning | The canary scan has not run for 8 days. |
 | `JuiceFSVolumeNotEncrypted` | critical | A node refused a JuiceFS volume that is not encrypted. |
+| `SecretsMissing` | critical | Secrets the node was given did not decrypt: its TPM does not hold the identity they were rekeyed to. A boot that began this way did not start Nomad. |
 | `JuiceFSUnwritable` | critical | `/mnt/jfs` is not writable. |
 | `JuiceFSProbeStale` | warning | The JuiceFS probe has not run. |
 | `JuiceFSMetaDumpStale` | warning | The newest metadata dump in the bucket is old, or a volume has gone that long without writing its first. |
@@ -1190,7 +1218,7 @@ This version is written for fresh installs. A cluster running an earlier version
 
 Everything runs against the **fixture cluster** in [`tests/fixtures`](tests/fixtures), which is built through `mkCluster` the way a consumer's is. Its public addresses are documentation-only (RFC 5737, RFC 3849) and its names are under `example.com` and `example.net`. Its internal VLANs are RFC 1918, because the documentation ranges have no /16 to split into per-node subnets. It has `node1` with every role, placeholders `node2` and `node3`, and neutral apps of every kind, with stub packages for Odoo and Frappe. Every fixture node opts out of boot security, because a VM test of a cluster has no TPM; the `boot-*` checks install and boot the encrypted layout themselves, and `tests/fixtures/secure` is node1 with boot security on, evaluated by `security-policy` and `boot-closure`.
 
-No secret is committed. `tests/fixtures/secrets` holds placeholders that are not ciphertext, because `lib/mk-app-container.nix` asserts that every secret an app mounts exists. `tests/fixtures/update-secrets.sh` regenerates them after you add a fixture app or change a generator.
+No secret is committed. `tests/fixtures/secrets` holds placeholders that are not ciphertext, because a secret with no file is not given to a node and `lib/mk-app-container.nix` asserts that every secret an app mounts exists. `tests/fixtures/update-secrets.sh` regenerates them after you add a fixture app or change a generator.
 
 ```sh
 nix build -L .#checks.x86_64-linux.<name>        # one check
@@ -1216,7 +1244,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
 | `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
 | `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
-| `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that `clan vars generate` can read every generator of a new site. Evaluation only. |
+| `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that every generator of a new site can be read. Evaluation only. |
 | `security-policy-fixture` | The posture checks that need a whole fixture system per node. |
 | `boot-closure` | What can be proven about an encrypted closure without booting it: the ESP budget, the initrd's contents (one without TPM support fails the build), and when the boot contract moves (not on a kernel bump; on every field an unlock depends on). |
 | `boot-install` | An encrypted node installed with the real disko script, under Secure Boot with keys made on the node: unattended unlock from the TPM on both legs, with and without a network, bind refused in Setup Mode, one leg rebound, a second kernel and generation on both ESPs. |
@@ -1234,7 +1262,6 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `jfs-encrypted` | The JuiceFS volume is encrypted; a plaintext one is refused at format and at mount; restore works with the key, only with the key, and from the offline kit alone; stale dumps, interrupted loads, S3 key rotation. |
 | `canary-scan` | Per class: plant the canary, scan, found; remove it, scan, not found. Swap plain against dm-crypt, a plaintext bucket against an encrypted one, a real compressed core a grep can't see into. |
 | `container-tunnel` | The generated container, tunnel and firewall wiring. |
-| `clan-coexist` | clan-core is not overriding the host configuration it must not touch. Run it on every clan bump. |
 | `backup` | What the fixture apps generate: engine detection, units, salted repository paths, target URLs. |
 | `freeipa` | FreeIPA's wiring, and Authelia's own `validate-config` over its generated config. |
 | `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool). |
@@ -1251,7 +1278,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `ci-workflows` | The workflows in `.github/` and the template's pass actionlint, keep the properties the merge gates rest on (one evaluation per check, never `nix flake check`, a gate that fails on anything but success), and `tools/ci` fails loudly, against a stub `nix`. |
 | `eval-memory` | Every check and mutant is detached, so `nix flake check` does not keep every evaluation to the end, and detaching keeps the same `.drv` and the interactive driver. |
 
-The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths clan's age backend would decrypt to, NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
+The VM tests take the real machine modules and change only what a VM cannot have (`tests/lib/cluster-harness.nix`, `tests/lib/boot-harness.nix`): fixture values are written to the paths agenix would decrypt to, NICs carry the topology's names, a `wan` VM holds the nodes' gateways and answers for the object-storage hostnames, and the pull timer is unhooked. The test network has no route out. The boot tests run OVMF with Secure Boot and a software TPM, and a `peer` VM that types the passphrase over SSH.
 
 ### Continuous integration
 

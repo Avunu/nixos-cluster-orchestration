@@ -1,7 +1,7 @@
 # VM test: backup → damage → restore, for real, against an S3 server in the VM.
 #
 # Runs the REAL modules/backup-core.nix (not a copy) with plain credential
-# files instead of clan vars, and two ordinary NixOS containers standing in for
+# files instead of the site's secrets, and two ordinary NixOS containers standing in for
 # apps: one on PostgreSQL, one on MariaDB, each with a dummy "app" unit ordered
 # after its database -- which cluster-restore must stop and start again. A
 # third app has no database, only files. A fourth keeps its state in local

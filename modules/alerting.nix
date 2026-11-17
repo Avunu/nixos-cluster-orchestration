@@ -1,4 +1,4 @@
-# modules/alerting.nix — alerting, wired to topology, clusterApps and clan vars.
+# modules/alerting.nix — alerting, wired to topology, clusterApps and the site's secrets.
 #
 # Imported by modules/monitoring-server.nix, so it runs on every node, next to that
 # node's Prometheus. Each node evaluates the same rules over the same targets and
@@ -9,7 +9,7 @@
 #   cluster-alert-test      fire a test alert through the whole path
 #
 # Recipients and sender: topology.alerting. The Cloudflare token:
-#   clan vars set <node> alerting/cf-email-token
+#   agenix edit secrets/shared/alerting/cf-email-token.age
 {
   config,
   lib,
@@ -18,6 +18,7 @@
   node,
   nodeName,
   clusterLib,
+  clusterSite,
   ...
 }:
 let
@@ -41,8 +42,8 @@ in
   imports = [ ./alerting-core.nix ];
 
   # Shared with the cluster-watchdog Worker (wrangler secret put WATCHDOG_TOKEN
-  # < <(clan vars get node1 alerting-watchdog/token)).
-  clan.core.vars.generators.alerting-watchdog = {
+  # < <(agenix view secrets/shared/alerting-watchdog/token.age)).
+  cluster.secrets.generators.alerting-watchdog = {
     share = true;
     files.token = { };
     runtimeInputs = [
@@ -54,7 +55,7 @@ in
     '';
   };
 
-  clan.core.vars.generators.alerting = {
+  cluster.secrets.generators.alerting = {
     share = true;
     prompts.cf-email-token = {
       description = "Cloudflare API token, Email Sending permission only (alert emails)";
@@ -73,9 +74,9 @@ in
       port = net.alertmanagerClusterPort;
     };
     report.self = "${net.meshIp topology node}:${toString net.nodeExporterPort}";
-    clusterName = config.clan.core.settings.name;
+    clusterName = clusterSite.name;
     inherit (topology.alerting) cloudflareAccountId from to;
-    tokenFile = config.clan.core.vars.generators.alerting.files.cf-email-token.path;
+    tokenFile = config.cluster.secrets.generators.alerting.files.cf-email-token.path;
     backupApps = lib.attrNames backedUp;
     verifiedApps = lib.attrNames (lib.filterAttrs isVerified backedUp);
     freeipaApps = lib.attrNames (lib.filterAttrs (_: a: a.freeipa != null) apps);
@@ -95,7 +96,7 @@ in
     );
     heartbeat = lib.optionalAttrs (topology.alerting.heartbeatUrl or null != null) {
       url = topology.alerting.heartbeatUrl;
-      tokenFile = config.clan.core.vars.generators.alerting-watchdog.files.token.path;
+      tokenFile = config.cluster.secrets.generators.alerting-watchdog.files.token.path;
     };
     targetProbes =
       lib.optional (target.type == "s3") target.endpoint

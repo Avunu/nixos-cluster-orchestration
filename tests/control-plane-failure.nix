@@ -39,10 +39,12 @@
 #                                once the link returns (mutant
 #                                `nomad-start-limit-default`)
 #   missing-wg-key-boots         node1 boots with no mesh key: no interface, the boot
-#                                completes, the mesh services wait; with the key back
-#                                (and nothing restarted by hand) node2's JuiceFS client
-#                                works again: Patroni waits for its etcd, and the
-#                                metadata database is back with nothing done by hand
+#                                completes, the mesh services wait, and Nomad is not
+#                                started (the secrets gate); with the key back and
+#                                what a switch does on top (networkd restarted,
+#                                default.target started) node2's JuiceFS client works
+#                                again: Patroni waits for its etcd, and the metadata
+#                                database is back with nothing else done by hand
 #
 # Every job is held off the fixture's own apps (node pool `ci-hold`), as in
 # tests/cluster-single.nix; the test places its own.
@@ -51,7 +53,7 @@
 {
   pkgs,
   lib,
-  mkClan,
+  mkSite,
   topology,
   harnessFor,
   mutant ? "",
@@ -61,19 +63,19 @@ let
   testTopology = lib.recursiveUpdate topology {
     nodes.node2.provisioned = true;
   };
-  clan = mkClan testTopology;
+  site = mkSite testTopology;
   harness = harnessFor testTopology;
   net = import ../lib/net.nix { inherit lib; };
   clusterLib = import ../lib { inherit lib; };
   nomadPki = import ../lib/nomad-pki.nix { inherit lib; };
   wg = harness.wg;
   pki = harness.pki;
-  machines = clan.config.nixosConfigurations;
+  machines = site.nixosConfigurations;
   cfg1 = machines.node1.config;
   cfg2 = machines.node2.config;
 
-  keyPath = n: machines.${n}.config.clan.core.vars.generators.wg-ctrl.files.private.path;
-  tlsPath = n: f: machines.${n}.config.clan.core.vars.generators.nomad-tls.files.${f}.path;
+  keyPath = n: machines.${n}.config.cluster.secrets.generators.wg-ctrl.files.private.path;
+  tlsPath = n: f: machines.${n}.config.cluster.secrets.generators.nomad-tls.files.${f}.path;
 
   # What a switch would do to node1's netdev once node2's rotated key is committed:
   # the real module's rendering of it, for node1, with that one key changed. The test
@@ -172,7 +174,7 @@ let
   noKeyModule =
     { lib, ... }:
     {
-      system.activationScripts.ci-no-wg-key = lib.stringAfter [ "setupSecrets" ] ''
+      system.activationScripts.ci-no-wg-key = lib.stringAfter [ "fixtureSecrets" ] ''
         if [ -e /var/lib/ci-no-wg-key ]; then rm -f ${keyPath "node1"}; fi
       '';
     };
@@ -187,7 +189,7 @@ pkgs.testers.runNixOSTest {
     wan = harness.wanNode;
     node1 = {
       imports = [
-        clan.config.nixosModules."clan-machine-node1"
+        site.machineModules.node1
         (harness.nodeModule { memoryMB = 3584; })
         noKeyModule
         extraModule
@@ -196,7 +198,7 @@ pkgs.testers.runNixOSTest {
     };
     node2 = {
       imports = [
-        clan.config.nixosModules."clan-machine-node2"
+        site.machineModules.node2
         (harness.nodeModule { memoryMB = 2048; })
         extraModule
       ];
@@ -229,7 +231,7 @@ pkgs.testers.runNixOSTest {
         ("node1", "${tlsPath "node1" "agent.crt"}", "${tlsPath "node1" "agent.key"}"),
         ("node2", "${tlsPath "node2" "agent.crt"}", "${tlsPath "node2" "agent.key"}"),
     ]}
-    GOSSIP = "${cfg1.clan.core.vars.generators.nomad-gossip.files."gossip.hcl".path}"
+    GOSSIP = "${cfg1.cluster.secrets.generators.nomad-gossip.files."gossip.hcl".path}"
     NODES = [node1, node2]
     VRACK2 = "${testTopology.nodes.node2.vrackInterface}"
     CTRL_VLAN = ${toString testTopology.vlans.control.id}
@@ -528,11 +530,18 @@ pkgs.testers.runNixOSTest {
             pg_up = node1.execute("systemctl is-active --quiet patroni.service")[0] == 0
             pg_pid = node1.succeed("systemctl show -p MainPID --value patroni.service").strip()
             stuck = not jfs_write(node2, "ci-while-keyless", 10)
-            # The repair: the key back where the vars put it, and the restart a switch with
-            # a new ciphertext would do (wg-key-rotation-restarts-networkd). Nothing else.
+            # A boot short of a secret takes no work: the gate failed, and Nomad with it
+            # (modules/secrets.nix).
+            gate = node1.succeed("systemctl show -p ActiveState --value cluster-secrets.service").strip()
+            nomad_held = node1.succeed("systemctl show -p ActiveState --value nomad.service").strip()
+            # The repair: the key back where the secrets put it, and what a switch that
+            # decrypts it again does: the restart for a new ciphertext
+            # (wg-key-rotation-restarts-networkd), and default.target started, which runs
+            # the gate again and then Nomad. Nothing else.
             node1.succeed("rm -f /var/lib/ci-no-wg-key")
             set_key(node1, "node1")
             node1.succeed("systemctl restart systemd-networkd")
+            node1.succeed("systemctl start --no-block default.target")
             node1.wait_until_succeeds(f"ip -4 -o addr show dev {MESH_IF} | grep -qF ' {M1}/'", timeout=60)
             start = time.monotonic()
             recovered = None
@@ -543,16 +552,17 @@ pkgs.testers.runNixOSTest {
                 time.sleep(3)
             same_pg = node1.succeed("systemctl show -p MainPID --value patroni.service").strip() == pg_pid
             # The mesh-bound units on node1 came up by themselves too.
-            units = ["etcd", "prometheus-node-exporter", "loki", "vector", "prometheus", "juicefs-mount"]
+            units = ["etcd", "prometheus-node-exporter", "loki", "vector", "prometheus", "juicefs-mount", "nomad"]
             def all_active(_):
                 return all(node1.execute(f"systemctl is-active --quiet {u}.service")[0] == 0 for u in units)
             retry(all_active, timeout_seconds=300)
             states = {u: node1.succeed(f"systemctl show -p ActiveState --value {u}.service").strip() for u in units}
             detail = (f"booted without the key: key absent={key_absent}, no {MESH_IF}={no_if}, {MESH_IF}-ready exited and said so={ready_said};"
-                      f" patroni up={pg_up}; node2 could not write meanwhile={stuck};"
+                      f" patroni up={pg_up}; node2 could not write meanwhile={stuck}; cluster-secrets {gate}, nomad {nomad_held};"
                       f" after the repair node2 wrote after {recovered}s, patroni not restarted={same_pg}; node1's mesh units {states}")
             print(f"missing-wg-key-boots: {detail}")
-            control("missing-wg-key-boots", key_absent and no_if and ready_said and pg_up and stuck, detail)
+            control("missing-wg-key-boots", key_absent and no_if and ready_said and pg_up and stuck
+                    and gate == "failed" and nomad_held == "inactive", detail)
             control("missing-wg-key-boots-recovers", recovered is not None and same_pg, detail)
 
         with subtest("control-vlan-late-nomad-waits: node2 boots with its vRack trunk without carrier, and Nomad waits"):

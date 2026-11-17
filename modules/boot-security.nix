@@ -8,8 +8,8 @@
 # of them, one forced control at a time.
 #
 # This is fail-closed by construction: a new site that fills in nothing fails, and
-# says what to do. They are assertions rather than `throw`s because `clan vars
-# generate` evaluates the machine to discover its generators, before any of the
+# says what to do. They are assertions rather than `throw`s because generating
+# a node's secrets evaluates the machine to discover its generators, before any of the
 # values below can exist (lib/mk-app-container.nix documents the same rule). A
 # throw would stop a new site from ever generating them. Assertions fire only when
 # the toplevel is forced.
@@ -33,7 +33,7 @@ let
   optedOut = optOut != null;
   fleetKeysAck = topology.insecureFleetKeysOnPlaintextDisk or null;
 
-  gens = config.clan.core.vars.generators;
+  gens = config.cluster.secrets.generators;
   security = topology.security or { };
   nicModules = node.initrdNicModules or [ ];
 
@@ -104,10 +104,11 @@ in
     # Keeping client data off such a node protects nothing. Every node holds the fleet's
     # shared secrets whatever runs on it: the JuiceFS volume's key and passphrase
     # (juicefs-rsa), the S3 pair (ovh-s3), the restic password and the backup target's
-    # credentials, all `share = true`. On a plaintext disk they sit next to the machine's
-    # age key (/etc/secret-vars/key.txt) and their ciphertext in the store, so one pulled
-    # or rescue-booted opted-out node decrypts them offline and, with the bucket, reads
-    # every client's files and every backup. So the opt-out takes a second, site-wide
+    # credentials, all `share = true`. Their ciphertext is in the store on a plaintext
+    # disk, and the machine's TPM decrypts it for whatever boots there: the node's age
+    # identity is bound to the TPM and to no boot state. So a rescue-booted opted-out
+    # node decrypts them and, with the bucket, reads every client's files and every
+    # backup. So the opt-out takes a second, site-wide
     # reason that says exactly that (topology.insecureFleetKeysOnPlaintextDisk), as the
     # one-member etcd does, and the warning and BootSecurityOptedOut say it too.
     (lib.mkIf optedOut {
@@ -116,8 +117,9 @@ in
         (
           "node ${nodeName} opted out of boot security (insecurePlaintextBoot): ${toString optOut}."
           + " Its disks are plaintext and it has no Secure Boot, and it holds the fleet's shared keys"
-          + " (JuiceFS volume key, S3, restic, backup target) next to its age key: one pulled drive"
-          + " reads every client's files and backups, whatever runs on it."
+          + " (JuiceFS volume key, S3, restic, backup target) where anything booted on the machine"
+          + " can have its TPM decrypt them: a rescue boot reads every client's files and backups,"
+          + " whatever runs on it."
         )
       ];
       assertions = [
@@ -139,18 +141,18 @@ in
 
     # ── not opted out ───────────────────────────────────────────────────────
     (lib.mkIf (!optedOut) {
-      # Partitioning secrets are the one safe exception to
-      # "every secret is neededFor = services" (tests/clan-coexist.nix): they are
-      # needed only at install, when clan uploads them, never by the pull loop.
-      # tests/security-policy.nix holds them to an exact allowlist.
+      # Partitioning secrets are the one exception to "a node decrypts what it reads
+      # from its own closure" (modules/secrets.nix): they are needed only at install,
+      # when whatever installs the node puts them there, never by the pull loop, and
+      # they are rekeyed to no node. tests/security-policy.nix holds them to an exact
+      # allowlist.
       #
       # `luks` and `volume-identity` must never be regenerated once a node is
-      # installed: the disks and the identity check are bound to these values. Plain
-      # `clan vars generate <node>` leaves a generator alone only while every one of
-      # its files exists and its validation hash matches, so adding a file or a
-      # `validation` here replaces the values on the next run. And `--generator` is
-      # not a filter: it reruns the generator named, with or without `--regenerate`.
-      clan.core.vars.generators = {
+      # installed: the disks and the identity check are bound to these values. A
+      # generator is stale when one of its files is missing or its validation hash
+      # differs, so adding a file or a `validation` here replaces the values on the
+      # next run.
+      cluster.secrets.generators = {
         luks = {
           files.passphrase.neededFor = "partitioning";
           runtimeInputs = [
@@ -312,9 +314,7 @@ in
           ))
           "boot.initrd.luks.devices has a device without tpm2-device=auto in crypttabExtraOpts: that leg can ask for the passphrase before the TPM is there to answer."
         )
-        (refuseUnless config.boot.initrd.systemd.tpm2.enable
-          "boot.initrd.systemd.tpm2.enable must be true: without it the initrd cannot open a leg from its TPM slot."
-        )
+        (refuseUnless config.boot.initrd.systemd.tpm2.enable "boot.initrd.systemd.tpm2.enable must be true: without it the initrd cannot open a leg from its TPM slot.")
         # A crypt(3) hash, so never `true` (no password at all) and never "": nixpkgs
         # treats any string as access granted, and writes it as root's password
         # field, where an empty one again means no password.
@@ -333,11 +333,14 @@ in
         (refuseUnless config.boot.initrd.network.flushBeforeStage2 "boot.initrd.network.flushBeforeStage2 must be true: initrd addresses must not leak into stage 2.")
 
         # ── generated values ──────────────────────────────────────────────────
-        (refuseUnless (
-          gens.volume-identity.files.hash.exists
-          && gens.emergency-access.files.hash.exists
-          && gens.initrd-ssh.files."ssh_host_ed25519_key.pub".exists
-        ) "boot vars are missing. Run: clan vars generate ${nodeName}, then git add vars secrets.")
+        (refuseUnless
+          (
+            gens.volume-identity.files.hash.exists
+            && gens.emergency-access.files.hash.exists
+            && gens.initrd-ssh.files."ssh_host_ed25519_key.pub".exists
+          )
+          "boot secrets are missing. Generate ${nodeName}'s secrets (luks, volume-identity, initrd-ssh, emergency-access), then git add secrets."
+        )
 
         # ── topology ──────────────────────────────────────────────────────────
         (refuseUnless (builtins.isList nicModules && nicModules != [ ])

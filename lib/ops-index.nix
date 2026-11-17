@@ -4,7 +4,7 @@
 # Derived, never edited: nodes come from the topology and apps from the
 # evaluated clusterApps of one node, so the tool cannot drift from what is
 # actually deployed. One eval instead of the tool scraping apps/ and topology,
-# and the only place that knows which app consumes which vars generator —
+# and the only place that knows which app consumes which generator —
 # which is how a rotation knows what to restart.
 {
   lib,
@@ -36,7 +36,7 @@ let
     ++ lib.optional (a.tunnel.credentials != null) { inherit (a.tunnel.credentials) generator file; };
 in
 {
-  # A machine to read and write shared vars through, and whose evaluation the
+  # A machine to read and write shared secrets through, and whose evaluation the
   # catalogue above came from. Not a node anything runs on: avc asks whichever
   # node answers.
   inherit reference;
@@ -56,7 +56,7 @@ in
       # Nomad servers hold.
       nomad =
         let
-          tls = clusterLib.nomadPki.cliTlsFor cfg.clan.core.vars.generators;
+          tls = clusterLib.nomadPki.cliTlsFor cfg.cluster.secrets.generators;
         in
         {
           addr = clusterLib.net.nomadAddr node;
@@ -69,7 +69,7 @@ in
       # It is readable on the ESP too, so it stops accidents, not someone who read the disk.
       boot =
         let
-          gens = cfg.clan.core.vars.generators;
+          gens = cfg.cluster.secrets.generators;
           pub = if gens ? initrd-ssh then gens.initrd-ssh.files."ssh_host_ed25519_key.pub" else null;
         in
         {

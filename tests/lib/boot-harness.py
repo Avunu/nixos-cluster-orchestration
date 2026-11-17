@@ -107,7 +107,7 @@ def installer_up(disks):
 
 
 def seed_secrets(identity=True):
-    """/run/partitioning-secrets, at the paths clan would upload to."""
+    """/run/partitioning-secrets, at the paths an install puts them."""
     installer.succeed(
         f"install -D -m 0400 /dev/null {PASSWORD_FILE}",
         f"printf %s '{PASSPHRASE}' > {PASSWORD_FILE}",
@@ -161,8 +161,8 @@ def esp_differences(machine, a, b):
 
 
 def provision(inspect=None):
-    """The real disko script, from an empty disk, then nixos-install, as `clan machines
-    install` does. Only the secrets' upload is the test's own. `inspect` runs with the new
+    """The real disko script, from an empty disk, then nixos-install, as an install
+    does. Only how the secrets get there is the test's own. `inspect` runs with the new
     system still mounted at /mnt."""
     global HOST_KEY_LINE
     BASE.mkdir(parents=True)

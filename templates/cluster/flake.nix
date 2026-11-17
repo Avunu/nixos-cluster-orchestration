@@ -25,16 +25,26 @@
     let
       topology = import ./topology.nix;
 
-      clan = cluster.lib.mkCluster {
+      site = cluster.lib.mkCluster {
         inherit self inputs topology;
         directory = ./.;
         meta = {
           name = "my-cluster";
           domain = "example.com";
         };
-        # The operators' age public keys (age-keygen). Anyone listed can decrypt
-        # every secret. Replace this example with your own.
-        recipients = [ "age1d4xvnzk8ukfgsawg7alhva2lzp9cuztygzwpwdgvgtepzvv44e0qgvt7ar" ];
+        # The operators' age identities: every secret in this repository is encrypted
+        # to them, and `agenix rekey` decrypts with one of them. For a YubiKey, the
+        # identity file `age-plugin-yubikey --identity` prints (it holds no private
+        # key, so it is committed) and the recipient beside it. Replace this example
+        # with your own.
+        masterIdentities = [
+          {
+            identity = ./secrets/master/operator.pub;
+            pubkey = "age1d4xvnzk8ukfgsawg7alhva2lzp9cuztygzwpwdgvgtepzvv44e0qgvt7ar";
+          }
+        ];
+        # Recipients nothing decrypts with day to day: the offline one.
+        #   extraRecipients = [ "age1…" ];
         # The operators' SSH public keys, for root and `admin` on every node.
         # Replace this example with your own, or you cannot log in.
         admins = [
@@ -48,16 +58,19 @@
       };
     in
     {
-      # `nixos-rebuild --flake .#<node>` (the pull loop) and `clan` read these.
-      inherit (clan.config) nixosConfigurations clanInternals;
+      # `nixos-rebuild --flake .#<node>` (the pull loop) reads the first, and
+      # `nix run .#agenix -- rekey` the second.
+      inherit (site) nixosConfigurations agenix-rekey;
+      # Every machine's secret generators, as data.
+      clusterSecrets = site.secrets;
 
       # What `avc` reads.
-      opsIndex = cluster.lib.mkOpsIndex { inherit clan topology; };
+      opsIndex = cluster.lib.mkOpsIndex { inherit site topology; };
       # What `avc cloud` hands to OpenTofu: the buckets, tunnels and DNS records the
       # topology and the apps call for (topology.nix, `cloud`).
-      cloud = cluster.lib.mkCloud { inherit clan topology; };
+      cloud = cluster.lib.mkCloud { inherit site topology; };
 
-      # avc, clan, nomad and friends: `nix develop`, `nix run .#avc`.
+      # avc, agenix, nomad and friends: `nix develop`, `nix run .#avc`, `nix run .#agenix`.
       inherit (cluster) packages devShells;
 
       # What .github/workflows/merge-gate.yml builds before anything reaches `main`. The
@@ -68,7 +81,7 @@
         inherit (cluster.checks.x86_64-linux) boot-install boot-fallback;
 
         # The boot tests ran on the library's nixpkgs; the nodes build on this flake's
-        # (clan takes the site's). They prove the nodes' boot only if those are one source,
+        # (mkCluster takes the site's). They prove the nodes' boot only if those are one source,
         # which `nixpkgs.follows = "cluster/nixpkgs"` above makes them.
         nixpkgs-follows-library =
           inputs.nixpkgs.legacyPackages.x86_64-linux.runCommand "nixpkgs-follows-library" { }

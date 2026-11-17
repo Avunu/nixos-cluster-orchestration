@@ -2,7 +2,7 @@
 #
 # The certificates the VM tests use come from tests/lib/fixture-pki.nix, so this check
 # runs the GENERATORS themselves: the fixture cluster's real `nomad-ca`, `nomad-tls` and
-# `nomad-gossip` scripts (clan's finalScript, with $in and $out as clan sets them), for
+# `nomad-gossip` scripts (each generator's finalScript, with $in and $out set), for
 # a server (node1) and a worker (node2). What is checked is what Nomad relies on:
 #   - every certificate verifies against the CA, and one from another CA does not
 #   - names: server.global.nomad only on servers, client.global.nomad, cli.global.nomad,
@@ -27,8 +27,7 @@
 }:
 let
   pki = import ../lib/nomad-pki.nix { inherit lib; };
-  generatorsOf =
-    name: fixtureCluster.config.nixosConfigurations.${name}.config.clan.core.vars.generators;
+  generatorsOf = name: fixtureCluster.nixosConfigurations.${name}.config.cluster.secrets.generators;
   server = generatorsOf "node1";
   worker = generatorsOf "node2";
   fixturePki = import ./lib/fixture-pki.nix {
@@ -94,7 +93,7 @@ pkgs.runCommand "nomad-pki-check"
       || fail "a worker's logins: $(jq -c .workerLogins $f)"
     pass "declarations: nomad-acl on servers only, the JWT key stays off nodes, logins per machine and per role"
 
-    # ── run the generators as clan does ─────────────────────────────────────
+    # ── run the generators as they are run ──────────────────────────────────
     gen() { # name script indir outdir
       mkdir -p "$4"
       in=$3 out=$4 prompts=$(mktemp -d) bash "$2" >/dev/null 2>"$4.log" \
@@ -200,7 +199,7 @@ pkgs.runCommand "nomad-pki-check"
     ! verify "$h" "$forged" "$s" || fail "a JWT with its role changed still verifies"
     pass "JWT: RS256, verifies, claims iss/aud/role/node/exp; a tampered role does not verify"
 
-    # ── the login generators, as clan runs them ─────────────────────────────
+    # ── the login generators, the same way ──────────────────────────────────
     gen nomad-jwt ${server.nomad-jwt.finalScript} /var/empty jwtkey
     mkdir -p in/nomad-jwt && cp jwtkey/signing.key jwtkey/signing.pub in/nomad-jwt/
     gen nomad-login ${server.nomad-login.finalScript} "$PWD/in" login-server

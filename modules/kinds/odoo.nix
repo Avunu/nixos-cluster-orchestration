@@ -171,7 +171,7 @@ in
   # The database manager's master password. Not a database password: the
   # local PostgreSQL uses socket peer auth, so there is none. share = true:
   # one value for the fleet, so it follows the app to any node.
-  config.clan.core.vars.generators = lib.mapAttrs (_: _: {
+  config.cluster.secrets.generators = lib.mapAttrs (_: _: {
     share = true;
     files.admin-passwd = { };
     runtimeInputs = [

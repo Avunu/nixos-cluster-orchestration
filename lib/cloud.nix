@@ -7,8 +7,8 @@
 # DNS records are the ones the apps' hostnames need. `avc cloud plan` and `apply`
 # (tools/avc/avc/flows/cloud.py) run OpenTofu over it on the operator's machine, with
 # the providers' credentials from vars that no node holds, and put what the providers
-# hand back where the rest of the site reads it: S3 key pairs into `clan vars`, a new
-# tunnel's id into `apps/<app>.json`, its credentials into the app's own var.
+# hand back where the rest of the site reads it: S3 key pairs into the site's secrets, a new
+# tunnel's id into `apps/<app>.json`, its credentials into the app's own secret.
 #
 # What it makes, where `topology.cloud` names the provider:
 #
@@ -48,7 +48,7 @@ let
   reference = clusterLib.net.referenceNode topology;
   cfg = nixosConfigurations.${reference}.config;
   apps = cfg.cluster.nomadApps;
-  clusterName = cfg.clan.core.settings.name;
+  clusterName = nixosConfigurations.${reference}._module.specialArgs.clusterSite.name;
 
   # A resource name: letters, digits and underscores.
   slug = s: lib.replaceStrings [ "." "-" "/" ":" ] [ "_" "_" "_" "_" ] s;
@@ -352,7 +352,7 @@ in
 
   # Where each output belongs. avc reads this, never the configuration.
   writeback = {
-    # output name -> clan var (generator/file), written when the value differs.
+    # output name -> secret (generator/file), written when the value differs.
     vars = lib.concatMapAttrs (k: b: {
       "s3_${k}_access_key" = b.vars.access;
       "s3_${k}_secret_key" = b.vars.secret;

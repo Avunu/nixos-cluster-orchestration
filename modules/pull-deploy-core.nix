@@ -1,4 +1,4 @@
-# modules/pull-deploy-core.nix — the pull deploy's tick, independent of clan and of any
+# modules/pull-deploy-core.nix — the pull deploy's tick, independent of any
 # flake, so that tests/deploy-safety.nix runs the real thing against specialisations.
 # The timer is here too, because a rollback only sticks if the tick the timer fires after
 # a reboot refuses the closure. modules/pull-deploy.nix supplies the flake on a real node.
@@ -276,14 +276,14 @@ in
       };
     };
 
-    # Break-glass hold. `clan machines update` pushes a build from a working tree
+    # Break-glass hold. A pushed `nixos-rebuild switch --target-host` builds from a working tree
     # that may not be pushed to git yet; the next tick of this timer (<=10 min)
     # would then rebuild from the LAST PUSHED commit and silently revert it. The
     # two paths do not conflict mechanically — both set the system profile and run
     # switch-to-configuration — they conflict logically, and a convenient CLI makes
     # that far easier to hit than it was with a manual deploy.
     #
-    #   touch /run/cluster-upgrade.hold   # before `clan machines update`
+    #   touch /run/cluster-upgrade.hold   # before the push
     #   rm    /run/cluster-upgrade.hold   # after pushing
     #
     # /run so it clears on reboot: a hold someone forgot to remove must not

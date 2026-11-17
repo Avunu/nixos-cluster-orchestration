@@ -92,7 +92,7 @@ in
   config = {
     # One set per SITE, from the admin plane only -- the two planes would
     # otherwise define the same generators twice.
-    clan.core.vars.generators = lib.mkMerge (
+    cluster.secrets.generators = lib.mkMerge (
       lib.mapAttrsToList (_: a: (built a).generators) adminPlanes
     );
 

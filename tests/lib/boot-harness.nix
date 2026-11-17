@@ -56,7 +56,7 @@ let
 
   hostId = "f0000b00";
 
-  # Where clan uploads partitioning secrets for a machine called target.
+  # Where an install puts the partitioning secrets of a machine called target.
   partitioningSecret = gen: file: "/run/partitioning-secrets/per-machine/target/${gen}/${file}";
   passwordFile = partitioningSecret "luks" "passphrase";
   identitySecretFile = partitioningSecret "volume-identity" "secret";
@@ -326,7 +326,9 @@ in
           SSH_PORT = ${toString sshPort}
           WAN_INTERFACE = "${wan.interface}"
           WAN_ADDRESS = "${wan.address4}"
-          LUKS_DEVICES = ${builtins.toJSON (lib.mapAttrs (_: v: v.device) nodes.target.boot.initrd.luks.devices)}
+          LUKS_DEVICES = ${
+            builtins.toJSON (lib.mapAttrs (_: v: v.device) nodes.target.boot.initrd.luks.devices)
+          }
           TPM2_PLUGINS = "${nodes.target.systemd.package}/lib/cryptsetup"
           VIRT_FW_VARS = "${pkgs.python3Packages.virt-firmware}/bin/virt-fw-vars"
           OPENSSL = "${pkgs.openssl}/bin/openssl"

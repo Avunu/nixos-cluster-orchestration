@@ -43,7 +43,7 @@ let
   token = "${pki.tokenDir}/fence";
   # The HTTP API wants a client certificate before anything else (cluster-common.nix).
   # A handshake that fails is a curl failure like any other below: fail-safe, no fence.
-  tls = pki.cliTlsFor config.clan.core.vars.generators;
+  tls = pki.cliTlsFor config.cluster.secrets.generators;
 
   # Managed container names (the only units the fencer may touch).
   managedApps = builtins.attrNames config.cluster.nomadApps;

@@ -1,4 +1,4 @@
-# modules/boot-security-core.nix — boot security, independent of clan.
+# modules/boot-security-core.nix — boot security, with its values given.
 #
 # The encrypted root's unlock path, and the chain that makes an initrd worth trusting.
 # LUKS devices come from the layout (lib/mk-disk-layout.nix); this adds the initrd that
@@ -10,9 +10,9 @@
 # cluster-boot-seal is how an operator binds it, and refuses every binding someone else
 # could reproduce.
 #
-# Written this way round so boot behaviour stays testable without clan: the boot
+# Written this way round so boot behaviour stays testable without a site: the boot
 # VM tests import this module directly with literal values, and
-# modules/boot-security.nix supplies vars and topology on a real node.
+# modules/boot-security.nix supplies secrets and topology on a real node.
 {
   config,
   lib,
@@ -201,13 +201,17 @@ let
       # before the reboot. A leg that is absent is the DEGRADED pool's alert, not this one.
       f=${lib.escapeShellArg cfg.identity.path}
       if [ -f "$f" ] && [ ! -L "$f" ] \
-        && [ "$(sha256sum < "$f" | cut -d' ' -f1)" = ${lib.escapeShellArg (if haveIdentityHash then cfg.identity.hash else "")} ]; then
+        && [ "$(sha256sum < "$f" | cut -d' ' -f1)" = ${
+          lib.escapeShellArg (if haveIdentityHash then cfg.identity.hash else "")
+        } ]; then
         r=1
       else
         r=0
       fi
       echo "cluster_volume_identity_ok $r"
-      for d in ${lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)}; do
+      for d in ${
+        lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)
+      }; do
         if [ -e "$d" ] && n=$(cryptsetup luksDump --dump-json-metadata "$d" 2>/dev/null \
           | jq '[.tokens[] | select(.type == "systemd-tpm2")] | length') && [ -n "$n" ]; then
           echo "cluster_boot_tpm_tokens{device=\"$d\"} $n"
@@ -253,7 +257,9 @@ let
   # the disk key to a PCR 7 that someone else can reproduce. Text, so a test can take a
   # control out.
   sealText = ''
-    devices=(${lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)})
+    devices=(${
+      lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)
+    })
     identity_path=${lib.escapeShellArg cfg.identity.path}
     identity_hash=${lib.escapeShellArg (if haveIdentityHash then cfg.identity.hash else "")}
     burn_marker=/run/cluster-boot/pcr7-burned
@@ -479,8 +485,7 @@ let
             fi
           done
         fi
-        # The passphrase comes on stdin, with or without a final newline (clan vars get
-        # writes none), and never on the command line.
+        # The passphrase comes on stdin, with or without a final newline, and never on the command line.
         pass=""
         IFS= read -r pass || true
         if [ -z "$pass" ]; then

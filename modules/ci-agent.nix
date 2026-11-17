@@ -154,7 +154,7 @@ in
         };
         serviceConfig = {
           ExecStart = agent;
-          LoadCredential = [ "token:${config.clan.core.vars.generators.ci.files.token.path}" ];
+          LoadCredential = [ "token:${config.cluster.secrets.generators.ci.files.token.path}" ];
           StateDirectory = "cluster-ci";
           StateDirectoryMode = "0700";
           # The Worker being away is a wait, not a failure; a crash is restarted.

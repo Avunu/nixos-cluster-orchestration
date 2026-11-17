@@ -1,49 +1,21 @@
-# modules/vars.nix — cluster-wide secrets, as clan vars generators.
+# modules/vars.nix — the cluster-wide secrets, as generators.
 #
-# Replaces the agenix wiring (modules/secrets.nix + the filesystem-derived
-# recipient registry in secrets.nix, both deleted). Per-client secrets are NOT
-# here: each app's generators are declared by its kind (modules/kinds/) from
-# its entry in apps/, so a client's secrets live and die with the client.
+# How a generator is declared, where its files are kept and how they reach a node is
+# modules/secrets.nix. Per-client secrets are NOT here: each app's generators are
+# declared by its kind (modules/kinds/) from its entry in apps/, so a client's secrets
+# live and die with the client.
 #
-# ── how this reaches a node ──────────────────────────────────────────────────
-# `clan.core.vars.settings.secretStore = "age"` (flake.nix), clan-core's own
-# plain-`age` vars backend — NOT sops-nix. `clan vars generate` runs each
-# script in an offline sandbox and commits the age-encrypted result to
-# secrets/clan-vars/shared/<generator>/<file>/<file>.age. clanCore's age.nix
-# decrypts every such file in an ACTIVATION SCRIPT during `nixos-rebuild
-# switch`, using nothing but the `age` CLI — no Go tool, no sops-nix.
-#
-# We were already on this shape in spirit before the backend switch: the node
-# decrypts with its own per-machine age keypair, generated into the repo by
-# clan under secrets/age-keys/machines/<name>/ and delivered ONCE by `clan
-# machines install` (nixos-anywhere --extra-files) to
-# `clan.core.vars.age.secretLocation`/key.txt (default /etc/secret-vars). After
-# that the PULL loop (modules/pull-deploy.nix) needs no clan CLI, no network
-# beyond the flake fetch, and nothing uploaded — the key persists.
-#
-# We tried to keep agenix's nicer property (the node's SSH HOST key as the
-# identity, so nothing is distributed at all). It does not survive first boot:
-# you cannot encrypt to a host key before the host exists, and activation fails
-# on a secret it cannot decrypt, so a fresh node could never complete its first
-# switch. Something must be delivered at install either way — true of the age
-# backend just as it was of sops.
-#
-# What therefore MUST hold — and what tests/clan-coexist.nix asserts — is that
-# every secret stays `neededFor = "services"` (the default). "activation" and
-# "partitioning" secrets are uploaded out of band by clan on each install/update;
-# the pull loop uploads nothing, so such a secret would work on a pushed node and
-# silently break on every pulled one.
-#
-# The one exception is modules/boot-security.nix's `luks`, `volume-identity` and
-# `initrd-ssh` secrets, on nodes that have not opted out. They are `neededFor =
-# "partitioning"` because disko and its hook read them, once, at install, and nothing
-# reads them on a running node, so the pull loop uploading nothing cannot break them.
-# They are declared there, not here, because an opted-out node must not have them.
-# tests/security-policy.nix holds them to an exact allowlist.
+# Every file here is read by services (`neededFor = "services"`, the default) or by
+# nobody on a node (`deploy = false`). The one exception is modules/boot-security.nix's
+# `luks`, `volume-identity` and `initrd-ssh` secrets, on nodes that have not opted out.
+# They are `neededFor = "partitioning"` because disko and its hook read them, once, at
+# install, and nothing reads them on a running node. They are declared there, not
+# here, because an opted-out node must not have them. tests/security-policy.nix holds
+# them to an exact allowlist.
 #
 # ── share = true ─────────────────────────────────────────────────────────────
 # Most of what is here is ONE value for the whole fleet (the same S3 credentials,
-# the same gossip key), so it lives in vars/shared/ rather than being regenerated
+# the same gossip key), so it lives in secrets/shared/ rather than being regenerated
 # per machine. A per-machine gossip key would simply not form a cluster.
 #
 # The exceptions are per machine on purpose: `nomad-tls` and `nomad-login`, because
@@ -63,12 +35,12 @@ let
   loginRoles = pki.loginRoles node;
 in
 {
-  clan.core.vars.generators = {
+  cluster.secrets.generators = {
     # The operator's Cloudflare API token for what wrangler's OAuth cannot do
     # (Access apps, DNS records, minting R2 tokens), read by a site-provisioning
     # tool when CF_PROVISION_TOKEN is not set. An operator secret, not a machine's:
     # deploy = false keeps it off every node; admins read it with
-    #   clan vars get node1 cloudflare/provision-token
+    #   agenix view secrets/shared/cloudflare/provision-token.age
     cloudflare = {
       share = true;
       prompts.provision-token = {
@@ -230,8 +202,8 @@ in
     # lib/nomad-pki.nix). `agent` is what the Nomad agent serves and presents;
     # `cli` is what local API consumers present (verify_https_client).
     #
-    # No pkgs.nomad here: it is unfree, and clan's generator path forces its own
-    # nixpkgs, so it would fail the unfree check. openssl does the same job.
+    # No pkgs.nomad here: openssl does the same job, and whoever generates needs no
+    # unfree package for it.
     nomad-tls = {
       dependencies = [ "nomad-ca" ];
       files."agent.key" = { };
@@ -295,8 +267,8 @@ in
     # will accept an OPERATOR-SUPPLIED token (`nomad acl bootstrap <path>`), so
     # we mint it here and hand it to Nomad rather than asking Nomad for one.
     #
-    # Prompting for it was a deadlock: `clan machines install` runs every
-    # generator BEFORE installing, so it asked for a token that can only exist
+    # Prompting for it was a deadlock: every generator runs BEFORE a node is
+    # installed, so it asked for a token that can only exist
     # after the cluster it is about to install is already running.
     #
     # Must be a UUID — Nomad validates the format of an operator-supplied
@@ -321,7 +293,7 @@ in
 
     # ── Nomad login: the key that signs, and what it signed ─────────────────
     # The private key never reaches a node (deploy = false): it signs on the
-    # operator's machine, at `clan vars generate`. The public half is what the
+    # operator's machine, when the secrets are generated. The public half is what the
     # leader's `nomad-acl-init` gives the `clan` auth method. Regenerating it
     # invalidates every node's JWTs at once; that is its rotation (manual).
     nomad-jwt = {
@@ -348,9 +320,9 @@ in
       dependencies = [ "nomad-jwt" ];
       files = lib.genAttrs (map (r: "jwt-${r}") loginRoles) (_: { });
       # A new role (a tag added) or a rotation reissues this machine's JWTs only. A
-      # string, not the list: clan's `validation` takes scalars or a set of them, and a
-      # list fails `clan vars generate` on every node (tests/security-policy.nix,
-      # "clan vars generate can read every generator").
+      # string, not the list: `validation` takes scalars or a set of them, because a
+      # list's order would be part of its hash (tests/security-policy.nix, "every
+      # generator of a new site can be read").
       validation = {
         roles = lib.concatStringsSep "," loginRoles;
         rotation = topology.security.nomadTlsRotation or 0;

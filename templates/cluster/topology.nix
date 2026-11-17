@@ -70,7 +70,7 @@
   # pull request of its project.
   # ci.url = "https://cluster-ci.example.workers.dev";
 
-  # S3-compatible storage for JuiceFS. Credentials: `clan vars`. Loki keeps its logs
+  # S3-compatible storage for JuiceFS. Credentials: the `ovh-s3` secret. Loki keeps its logs
   # on each node's own encrypted disk, not here.
   objectStorage = {
     endpoint = "https://s3.example.net";
@@ -163,7 +163,7 @@
       index = 1;
       hostName = "node1";
       fqdn = "node1.example.com";
-      # The canary: each new boot stack (a nixpkgs, kernel, Lanzaboote, clan or library
+      # The canary: each new boot stack (a nixpkgs, kernel, Lanzaboote, agenix or library
       # bump) activates here first, and every other node waits until this one has been
       # rebooted into it, with someone watching, and unlocked from its TPM on its own. Exactly
       # one node, a real one with boot security. README.md, "Deploying".

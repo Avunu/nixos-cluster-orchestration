@@ -13,19 +13,17 @@
 let
   net = clusterLib.net;
   pki = clusterLib.nomadPki;
-  vars = config.clan.core.vars.generators;
+  vars = config.cluster.secrets.generators;
   cliTls = pki.cliTlsFor vars;
 
-  # A vars file's ciphertext in the site's repository, by clan's age layout
-  # (clan-core nixosModules/clanCore/vars/secret/age-source-path.nix). Its hash changes
-  # when the file is regenerated, and nothing else about the unit does.
+  # A secret's ciphertext in the site's repository (lib/secrets-layout.nix). Its hash
+  # changes when the file is regenerated, and nothing else about the unit does.
   ciphertextHash =
     gen: file:
     let
       f = vars.${gen}.files.${file};
-      p = config.clan.core.settings.directory + "/secrets/clan-vars/${f.rel_dir}/${f.name}/${f.name}.age";
     in
-    lib.optional (builtins.pathExists p) (builtins.hashFile "sha256" p);
+    lib.optional f.exists (builtins.hashFile "sha256" f.source);
 
   # Human operators' SSH keys (mkCluster's `admins`). Deploys land as root, so
   # root MUST carry these or every `nixos-rebuild switch` locks you out.
@@ -151,15 +149,9 @@ in
   # project) that way (with submodules). Without it every evaluation on the node dies with
   #   error: executing "git": No such file or directory
   # which fails the pull loop and therefore every deploy.
-  #
-  # It used to arrive via clan's `enableRecommendedDefaults` bundle, which is
-  # off here because the same bundle injects networkd units this host cannot
-  # tolerate (see flake.nix). Re-added explicitly so the dependency is visible
-  # rather than inherited.
   environment.systemPackages = with pkgs; [
     git
-    # The rest of what enableRecommendedDefaults used to provide: basic
-    # reachability debugging on a box whose only inbound port is SSH.
+    # Basic reachability debugging on a box whose only inbound port is SSH.
     dnsutils
     curl
     jq
@@ -178,7 +170,7 @@ in
   #
   # Scoped rather than disabled: "online" here means the WAN bridge is up, which
   # is what units ordered after network-online.target actually need. Disabling it
-  # outright (what clan's recommended defaults do) would make
+  # outright would make
   # network-online.target fire immediately and let the pull loop race the network.
   systemd.network.wait-online = {
     enable = true;
@@ -224,6 +216,10 @@ in
   # And it binds the control VLAN address alone (bind_addr below), which can arrive
   # after network-online.target: lib/net.nix controlBoundUnit waits for it and takes
   # away the start limit, so a late VLAN delays Nomad instead of leaving it failed.
+  # Nomad is what makes a node take work, so it is what a boot whose secrets did not
+  # all decrypt does not start (modules/secrets.nix).
+  cluster.secrets.gate = [ "nomad.service" ];
+
   systemd.services.nomad = net.controlBoundUnit // {
     reloadTriggers =
       ciphertextHash "nomad-tls" "agent.crt"

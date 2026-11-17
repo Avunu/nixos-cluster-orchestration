@@ -4,7 +4,7 @@
 # evaluation (the netdev's PublicKey); a key made at build time would be
 # import-from-derivation, which `nix flake check --no-build` refuses.
 #
-# The public halves are also tests/fixtures/vars/per-machine/<node>/wg-ctrl/public/value,
+# The public halves are also tests/fixtures/secrets/per-machine/<node>/wg-ctrl/public,
 # which is where modules/mesh-control.nix reads them, as on a real site. `rotated` is
 # the key a rotation test changes to.
 {

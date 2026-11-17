@@ -9,9 +9,9 @@
 #            earlier run [RAN, design]. The test only READS the backing directory, to
 #            grep what the provider would see.
 #   node1    the fixture's node1, as far as JuiceFS goes: the REAL modules/vars.nix,
-#            modules/storage-juicefs.nix and modules/storage-juicefs-format.nix under
-#            clanCore, with the cluster harness's fixture secrets at the paths clan's
-#            age backend uses. Its control-mesh address is on a dummy interface
+#            modules/storage-juicefs.nix and modules/storage-juicefs-format.nix over
+#            modules/secrets.nix, with the cluster harness's fixture secrets at the paths
+#            agenix decrypts to. Its control-mesh address is on a dummy interface
 #            standing in for wg-ctrl (WireGuard is another test's business), and
 #            nothing of Nomad's is here. Units, scripts and credentials are
 #            production's; only the object-storage endpoint is this VM's `s3`.
@@ -88,7 +88,7 @@
   lib,
   topology,
   harnessFor,
-  clanCoreModule,
+  secretsModule,
   mutant ? "",
   extraModule ? { },
 }:
@@ -175,7 +175,7 @@ pkgs.testers.runNixOSTest {
       { config, pkgs, ... }:
       {
         imports = [
-          clanCoreModule
+          secretsModule
           ../modules/vars.nix
           ../modules/storage-juicefs.nix
           ../modules/storage-juicefs-format.nix
@@ -201,12 +201,12 @@ pkgs.testers.runNixOSTest {
         virtualisation.cores = 2;
         system.stateVersion = testTopology.stateVersion;
 
-        clan.core.enableRecommendedDefaults = false;
-        clan.core.settings.state-version.enable = false;
-        clan.core.settings.machine.name = "node1";
-        # The fixture's directory, as a string for the reason in tests/fixtures/default.nix.
-        clan.core.settings.directory = toString ./fixtures;
-        clan.core.vars.settings.secretStore = "age";
+        cluster.secrets = {
+          machine = "node1";
+          # The fixture's directory, as a string for the reason in tests/fixtures/default.nix.
+          directory = toString ./fixtures;
+          masterIdentities = import ./fixtures/master-identities.nix;
+        };
 
         # The control-mesh address the metadata URL names (a test that asks the database by that address),
         # under the unit name every mesh-bound service waits for.
@@ -247,7 +247,7 @@ pkgs.testers.runNixOSTest {
   testScript =
     { nodes, ... }:
     let
-      gens = nodes.node1.clan.core.vars.generators;
+      gens = nodes.node1.cluster.secrets.generators;
     in
     ''
       import calendar

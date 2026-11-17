@@ -53,7 +53,7 @@
 # about five minutes; the image then exits 123 and the unit restarts it into
 # the installed server. Watch it with
 #   nixos-container run <app> -- journalctl -fu podman-freeipa
-# The admin password is <app>/password (clan vars get <node> <app>/password);
+# The admin password is <app>/password (agenix view secrets/shared/<app>/password.age);
 # it is read at install only, so a password changed in IPA afterwards is not
 # reflected there.
 {
@@ -999,7 +999,7 @@ in
         }
       ];
 
-    clan.core.vars.generators = lib.mkMerge (
+    cluster.secrets.generators = lib.mkMerge (
       lib.mapAttrsToList (
         name: inst:
         {
@@ -1026,7 +1026,7 @@ in
           # with no value.
           #   cloudflared tunnel create <name>
           #   cloudflared tunnel route dns <name> <hostname>
-          #   clan vars set <node> <name>-cf/cloudflared < ~/.cloudflared/<id>.json
+          #   agenix edit -i ~/.cloudflared/<id>.json secrets/shared/<name>-cf/cloudflared.age
           "${name}-cf" = {
             share = true;
             prompts.cloudflared = {
@@ -1059,7 +1059,7 @@ in
             };
             # Cloudflare-issued, so prompted; declared before it is used (set it,
             # then set authelia.smtpSender):
-            #   clan vars set <node> <name>-smtp/token   (a token with Email Sending: Edit)
+            #   agenix edit secrets/shared/<name>-smtp/token.age   (a token with Email Sending: Edit)
             "${name}-smtp" = {
               share = true;
               prompts.token = {

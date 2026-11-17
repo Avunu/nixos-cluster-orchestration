@@ -66,7 +66,7 @@
 {
   pkgs,
   lib,
-  mkClan,
+  mkSite,
   topology,
   # tests/lib/cluster-harness.nix, as a function of { topology, fixturePki ? null }.
   harnessFor,
@@ -122,7 +122,7 @@ let
 
   # One CA, gossip key and JWT key for both: the commit that adds voters regenerates no
   # shared secret. The single-voter site's PKI is the three-voter one with node3's agent
-  # certificate a worker's, which is what clan's `validation` reissues on promotion
+  # certificate a worker's, which is what the generator's `validation` reissues on promotion
   # (modules/vars.nix: nomad-tls's validation carries isServer).
   votersPki = import ./lib/fixture-pki.nix {
     inherit pkgs lib;
@@ -169,7 +169,7 @@ let
 
   site = lib.mapAttrs (name: t: {
     topology = t;
-    clan = mkClan t;
+    cluster = mkSite t;
     harness = harnessFor {
       topology = t;
       fixturePki = if name == "single" then singlePki else votersPki;
@@ -177,7 +177,7 @@ let
   }) topologies;
 
   # A node of one site: its real machine module, the harness, and the topology it was
-  # built from. `topology` is a clan-wide specialArg, which a NixOS test shares between
+  # built from. `topology` is a site-wide specialArg, which a NixOS test shares between
   # all its nodes, so here it is each node's own module argument instead.
   machineIn =
     which: name:
@@ -187,7 +187,7 @@ let
     }:
     {
       imports = [
-        site.${which}.clan.config.nixosModules."clan-machine-${name}"
+        site.${which}.cluster.machineModules.${name}
         (site.${which}.harness.nodeModule { inherit memoryMB; })
         noApps
         extraModule
@@ -219,20 +219,18 @@ let
     node3 = 2048;
   };
   ctrlIps = lib.mapAttrs (_: n: n.controlIp) topologies.voters.nodes;
-  vcfg = site.voters.clan.config.nixosConfigurations;
-  gossipPath = vcfg.node3.config.clan.core.vars.generators.nomad-gossip.files."gossip.hcl".path;
-  tlsCrtPath = n: vcfg.${n}.config.clan.core.vars.generators.nomad-tls.files."agent.crt".path;
+  vcfg = site.voters.cluster.nixosConfigurations;
+  gossipPath = vcfg.node3.config.cluster.secrets.generators.nomad-gossip.files."gossip.hcl".path;
+  tlsCrtPath = n: vcfg.${n}.config.cluster.secrets.generators.nomad-tls.files."agent.crt".path;
 in
 pkgs.testers.runNixOSTest {
   name = "voter-growth${lib.optionalString (order != "a") "-order-${order}"}";
 
   node.pkgs = lib.mkForce null;
-  node.specialArgs =
-    removeAttrs site.voters.clan.config.nixosConfigurations.node1._module.specialArgs
-      [
-        "modulesPath"
-        "topology"
-      ];
+  node.specialArgs = removeAttrs site.voters.cluster.nixosConfigurations.node1._module.specialArgs [
+    "modulesPath"
+    "topology"
+  ];
 
   nodes = {
     wan = site.voters.harness.wanNode;

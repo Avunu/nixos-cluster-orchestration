@@ -1291,6 +1291,16 @@ let
       (s ''cluster_jfs_encrypted{instance="n"}'' "0x3 1x10")
     ] "10m" none)
 
+    # ── secrets (modules/secrets.nix) ───────────────────────────────────────
+    (case "SecretsMissing" [ (s ''cluster_secrets_missing{instance="n"}'' "2x10") ] "5m" [
+      (crit "critical")
+    ])
+    (case "SecretsMissing" [ (s ''cluster_secrets_missing{instance="n"}'' "0x10") ] "5m" none)
+    # One check that missed, put right by the next: not yet an alert.
+    (case "SecretsMissing" [
+      (s ''cluster_secrets_missing{instance="n"}'' "0 1 0x10")
+    ] "5m" none)
+
     # ── audit delivery (WS13) ───────────────────────────────────────────────
     (case "AuditDeliveryStale"
       [ (s ''cluster_audit_spool_oldest_timestamp_seconds{instance="n"}'' "0x200") ]

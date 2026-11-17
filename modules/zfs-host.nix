@@ -52,13 +52,7 @@ in
     autoScrub.enable = true; # weekly integrity pass over the mirror
     trim.enable = true;
 
-    # Declared explicitly because clanCore/zfs.nix turns this on unconditionally
-    # (it is NOT gated by clan.core.enableRecommendedDefaults), and an inherited
-    # snapshot policy is the kind of thing that should be a decision rather than
-    # a discovery. Stating it here also means `services.zfs.autoSnapshot.enable`
-    # keeps its value if the clan input is ever dropped.
-    #
-    # This is wanted: the per-dataset `com.sun:auto-snapshot` properties below
+    # The per-dataset `com.sun:auto-snapshot` properties below
     # were already set (false at the root, true on state/postgresql/etcd) but
     # nothing consumed them, so the intent recorded in this file's header was
     # never actually running. zfs-auto-snapshot honours those properties, so
@@ -135,7 +129,12 @@ in
   systemd.services.cluster-generation-gc = {
     description = "Collect old generations and garbage, keeping the booted and running ones";
     serviceConfig.Type = "oneshot";
-    script = lib.getExe (import ../lib/generation-gc.nix { inherit pkgs; nix = config.nix.package; });
+    script = lib.getExe (
+      import ../lib/generation-gc.nix {
+        inherit pkgs;
+        nix = config.nix.package;
+      }
+    );
     startAt = "weekly";
   };
   systemd.timers.cluster-generation-gc.timerConfig.Persistent = true;
@@ -148,7 +147,8 @@ in
     (import ../lib/mk-disk-layout.nix (
       {
         inherit lib encrypted;
-        passwordFile = if encrypted then config.clan.core.vars.generators.luks.files.passphrase.path else null;
+        passwordFile =
+          if encrypted then config.cluster.secrets.generators.luks.files.passphrase.path else null;
       }
       // lib.optionalAttrs (node ? disks) { devices = node.disks; }
       // lib.optionalAttrs (node ? swapPerDiskGiB) { swapSizePerDiskGiB = node.swapPerDiskGiB; }

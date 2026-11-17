@@ -3,21 +3,16 @@
 #
 #   nix run .#avc            # status overview + menu
 #   nix run .#avc -- --help  # every menu entry is also a subcommand
-#
-# Built on clan-cli's own Python so it can import clan_lib (vars status,
-# generator graph) directly; tools/avc/avc/core/vars.py is the only module
-# that does.
 {
   pkgs,
   lib ? pkgs.lib,
-  clan-cli,
   # Optional provisioning tool that `avc site ...` delegates to
   # (tools/avc/avc/flows/sites.py). Not part of this library; without it those
   # commands say so and everything else works.
   siteProvisioner ? null,
 }:
 let
-  python = clan-cli.pythonRuntime;
+  python = pkgs.python3;
   cloudTofu = pkgs.opentofu.withPlugins (ps: [
     ps.ovh_ovh
     ps.cloudflare_cloudflare
@@ -42,28 +37,16 @@ python.pkgs.buildPythonApplication {
     python.pkgs.pytestCheckHook
     pkgs.git
   ];
-  # clan_lib on the import path for the checks as well as at runtime.
-  preCheck = ''
-    export PYTHONPATH=${clan-cli}/${python.sitePackages}:$PYTHONPATH
-  '';
 
   # One element per wrapper argument: under __structuredAttrs (the default for
   # Python apps) a "--prefix X : y" string stays a single arg and makeWrapper
   # rejects it.
   makeWrapperArgs = [
     "--prefix"
-    "PYTHONPATH"
-    ":"
-    "${clan-cli}/${python.sitePackages}"
-    # clan_lib shells out to what clan-cli bundles; CLAN_PROVIDED_PACKAGES
-    # tells it these are on PATH (otherwise it reaches for `nix shell`).
-    "--prefix"
     "PATH"
     ":"
     (lib.makeBinPath (
-      [ clan-cli ]
-      ++ lib.optional (siteProvisioner != null) siteProvisioner
-      ++ lib.attrValues clan-cli.runtimeDependenciesMap
+      lib.optional (siteProvisioner != null) siteProvisioner
       # gh: avc opens a pull request for every change and never pushes the deploy
       # branch (tools/avc/avc/core/pr.py). It uses the operator's own `gh auth login`.
       ++ (with pkgs; [
@@ -77,9 +60,6 @@ python.pkgs.buildPythonApplication {
       # downloads nothing.
       ++ [ cloudTofu ]
     ))
-    "--set-default"
-    "CLAN_PROVIDED_PACKAGES"
-    (lib.concatStringsSep ":" (lib.attrNames clan-cli.runtimeDependenciesMap))
   ];
 
   meta = {

@@ -13,7 +13,7 @@
   fixtureTopology,
 }:
 let
-  system = name: fixtureCluster.config.nixosConfigurations.${name};
+  system = name: fixtureCluster.nixosConfigurations.${name};
   failedMessages =
     name: map (a: a.message) (lib.filter (a: !a.assertion) (system name).config.assertions);
   evaluates = name: (builtins.tryEval (system name).config.system.build.toplevel.drvPath).success;
