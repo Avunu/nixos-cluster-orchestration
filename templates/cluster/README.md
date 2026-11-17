@@ -22,12 +22,14 @@ Keep this repository private: it names your addresses and customers, and it hold
 2. Run `age-keygen -o ~/.config/age/identities` once per operator, and put the public keys in `recipients` in `flake.nix`. Make one more identity for the offline kit (`age-keygen -o <offline media>/identity`) and add its public key too.
 3. Put your SSH public keys in `admins` in `flake.nix`.
 4. Replace every example value in `topology.nix`: `deploy.flakeUrl` to this repository's URL, `backup.repoSalt` (`openssl rand -hex 16`), and per node `initrdNicModules`. A node refuses to evaluate until its boot fields are real.
-5. `nix develop`, generate the secrets, commit them, and install the first node with the library's README, "Installing a node" (S0 to S8), as far as its Secure Boot keys:
+5. `nix develop`, generate the secrets, and install the first node with the library's README, "Installing a node" (S0 to S8), as far as its Secure Boot keys:
 
    ```sh
    git add -A                       # flakes only see tracked files
-   clan vars generate               # every machine; prompts for what third parties issue
-   git add -A && git commit -m "vars"
+   avc secrets provision            # every machine; prompts for what third parties issue, then
+                                    # commits secrets/ on a branch and opens the pull request
+   avc secrets check                # every declared secret is generated; nothing is rekeyed yet:
+                                    # a node has a recipient once it is installed
    avc boot preflight node1
    avc boot install node1 root@<rescue-address>
    avc boot unlock node1            # first boot, Setup Mode: type the passphrase
@@ -46,11 +48,11 @@ After that, every node rebuilds itself from `main` on a timer. `avc` is the guid
 
 ## Keep an offline kit
 
-Off the cluster and away from your laptop: the offline age identity, a dated `git bundle create site-<date>.bundle --all` of this repository, and copies of each node's `luks/passphrase`, `restic/password`, `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase`, the S3 and backup-target keys (and the state backup target's), and `backup.repoSalt`. The library's README, "The offline kit", says what each restores. Refresh the bundle whenever `vars/` or `secrets/` change. Name a second person who can unlock a node.
+Off the cluster and away from your laptop: the offline age identity, a dated `git bundle create site-<date>.bundle --all` of this repository, and copies of each node's `luks/passphrase`, `restic/password`, `juicefs-rsa/rsa.pem` and `juicefs-rsa/rsa-passphrase`, the S3 and backup-target keys (and the state backup target's), and `backup.repoSalt`. The library's README, "The offline kit", says what each restores. Refresh the bundle whenever `secrets/` changes. Name a second person who can unlock a node.
 
 ## Secrets policy
 
-`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`, `juicefs-patroni`) are manual. Never `clan vars generate --regenerate` `luks` or `volume-identity` for an installed node.
+`secrets/policy.toml` tells `avc secrets rotate` which secrets it may regenerate. The ones bound to disks or data (`luks`, `volume-identity`, `juicefs-rsa`, `restic`) are refused whatever it says; the ones whose rotation needs both sides of something at once (`nomad-ca`, `nomad-jwt`, `wg-ctrl`, `juicefs-pg`, `juicefs-patroni`) are manual. Never regenerate `luks` or `volume-identity` for an installed node: `avc secrets rotate` and `avc secrets provision` both refuse to. `avc secrets check` says whether a deploy would give every node its secrets, and `avc deploy ship` asks it first.
 
 ## Nodes that already run an earlier library
 
@@ -58,7 +60,7 @@ The first deploy of a library version with boot security waits on every such nod
 
 ## Adding an app
 
-Write `apps/<name>.nix`, run `clan vars generate <node>`, and ship it (`avc deploy ship`). To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
+Write `apps/<name>.nix`, `git add` it, and run `avc secrets provision`: it generates the app's secrets, rekeys them for the nodes and ships the lot. To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
 
 ## Deploying on merge, and previews
 
