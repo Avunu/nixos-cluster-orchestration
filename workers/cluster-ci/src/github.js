@@ -113,6 +113,45 @@ export class GitHub {
     return token;
   }
 
+  // The App's own JWT, kept for half its life: listing what installations cover asks
+  // as the App once per repository.
+  async jwt() {
+    if (!this.signed || this.signed.until <= this.now()) {
+      this.signed = { jwt: await this.appJwt(), until: this.now() + 4 * 60 * 1000 };
+    }
+    return this.signed.jwt;
+  }
+
+  // Every installation of the App, anyone's: it is public. Only the account is read.
+  async installations() {
+    const out = [];
+    for (let page = 1; ; page++) {
+      const got = JSON.parse(await this.raw(await this.jwt(), "GET", `/app/installations?per_page=100&page=${page}`));
+      out.push(...got);
+      if (got.length < 100) return out;
+    }
+  }
+
+  // The installation that covers `repo`, or null: not installed for its owner, or
+  // installed on chosen repositories of which this is not one.
+  async repoInstallation(repo) {
+    try {
+      return JSON.parse(await this.raw(await this.jwt(), "GET", `/repos/${repo}/installation`)).id;
+    } catch (e) {
+      if (e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  // A token GitHub narrows itself: these repositories of the installation (names,
+  // without the owner) and these permissions, whatever the App holds beyond them.
+  async scopedToken(installation, repositories, permissions) {
+    const made = JSON.parse(
+      await this.raw(await this.jwt(), "POST", `/app/installations/${installation}/access_tokens`, { repositories, permissions }),
+    );
+    return { token: made.token, expiresAt: Date.parse(made.expires_at) };
+  }
+
   async api(repo, method, path, body, accept) {
     const text = await this.raw(await this.tokenFor(repo), method, `/repos/${repo}${path}`, body, accept);
     return text ? JSON.parse(text) : null;

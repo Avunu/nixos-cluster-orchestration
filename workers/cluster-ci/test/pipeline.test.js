@@ -1,67 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { nodeFor } from "../src/auth.js";
-import { Pipeline, parseFlakeUrl, renderComment, trackingInputs } from "../src/core.js";
+import { parseFlakeUrl, renderComment, trackingInputs } from "../src/core.js";
 import { GitHub, pemToPkcs8, verifySignature } from "../src/github.js";
 import { previewHost, previewLabel } from "../src/slug.js";
 
-const REPO = "acme/shop";
-const SITE = "acme/cluster";
-
-function harness({ failTunnel = false } = {}) {
-  const calls = [];
-  const stored = {};
-  let comments = 100;
-  let tunnels = 0;
-  const lock = {
-    root: "root",
-    nodes: {
-      root: { inputs: { shop: "shop", nixpkgs: ["cluster", "nixpkgs"], pinned: "pinned", other: "other" } },
-      shop: { original: { type: "git", url: "https://github.com/acme/shop.git", ref: "main", submodules: true } },
-      pinned: { original: { type: "github", owner: "acme", repo: "shop", rev: "abc" } },
-      other: { original: { type: "github", owner: "acme", repo: "other" } },
-    },
-  };
-  const github = {
-    upsertComment: async (repo, pr, id, body) => (calls.push(["comment", repo, pr, id ?? null, body]), id ?? ++comments),
-    setStatus: async (repo, sha, s) => void calls.push(["status", repo, sha, s.state, s.context]),
-    api: async (repo, method, path) => (calls.push(["api", repo, method, path]), { default_branch: "main" }),
-    readFile: async (repo, path, ref) => (calls.push(["read", repo, path, ref]), JSON.stringify(lock)),
-    dispatchWorkflow: async (repo, wf, ref, inputs) => void calls.push(["dispatch", repo, wf, ref, inputs]),
-  };
-  const cloudflare = {
-    createTunnel: async (name) => {
-      if (failTunnel) throw new Error("no");
-      calls.push(["tunnel", name]);
-      return { id: `t${++tunnels}`, secret: "s3cret", account: "acct" };
-    },
-    routeDns: async (host, id) => (calls.push(["dns", host, id]), `d-${id}`),
-    deleteDns: async (id) => void calls.push(["undns", id]),
-    deleteTunnel: async (id) => void calls.push(["untunnel", id]),
-  };
-  const pipeline = new Pipeline({
-    storage: { get: async (k) => stored[k], put: async (k, v) => void (stored[k] = structuredClone(v)) },
-    github,
-    cloudflare,
-    config: { domain: "preview.example.com", workflow: "flake-update.yml" },
-    now: () => 1000,
-    log: () => {},
-  });
-  const agent = (previews = [], version = 0, node = "node1") =>
-    pipeline.sync(node, {
-      version,
-      flake: `github:${SITE}`,
-      apps: [{ app: "shop", repo: REPO, slots: 2 }],
-      previews,
-    });
-  const pr = (action, { number = 7, ref = "feat-x", sha = "a".repeat(40), fork = false } = {}) =>
-    pipeline.webhook("pull_request", {
-      action,
-      repository: { full_name: REPO, default_branch: "main" },
-      pull_request: { number, head: { ref, sha, repo: { full_name: fork ? "mallory/shop" : REPO } } },
-    });
-  return { pipeline, calls, stored, agent, pr, of: (kind) => calls.filter((c) => c[0] === kind) };
-}
+import { REPO, SITE, harness } from "./harness.js";
 
 test("a pull request becomes one preview with its own tunnel, hostname, comment and status", async () => {
   const h = harness();
