@@ -14,6 +14,9 @@
 #
 #   operator  no TPM and the master key. Runs `agenix rekey`, the app a site's flake
 #             exports, from empty.
+#   (a build) avc's runner over the same site, from this site's own `secrets` export:
+#             it reads the committed sources with the master key, agrees with the
+#             committed rekeyed files, and rekeys from empty (`avcRekeyed`).
 #   good      node1, on the software TPM its recipient was made on.
 #   other     the same system, identity file and rekeyed files on a TPM of its own.
 #
@@ -30,6 +33,8 @@
   mkCluster,
   fixtureTopology,
   harness,
+  # The operations tool (lib/avc.nix): its runner rekeys too.
+  avc,
   mutant ? "",
 }:
 let
@@ -87,6 +92,69 @@ let
     timeout 120 ${rekey}/bin/agenix-rekey < /dev/null
     cp -r secrets/rekeyed/node1 $out
   '';
+
+  # What `avc secrets check` and `avc secrets rekey` do (tools/avc/avc/core/secretstore.py),
+  # on the export exactly as a site's flake gives it. The scripts are left out: nothing
+  # here generates, and a script in the export would be built for it.
+  export = pkgs.writeText "secrets-tpm-export.json" (
+    builtins.toJSON (
+      lib.mapAttrs (
+        _: m:
+        m
+        // {
+          generators = lib.mapAttrs (
+            _: g:
+            removeAttrs g [
+              "script"
+              "scriptDrv"
+              "runtimeInputs"
+            ]
+          ) m.generators;
+        }
+      ) site.secrets
+    )
+  );
+  avcRekeyed =
+    pkgs.runCommand "secrets-tpm-avc-rekeyed"
+      {
+        nativeBuildInputs = [
+          (pkgs.python3.withPackages (ps: [ (ps.toPythonModule avc) ]))
+          pkgs.age
+        ];
+      }
+      ''
+        install -m 0400 ${fixture.masterIdentity} ${fixture.masterIdentityAt}
+        mkdir site && cp -r --no-preserve=mode ${fixture.directory}/secrets site/secrets
+        python3 - <<'EOF'
+        import json, shutil
+        from pathlib import Path
+        from avc.core.secretstore import Store
+
+        export = json.loads(Path("${export}").read_text())
+        store = Store(Path("site"), export)
+
+        # A source `age` encrypted by hand, read with the identity the flake names.
+        value = store.get("node1", "canary/value").decode()
+        assert value == "${fixture.canaryValue}", value
+
+        # The files agenix-rekey wrote are the ones the runner expects, by name.
+        ready = store.readiness("node1")
+        assert ready.recipient and not ready.unrekeyed and not ready.orphaned, ready
+        assert sorted(store.expected_rekeyed("node1")) == ${builtins.toJSON committed}
+
+        # Without them the node would be deployed short of both, and the check says so.
+        shutil.rmtree("site/secrets/rekeyed")
+        ready = store.readiness("node1")
+        assert ready.unrekeyed == ("canary/value", "wg-ctrl/private") and not ready.ok, ready
+        written = store.fill_rekeyed()
+        assert len(written) == 2 and not store.readiness("node1").unrekeyed, written
+        # This site generated two of what node1 declares: the rest is still refused.
+        assert "restic/password" in store.readiness("node1").missing
+        # node2 and node3 have no recipient.
+        assert [p.name for p in Path("site/secrets/rekeyed").iterdir()] == ["node1"]
+        EOF
+        cp -r site/secrets/rekeyed/node1 $out
+      '';
 
   tpmNode = {
     imports = [
@@ -202,6 +270,23 @@ pkgs.testers.runNixOSTest {
             fresh = good.succeed(f"{AGE} -d -i {IDENTITY} /root/rekeyed/{name}")
             control("fresh-rekey-decrypts-on-the-tpm", fresh == "${fixture.canaryValue}", f"{name} -> {fresh!r}")
 
+        with subtest("what avc's runner rekeyed decrypts on that TPM too"):
+            # Same names as the committed ones (the build asserted it); the ciphertext is avc's.
+            good.copy_from_host("${avcRekeyed}", "/root/avc-rekeyed")
+            got = {
+                c: good.succeed(f"{AGE} -d -i {IDENTITY} /root/avc-rekeyed/{c}")
+                for c in COMMITTED
+            }
+            canary = [v for c, v in got.items() if c.endswith("shared/canary/value.age")]
+            key = [v for c, v in got.items() if c.endswith("wg-ctrl/private.age")]
+            pub = good.succeed(f"${pkgs.wireguard-tools}/bin/wg pubkey < {WG_KEY}").strip()
+            mine = good.succeed(f"echo {key[0].strip()} | ${pkgs.wireguard-tools}/bin/wg pubkey").strip()
+            control(
+                "avc-rekey-decrypts-on-the-tpm",
+                canary == ["${fixture.canaryValue}"] and mine == pub == "${harness.wg.node1.public}",
+                f"{sorted(got)}: canary {canary!r}, wg-ctrl/private's public half {mine}",
+            )
+
         with subtest("a secret that goes missing on a running node: the watch, not the gate"):
             good.succeed(f"rm $(readlink -f {CANARY})")
             good.wait_until_succeeds(f"grep -qx 'cluster_secrets_missing 1' {METRIC}", timeout=180)
@@ -248,5 +333,5 @@ pkgs.testers.runNixOSTest {
   '';
 }
 // {
-  inherit rekeyed;
+  inherit rekeyed avcRekeyed;
 }

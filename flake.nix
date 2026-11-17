@@ -579,9 +579,9 @@
           );
 
           # The real path, with a software TPM: a master-encrypted secret, rekeyed by
-          # agenix-rekey's own app to a node's TPM recipient, decrypted at boot by that
-          # TPM and by no other, and what a node that could not decrypt looks like
-          # (tests/secrets-tpm.nix).
+          # agenix-rekey's own app and by avc's runner to a node's TPM recipient, decrypted
+          # at boot by that TPM and by no other, and what a node that could not decrypt
+          # looks like (tests/secrets-tpm.nix).
           checks.secrets-tpm = detach (
             _:
             import ./tests/secrets-tpm.nix {
@@ -592,6 +592,7 @@
                 fixtureTopology
                 ;
               harness = fixtureHarness;
+              avc = self'.packages.avc;
             }
           );
 
@@ -798,7 +799,20 @@
                 fixtureTopology
                 ;
               harness = fixtureHarness;
+              avc = self'.packages.avc;
             }).rekeyed;
+          # The same site rekeyed by avc's runner, which the test then decrypts on the TPM.
+          legacyPackages.fixtures.secrets-tpm-avc-rekeyed =
+            (import ./tests/secrets-tpm.nix {
+              inherit
+                pkgs
+                lib
+                mkCluster
+                fixtureTopology
+                ;
+              harness = fixtureHarness;
+              avc = self'.packages.avc;
+            }).avcRekeyed;
 
           # Named mutants: one control removed, and the assertion that must flip
           # (tests/lib/control.py). Not in `checks`, so they add nothing to `nix flake
