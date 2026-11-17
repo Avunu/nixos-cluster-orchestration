@@ -1155,6 +1155,24 @@ let
     (case "TpmBindingMissing" [
       (s ''cluster_boot_tpm_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x5 0x5 1x20")
     ] "20m" none)
+    # The install's slot, never replaced by a bind: seven hours on.
+    (case "TpmBindingUnsealed"
+      [
+        (s ''cluster_boot_tpm_unsealed_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x430")
+      ]
+      "7h"
+      [
+        {
+          instance = "n";
+          device = "/dev/disk/by-partlabel/disk-nvme1-luks";
+          severity = "critical";
+        }
+      ]
+    )
+    # An install in its order: unsealed for two hours, then bound.
+    (case "TpmBindingUnsealed" [
+      (s ''cluster_boot_tpm_unsealed_tokens{instance="n",device="/dev/disk/by-partlabel/disk-nvme1-luks"}'' "1x120 0x320")
+    ] "7h" none)
     (case "CoreDumpsNotOff" [ (s ''cluster_core_pattern_ok{instance="n"}'' "0x30") ] "20m" [
       (crit "warning")
     ])

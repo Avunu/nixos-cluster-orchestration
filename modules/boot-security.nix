@@ -147,6 +147,11 @@ in
       # they are rekeyed to no node. tests/security-policy.nix holds them to an exact
       # allowlist.
       #
+      # `luks/passphrase` is the node's recovery key: the one thing besides its TPM that
+      # opens its disks, and the one copy of it is this ciphertext, encrypted to the
+      # operators. The install gives each leg a slot for it and never uses it to format
+      # (modules/boot-security-core.nix); after that it is read only to recover.
+      #
       # `luks` and `volume-identity` must never be regenerated once a node is
       # installed: the disks and the identity check are bound to these values. A
       # generator is stale when one of its files is missing or its validation hash
@@ -217,6 +222,7 @@ in
           kernelModules = lib.mkIf (nicModules != [ ]) nicModules;
         };
         install = {
+          recoveryKeyFile = gens.luks.files.passphrase.path;
           identitySecretFile = gens.volume-identity.files.secret.path;
           hostKeyFile = gens.initrd-ssh.files."ssh_host_ed25519_key".path;
         };

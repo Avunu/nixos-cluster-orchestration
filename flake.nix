@@ -1044,12 +1044,13 @@
             );
             # ── TPM unlock ─────────────────────────────────────────────────────────
             # The initrd without TPM support: the binding is on the disk and nothing in the
-            # initrd can open it, so every boot waits at the prompt. The build gate that
-            # refuses such an initrd is out too, or there would be no closure to boot.
+            # initrd can open it, so every boot waits at the prompt, the first one after
+            # the install included. The build gate that refuses such an initrd is out too,
+            # or there would be no closure to boot.
             initrd-no-tpm = detach (
               _:
               bootTest ./tests/boot-install.nix {
-                mutant = "unattended-both-devices";
+                mutant = "first-boot-unattended";
                 extraModule =
                   { lib, ... }:
                   {

@@ -5,10 +5,32 @@
 # can open them, reachable over the network, patient with a slow human and not stuck on
 # a dead disk, signed by Lanzaboote on both ESPs, and refusing any root filesystem that
 # doesn't hold the volume identity secret. Each leg opens unattended from a TPM2 slot in
-# its own LUKS header, sealed to PCR 7, and asks for the passphrase when the TPM refuses.
+# its own LUKS header, sealed to PCR 7, and asks for the recovery key when the TPM refuses.
 # Emergency mode burns PCR 7 first, so a shell there can't ask the TPM for the key.
 # cluster-boot-seal is how an operator binds it, and refuses every binding someone else
 # could reproduce.
+#
+# ── a leg's key slots, from install to sealed ──────────────────────────────
+# One mechanism, systemd-cryptenroll's TPM2 slot, in two states:
+#
+#   install   The leg is formatted with a random key made in the installer's memory
+#             (`legInstall` below). Before anything else is written, that key enrolls a
+#             TPM2 slot bound to this TPM and to NO PCR, and adds the node's recovery
+#             key (the `luks/passphrase` secret); then its own slot is removed and the
+#             key deleted. The header holds two slots: the TPM's and the recovery key's.
+#             Secure Boot is not enrolled yet, so there is no PCR 7 worth sealing to:
+#             until `bind`, anything booted on this machine can ask its TPM for the
+#             disk key (README, "Installing a node").
+#   sealed    `cluster-boot-seal bind`, under enforcing Secure Boot, enrolls a slot
+#             sealed to PCR 7 and removes the install's. The TPM slot that is there
+#             authorises it (`--unlock-tpm2-device`), so the recovery key stays where
+#             it is: encrypted to the operators, in the repository. A leg with no TPM
+#             slot that opens (a new disk, a new TPM, a changed PCR 7) needs the
+#             recovery key on stdin instead.
+#
+# A slot's state is read from its token, never assumed: `tpm2-pcrs` holds 7 or it does
+# not. `cluster-boot-seal status` and `check` say which, and the audit exports it
+# (`cluster_boot_tpm_unsealed_tokens`, TpmBindingUnsealed).
 #
 # Written this way round so boot behaviour stays testable without a site: the boot
 # VM tests import this module directly with literal values, and
@@ -60,6 +82,50 @@ let
   # The signing keys are made here, on the node, and never leave it (D7). sbctl's own
   # config is what points it into the new root. --disable-landlock because its sandbox
   # has no idea about /mnt, and that form is the one known to work in an installer.
+  # A leg at install (lib/mk-disk-layout.nix's `leg`). disko defines $device and $name
+  # in the leg's subshell. Store paths, as below: the disko script's closure is what
+  # reaches the installer. Nothing here prints a key: disko runs under `set -x`, and a
+  # key is only ever a file's content.
+  #
+  # The install key is per leg, 32 random bytes in /run of the installer, which is
+  # memory. disko formats the leg with it and opens it. Then, in this order, so that a
+  # failure at any point leaves a leg nothing but that key opens, which the reboot
+  # forgets: the TPM slot, the recovery key, and only then the install key's own slot.
+  # An installer without a TPM, or without the recovery key, must not produce a node:
+  # the first could never unlock itself and the second could never be recovered.
+  installKeyDir = "/run/cluster-install";
+  cryptenroll = "${config.systemd.package}/bin/systemd-cryptenroll";
+  cryptsetup = "${pkgs.cryptsetup}/bin/cryptsetup";
+  legInstall = name: {
+    passwordFile = "${installKeyDir}/${name}.key";
+    preCreateHook = ''
+      key=${installKeyDir}/${name}.key
+      recovery=${lib.escapeShellArg cfg.install.recoveryKeyFile}
+      [ -s "$recovery" ] || { echo "disko-hook: $recovery missing; refusing to install" >&2; exit 1; }
+      tries=0
+      while [ ! -e /dev/tpmrm0 ] && [ "$tries" -lt 15 ]; do ${pkgs.coreutils}/bin/sleep 1; tries=$((tries + 1)); done
+      [ -e /dev/tpmrm0 ] || { echo "disko-hook: no TPM (/dev/tpmrm0) in this installer; refusing to install a node that could not unlock itself" >&2; exit 1; }
+      ${pkgs.coreutils}/bin/mkdir -p -m 0700 ${installKeyDir}
+      ( umask 077; ${pkgs.coreutils}/bin/head -c 32 /dev/urandom | ${pkgs.coreutils}/bin/base64 -w0 > "$key" )
+    '';
+    postCreateHook = ''
+      key=${installKeyDir}/${name}.key
+      recovery=${lib.escapeShellArg cfg.install.recoveryKeyFile}
+      # Bound to this TPM and to no PCR: `cluster-boot-seal bind` replaces it.
+      ${cryptenroll} --unlock-key-file="$key" --tpm2-device=auto --tpm2-pcrs= "$device" \
+        || { echo "disko-hook: could not enroll a TPM slot on $device; refusing to install" >&2; exit 1; }
+      # The recovery key, as it is typed: without a final newline.
+      ${cryptsetup} luksAddKey --key-file "$key" "$device" <(${pkgs.coreutils}/bin/tr -d '\n' < "$recovery") \
+        || { echo "disko-hook: could not add the recovery key to $device; refusing to install" >&2; exit 1; }
+      ${cryptsetup} open --test-passphrase --key-file <(${pkgs.coreutils}/bin/tr -d '\n' < "$recovery") "$device" \
+        || { echo "disko-hook: the recovery key does not open $device; refusing to install" >&2; exit 1; }
+      # The mapping stays open; from here the install key opens nothing.
+      ${cryptsetup} -q luksRemoveKey "$device" "$key" \
+        || { echo "disko-hook: could not remove the install key from $device; refusing to install" >&2; exit 1; }
+      ${pkgs.coreutils}/bin/rm -f "$key"
+    '';
+  };
+
   installRoot = config.disko.rootMountPoint;
   diskoHook = ''
     place() { # src dst mode
@@ -212,9 +278,13 @@ let
       for d in ${
         lib.escapeShellArgs (lib.mapAttrsToList (_: v: v.device) config.boot.initrd.luks.devices)
       }; do
-        if [ -e "$d" ] && n=$(cryptsetup luksDump --dump-json-metadata "$d" 2>/dev/null \
-          | jq '[.tokens[] | select(.type == "systemd-tpm2")] | length') && [ -n "$n" ]; then
+        if [ -e "$d" ] && meta=$(cryptsetup luksDump --dump-json-metadata "$d" 2>/dev/null) \
+          && n=$(printf '%s' "$meta" | jq '[.tokens[] | select(.type == "systemd-tpm2")] | length') && [ -n "$n" ]; then
           echo "cluster_boot_tpm_tokens{device=\"$d\"} $n"
+          # A TPM slot the install made and `cluster-boot-seal bind` has not replaced: bound
+          # to no PCR 7, so it opens for whatever is booted on this machine.
+          u=$(printf '%s' "$meta" | jq '[.tokens[] | select(.type == "systemd-tpm2") | select((."tpm2-pcrs" // []) | index(7) | not)] | length')
+          echo "cluster_boot_tpm_unsealed_tokens{device=\"$d\"} ''${u:-1}"
         fi
       done
     } > "$m/boot_audit.prom.tmp"
@@ -392,6 +462,14 @@ let
         | jq '[.tokens[] | select(.type == "systemd-tpm2")] | length'
     }
 
+    # How many of them are sealed to PCR 7. The install's is sealed to no PCR at all
+    # (legInstall above): it opens for anything booted on this machine, and bind
+    # replaces it.
+    sealed_tokens() {
+      cryptsetup luksDump --dump-json-metadata "$1" \
+        | jq '[.tokens[] | select(.type == "systemd-tpm2") | select((."tpm2-pcrs" // []) | index(7))] | length'
+    }
+
     # Whether a leg's TPM slot opens now: the unseal the next boot's initrd does, against
     # this boot's PCR 7. Nothing is activated, and stdin is closed so it can never turn
     # into a passphrase question. The token plugin is systemd's, and cryptsetup finds it
@@ -418,7 +496,13 @@ let
           echo "FAILED: $d has no TPM binding" >&2
           ok=1
         elif err=$(tpm_opens "$d"); then
-          echo "OK: $d"
+          if [ "$(sealed_tokens "$d")" = "$n" ]; then
+            echo "OK: $d"
+          else
+            # It opens, so the next boot is unattended, which is what this answers. But
+            # it opens for anyone's boot of this machine.
+            echo "OK: $d (NOT SEALED: its TPM slot is the install's, bound to no PCR. Bind once Secure Boot is enforcing)"
+          fi
         else
           echo "FAILED: $d: its TPM slot does not open: ''${err%%$'\n'*}" >&2
           ok=1
@@ -427,12 +511,19 @@ let
       return "$ok"
     }
 
-    # One new TPM slot on a leg, sealed to this boot's PCR 7. The passphrase goes in on
-    # stdin and never on a command line. With --wipe-slot the new slot is written first
-    # and the leg's other TPM slots are removed after it, so a failure loses nothing.
+    # One new TPM slot on a leg, sealed to this boot's PCR 7. What authorises it is the
+    # recovery key when one came on stdin (never on a command line), and otherwise the
+    # leg's own TPM slot, which bind has checked opens now. With --wipe-slot the new
+    # slot is written first and the leg's other TPM slots are removed after it, so a
+    # failure loses nothing.
     tpm_enroll() { # device [--wipe-slot=tpm2]
-      printf %s "$pass" | systemd-cryptenroll --unlock-key-file=/dev/stdin \
-        --tpm2-device=auto --tpm2-pcrs=7 "''${@:2}" "$1"
+      if [ -n "$pass" ]; then
+        printf %s "$pass" | systemd-cryptenroll --unlock-key-file=/dev/stdin \
+          --tpm2-device=auto --tpm2-pcrs=7 "''${@:2}" "$1"
+      else
+        systemd-cryptenroll --unlock-tpm2-device=auto \
+          --tpm2-device=auto --tpm2-pcrs=7 "''${@:2}" "$1" < /dev/null
+      fi
     }
 
     case "''${1:-}" in
@@ -443,7 +534,9 @@ let
           echo "PCR 7 BURNED this boot (emergency recovery). Reboot to clear; do not rebind."
         fi
         select_devices
-        for d in "''${selected[@]}"; do echo "$d: $(tpm_tokens "$d" 2>/dev/null || echo unreadable) TPM slot(s)"; done
+        for d in "''${selected[@]}"; do
+          echo "$d: $(tpm_tokens "$d" 2>/dev/null || echo unreadable) TPM slot(s), $(sealed_tokens "$d" 2>/dev/null || echo unreadable) sealed to PCR 7"
+        done
         need_identity
         echo "identity OK"
         zpool status rpool | grep -E 'state:|crypt-' || true
@@ -477,20 +570,31 @@ let
         need_identity
         select_devices "$want"
         # Every leg is looked at before any is touched, so a refusal changes nothing.
+        # Bound means sealed to PCR 7. A slot the install made is not, and a plain bind
+        # is what replaces it.
         if [ "$replace" != 1 ]; then
           for d in "''${selected[@]}"; do
-            if [ "$(tpm_tokens "$d")" != 0 ]; then
+            if [ "$(sealed_tokens "$d")" != 0 ]; then
               echo "refusing: $d is already bound; use --replace, or --device for the other leg" >&2
               exit 1
             fi
           done
         fi
-        # The passphrase comes on stdin, with or without a final newline, and never on the command line.
+        # The recovery key, if one is given, comes on stdin, with or without a final
+        # newline, and never on the command line. Without one, each leg's own TPM slot
+        # has to open now: it is then what authorises the new slot. A leg with no slot
+        # that opens (a new disk, a new TPM, a PCR 7 that changed) needs the key.
         pass=""
-        IFS= read -r pass || true
+        # Not from a terminal: a person who gives no key means the TPM, and must not be
+        # left at a read that prints nothing.
+        if [ ! -t 0 ]; then IFS= read -r pass || true; fi
         if [ -z "$pass" ]; then
-          echo "refusing: no passphrase on stdin" >&2
-          exit 2
+          for d in "''${selected[@]}"; do
+            if [ "$(tpm_tokens "$d")" = 0 ] || ! tpm_opens "$d" > /dev/null; then
+              echo "refusing: no recovery key on stdin, and $d has no TPM slot that opens now: nothing here may authorise a new one" >&2
+              exit 2
+            fi
+          done
         fi
         for d in "''${selected[@]}"; do
           if [ "$replace" = 1 ]; then
@@ -499,14 +603,32 @@ let
             # this boot has. One that still does not open (a replaced TPM, say) is worth
             # nothing, so it goes, and the leg gets a fresh one.
             if ! tpm_opens "$d" > /dev/null; then
+              # Only with the key: without it the slot being wiped would be the one
+              # thing that could authorise its replacement.
+              if [ -z "$pass" ]; then
+                echo "FAILED: $d: its TPM slot does not open after the bind; run it again with the recovery key" >&2
+                exit 1
+              fi
               systemd-cryptenroll --wipe-slot=tpm2 "$d"
               tpm_enroll "$d"
             fi
+          elif [ "$(tpm_tokens "$d")" != 0 ]; then
+            # Only the install's slot is there (a sealed one was refused above): the new
+            # one first, then that one goes.
+            tpm_enroll "$d" --wipe-slot=tpm2
           else
             tpm_enroll "$d"
           fi
         done
         unset pass
+        # A leg left with a slot that is not sealed would pass the check below, which
+        # asks only whether it opens.
+        for d in "''${selected[@]}"; do
+          if [ "$(sealed_tokens "$d")" != "$(tpm_tokens "$d")" ]; then
+            echo "FAILED: $d still has a TPM slot that is not sealed to PCR 7" >&2
+            exit 1
+          fi
+        done
         check_tpm
         echo "Bound. Reboot and confirm it unlocks unattended."
         ;;
@@ -646,6 +768,18 @@ in
     };
 
     install = {
+      recoveryKeyFile = mkOption {
+        type = types.str;
+        description = "Where the install finds this node's recovery key, which each leg is given a slot for.";
+      };
+      leg = mkOption {
+        type = types.functionTo types.attrs;
+        internal = true;
+        readOnly = true;
+        default = legInstall;
+        defaultText = lib.literalMD "the install key's path and the hooks that enroll the TPM slot and the recovery key";
+        description = "A mapping's name to what its leg's disko `luks` content gets at install (lib/mk-disk-layout.nix, `leg`).";
+      };
       identitySecretFile = mkOption {
         type = types.str;
         description = "Where the disko hook reads the volume identity secret from.";

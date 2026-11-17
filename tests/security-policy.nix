@@ -68,7 +68,7 @@ let
     (import ../lib/mk-disk-layout.nix {
       inherit lib;
       encrypted = true;
-      passwordFile = "/run/partitioning-secrets/passphrase";
+      leg = name: { passwordFile = "/run/cluster-install/${name}.key"; };
     }).disko.devices;
 
   # What a consumer's host file would do, against that baseline.
@@ -1154,16 +1154,53 @@ let
             ) baseline.config.boot.initrd.luks.devices;
           }
           {
-            name = "a secure node's layout reads the luks generator's passphrase, at install only";
+            # The recovery key is given a slot by the leg's hook and formats nothing: what
+            # disko formats with is a key the hook makes in the installer's memory.
+            name = "a secure node's layout reads the luks generator's passphrase, at install only, as the recovery key";
             ok =
               let
                 c = baseline.config;
-                parts = c.disko.devices.disk.nvme1.content.partitions;
+                leg = c.disko.devices.disk.nvme1.content.partitions.luks.content;
                 want = "/run/partitioning-secrets/per-machine/node1/luks/passphrase";
               in
               c.cluster.secrets.generators.luks.files.passphrase.path == want
-              && parts.luks.content.passwordFile == want
+              && c.cluster.boot.install.recoveryKeyFile == want
+              && leg.passwordFile == "/run/cluster-install/crypt-b.key"
+              && lib.hasInfix "recovery=${want}" leg.preCreateHook
+              && lib.hasInfix "recovery=${want}" leg.postCreateHook
               && !(c.boot.initrd.luks.devices.crypt-b ? passwordFile);
+            detail = [ ];
+          }
+          {
+            # In this order: a failure part way leaves a leg only the install key opens,
+            # which is in memory, and never one whose only way in is a TPM slot.
+            name = "a leg's install hook enrolls a TPM slot bound to no PCR, then the recovery key, then removes the install key";
+            ok =
+              let
+                c = baseline.config;
+                legs = map (d: d.content.partitions.luks.content) (lib.attrValues c.disko.devices.disk);
+                order =
+                  hook: needles:
+                  let
+                    at = n: lib.stringLength (lib.head (lib.splitString n hook));
+                    found = lib.all (n: lib.hasInfix n hook) needles;
+                  in
+                  found && lib.sort lib.lessThan (map at needles) == map at needles;
+              in
+              lib.length legs == 2
+              && lib.all (
+                leg:
+                lib.hasInfix "/dev/urandom" leg.preCreateHook
+                && lib.hasInfix "no TPM" leg.preCreateHook
+                && lib.hasInfix "refusing to install" leg.preCreateHook
+                && order leg.postCreateHook [
+                  "systemd-cryptenroll --unlock-key-file=\"$key\" --tpm2-device=auto --tpm2-pcrs= \"$device\""
+                  "cryptsetup luksAddKey --key-file \"$key\""
+                  "cryptsetup open --test-passphrase"
+                  "cryptsetup -q luksRemoveKey \"$device\" \"$key\""
+                  "rm -f \"$key\""
+                ]
+              ) legs;
             detail = [ ];
           }
           {
@@ -1222,6 +1259,13 @@ let
                 (import ../lib/mk-disk-layout.nix {
                   inherit lib;
                   encrypted = true;
+                }).disko.devices.disk.nvme0.device
+              ).success
+              && !(builtins.tryEval
+                (import ../lib/mk-disk-layout.nix {
+                  inherit lib;
+                  encrypted = true;
+                  leg = _: { };
                 }).disko.devices.disk.nvme0.device
               ).success;
             detail = [ ];

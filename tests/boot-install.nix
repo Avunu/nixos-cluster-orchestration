@@ -1,11 +1,16 @@
-# Fresh install to a sealed node, in the order a real node goes through it (section 2 of the
-# design, S2 to S7): the real disko script with the keys it makes on the node, a first boot in
-# Setup Mode, keys enrolled from the running OS, a boot that enforces them, each leg bound to
-# the TPM, and then boots nobody types into, one of them with the network cable out. On the
-# way, a binding that would seal to a PCR 7 someone else can reproduce, or that nobody with
-# the passphrase asked for, is refused. A second generation and another kernel have to keep
+# Fresh install to a sealed node, in the order a real node goes through it (README,
+# "Installing a node"): the real disko script on the machine's own TPM, with the keys it
+# makes on the node; a first boot in Setup Mode that nobody types into, on the TPM slot the
+# install left; keys enrolled from the running OS; a boot that enforces them, still on that
+# slot; each leg bound to the TPM, sealed to PCR 7, with nothing sent to the node; and then
+# boots nobody types into, one of them with the network cable out. On the way, a binding
+# that would seal to a PCR 7 someone else can reproduce, or that nothing on the leg and no
+# recovery key authorised, is refused. A second generation and another kernel have to keep
 # unlocking unattended. Each boot reports how it unlocked, to the real audit Worker on the
 # peer VM.
+#
+# The install through the real installer (nixos-anywhere, `avc boot stage`), the node's age
+# identity and a TPM that is not the node's are tests/install-node.nix.
 {
   pkgs,
   lib,

@@ -140,15 +140,14 @@ in
   systemd.timers.cluster-generation-gc.timerConfig.Persistent = true;
 
   # The layout lives in lib/mk-disk-layout.nix so tests/install-boot.nix and the boot
-  # tests can install and boot it in a VM without dragging in the rest of a node. An
-  # encrypted layout's passphrase path comes from the `luks` generator, which only a
-  # node that has not opted out declares (modules/boot-security.nix).
+  # tests can install and boot it in a VM without dragging in the rest of a node. What
+  # an encrypted leg is formatted with and given at install is the boot core's
+  # (modules/boot-security-core.nix, `cluster.boot.install.leg`).
   disko.devices =
     (import ../lib/mk-disk-layout.nix (
       {
         inherit lib encrypted;
-        passwordFile =
-          if encrypted then config.cluster.secrets.generators.luks.files.passphrase.path else null;
+        leg = if encrypted then config.cluster.boot.install.leg else null;
       }
       // lib.optionalAttrs (node ? disks) { devices = node.disks; }
       // lib.optionalAttrs (node ? swapPerDiskGiB) { swapSizePerDiskGiB = node.swapPerDiskGiB; }

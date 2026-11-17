@@ -5,7 +5,10 @@
 #   encrypted = false   lib/disk-layout.nix, for nodes that carry a reason in
 #                       insecurePlaintextBoot, and for tests/install-boot.nix.
 #   encrypted = true    every other node. Each leg of the mirror sits inside LUKS and
-#                       swap takes a random key per boot.
+#                       swap takes a random key per boot. What a leg is formatted with,
+#                       and what is done to it before and after, is `leg`'s: on a node,
+#                       modules/boot-security-core.nix's (a key that exists only in the
+#                       installer's memory, then a TPM slot and the recovery key).
 #
 # A plain function, not a module. A module function's argument defaults are ignored
 # by the module system (`key ? "/tmp/k"` fails with `attribute 'key' missing`), and a
@@ -31,13 +34,18 @@
   # only once its compressed pool, 20% of RAM, is full. A partition's size is fixed at
   # install: changing this on an installed node changes nothing until it is reinstalled.
   swapSizePerDiskGiB ? 32,
-  # Encrypted only: where disko reads the initial LUKS passphrase. Null would make
-  # disko ask at the terminal, which a remote install has no one to answer.
-  passwordFile ? null,
+  # Encrypted only: the mapping's name (`crypt-a`) to what is merged into that leg's
+  # disko `luks` content. It must give `passwordFile`, where disko reads the key it
+  # formats the leg with: without one disko would ask at the terminal, which a remote
+  # install has no one to answer. Hooks (`preCreateHook`, `postCreateHook`) go here too.
+  leg ? null,
 }:
 assert lib.assertMsg (
-  encrypted -> passwordFile != null
-) "mk-disk-layout: the encrypted layout needs passwordFile";
+  encrypted -> leg != null
+) "mk-disk-layout: the encrypted layout needs `leg`, which names each leg's passwordFile";
+assert lib.assertMsg (
+  encrypted -> (leg "crypt-a").passwordFile or null != null
+) "mk-disk-layout: `leg` must give each leg a passwordFile, or disko asks at the terminal";
 let
   # zswap (modules/zfs-host.nix) needs a real disk-backed swap device behind
   # it — a swapfile on a zvol deadlocks under memory pressure (the zvol's own
@@ -99,10 +107,10 @@ let
   poolLeg =
     letter:
     if encrypted then
-      {
+      leg "crypt-${letter}"
+      // {
         type = "luks";
         name = "crypt-${letter}";
-        inherit passwordFile;
         extraFormatArgs = [
           "--type"
           "luks2"
@@ -119,8 +127,9 @@ let
             # gate decides when to stop waiting for it.
             "nofail"
             "x-systemd.device-timeout=30s"
-            # Wait for the TPM and try this leg's TPM slot before asking anyone
-            # (cluster-boot-seal bind makes the slot; a leg without one just asks).
+            # Wait for the TPM and try this leg's TPM slot before asking anyone (the
+            # install makes one, cluster-boot-seal bind seals it to PCR 7; a leg
+            # without one just asks).
             "tpm2-device=auto"
           ];
         };

@@ -357,6 +357,18 @@ in
           summary = "{{ $labels.device }} on {{ $labels.instance }} has no TPM binding";
           description = "The next reboot waits for a passphrase. `avc boot bind <node> --device {{ $labels.device }}`.";
         })
+        # The install's TPM slot is bound to no PCR, so the TPM gives the disk key to
+        # whatever is booted on the machine: a rescue system, another disk. It is meant to
+        # last from the install to `avc boot bind`, which is hours with the Secure Boot
+        # enrolment between them, hence the `for`.
+        (rule {
+          alert = "TpmBindingUnsealed";
+          expr = "cluster_boot_tpm_unsealed_tokens > 0";
+          for = "6h";
+          severity = "critical";
+          summary = "{{ $labels.device }} on {{ $labels.instance }} has a TPM slot that is not sealed to PCR 7";
+          description = "Anything booted on this machine can ask its TPM for the disk key. Finish the install: `avc boot enroll <node>`, reboot, `avc boot bind <node>` (README, Installing a node).";
+        })
         (rule {
           alert = "CoreDumpsNotOff";
           expr = "cluster_core_pattern_ok == 0";

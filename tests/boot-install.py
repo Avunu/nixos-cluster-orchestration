@@ -121,8 +121,25 @@ def what_the_next_boot_needs():
         rc == 1 and f"{device} has no TPM binding" in out and tokens_in(text)[name] == "0",
         f"rc={rc}\n{out}\n{text}",
     )
+    # Nothing on that leg can authorise a new slot now but the recovery key: a bind that is
+    # sent none (`avc boot bind` without --recovery-key) binds nothing, and neither does a
+    # wrong one.
+    rc_none, out_none = bind("--device", device, passphrase="")
+    rc_wrong, out_wrong = bind("--device", device, passphrase=WRONG)
+    control(
+        "bind-refused-without-passphrase",
+        rc_none == 2
+        and "no recovery key on stdin" in out_none
+        and rc_wrong != 0
+        and tpm_tokens()[name] == 0,
+        f"none: rc={rc_none} {out_none.strip()}; wrong: rc={rc_wrong} {out_wrong.strip()[-300:]}; tokens={tpm_tokens()}",
+    )
     rc, out = bind("--device", device)
-    control("seal-check-rebound-leg", rc == 0 and set(tpm_tokens().values()) == {1}, f"rc={rc}\n{out}")
+    control(
+        "seal-check-rebound-leg",
+        rc == 0 and set(tpm_tokens().values()) == {1} and set(sealed_tokens().values()) == {1},
+        f"rc={rc}\n{out}",
+    )
 
     # A slot that is there and does not open: sealed to a PCR 7 that is not this firmware's,
     # as a binding made before a firmware update is after it. The header shows one TPM slot,
@@ -143,14 +160,20 @@ def what_the_next_boot_needs():
         f"rc={rc}\n{out}\n{text}",
     )
     # Bound already, so a plain bind refuses and leaves it. --replace is what puts it right,
-    # and leaves one slot on each leg.
+    # and leaves one slot on each leg. The stale slot does not open, so it authorises
+    # nothing: --replace with no key is refused, and the key is what renews it.
     rc_plain, out_plain = bind("--device", device)
+    rc_nokey, out_nokey = bind("--replace", passphrase="")
     rc, out = bind("--replace")
     rc_check, out_check = seal_tool("check")
     control(
         "bind-replace-renews-a-stale-slot",
         rc_plain != 0
         and "already bound" in out_plain
+        and rc_nokey == 2
+        and "no recovery key on stdin" in out_nokey
+        and set(sealed_tokens().values()) == {1}
+        and recovery_key_opens()
         and rc == 0
         and rc_check == 0
         and set(tpm_tokens().values()) == {1},
@@ -255,18 +278,38 @@ def report_tpm():
     )
 
 
+def install_slot_state():
+    """The legs as an install leaves them, seen from the running node: the seal tool says the
+    next boot is unattended and that the slot is not sealed, and the audit exports both."""
+    legs = sorted(LUKS_DEVICES.items())
+    rc, out = seal_tool("check")
+    text = audit_all()
+    unsealed = {n: audit_value(text, f'cluster_boot_tpm_unsealed_tokens{{device="{d}"}}') for n, d in legs}
+    tokens = {n: audit_value(text, f'cluster_boot_tpm_tokens{{device="{d}"}}') for n, d in legs}
+    ok = (
+        rc == 0
+        and out.count("NOT SEALED") == len(legs)
+        and set(unsealed.values()) == {"1"}
+        and set(tokens.values()) == {"1"}
+        and set(sealed_tokens().values()) == {0}
+    )
+    return ok, f"rc={rc} unsealed={unsealed} tokens={tokens} sealed={sealed_tokens()}\n{out}"
+
+
 def main():
     peer.start()
     peer.wait_for_unit("multi-user.target")
-    provision(inspect=installed)
+    # The machine, before anything is on it: its firmware variables and its TPM. The install
+    # runs on that TPM, as a node's does from its own rescue boot, and its slots are kept.
+    firmware = new_firmware()
+    provision(inspect=installed, firmware=firmware, keep_install_slots=True)
 
     disks = new_case()
-    firmware = new_firmware()
 
-    # ── S3: Setup Mode, passphrase typed ───────────────────────────────────
-    boot(disks, firmware=firmware)
-    booted = type_until_stage2(target, serial())
-    control("first-boot-reaches-stage-2", booted, "no stage 2")
+    # ── S3: Setup Mode, and nobody types ───────────────────────────────────
+    # The install's TPM slot opens both legs: no passphrase, no initrd SSH, no console.
+    ok, detail = unattended(disks, firmware)
+    control("first-boot-unattended", ok, detail)
     target.wait_for_unit("multi-user.target")
     status = pool_status()
     secure = secure_boot_status()
@@ -282,19 +325,29 @@ def main():
     journal = target.succeed("journalctl -b -o cat | grep 'volume-identity:' || true")
     control("identity-ok-first-boot", "volume-identity: OK" in journal, journal)
     setup_pcr7 = pcr7()
+    ok, detail = install_slot_state()
+    control("install-slot-is-reported-unsealed", ok, detail)
 
     for esp in ("/boot", "/boot-fallback"):
         ok, out = sbctl_verified(esp)
         control(f"sbctl-verify{esp.replace('/', '-')}", ok, out)
 
     # The Setup Mode PCR 7 is the same constant on every machine, so a binding made now
-    # would open for anyone who clears the keys. The right passphrase, and still refused.
+    # would open for anyone who clears the keys. The right key, and with none (the TPM slot
+    # that is there would authorise it), and still refused: nothing is sealed, and the
+    # install's slot is left as it was.
     rc, out = bind()
-    tokens = tpm_tokens()
+    rc_none, out_none = bind(passphrase="")
+    tokens, sealed = tpm_tokens(), sealed_tokens()
     control(
         "bind-refused-in-setup-mode",
-        rc != 0 and "refusing: SecureBoot=0 SetupMode=1" in out and set(tokens.values()) == {0},
-        f"rc={rc} tokens={tokens}\n{out}",
+        rc != 0
+        and "refusing: SecureBoot=0 SetupMode=1" in out
+        and rc_none != 0
+        and "refusing: SecureBoot=0 SetupMode=1" in out_none
+        and set(sealed.values()) == {0}
+        and set(tokens.values()) == {1},
+        f"rc={rc} rc(no key)={rc_none} tokens={tokens} sealed={sealed}\n{out}\n{out_none}",
     )
 
     # ── S4: enroll ─────────────────────────────────────────────────────────
@@ -309,10 +362,11 @@ def main():
     )
     power_off()
 
-    # ── S5: enforcing ──────────────────────────────────────────────────────
-    boot(disks, firmware=firmware)
-    booted = type_until_stage2(target, serial())
-    control("enforcing-reaches-stage-2", booted, "no stage 2 once enrolled")
+    # ── S5: enforcing, still on the install's slot ─────────────────────────
+    # PCR 7 has changed and the slot does not care: it is bound to none. That is what gets
+    # the node to the bind without anyone typing, and why the bind must follow.
+    ok, detail = unattended(disks, firmware)
+    control("enforcing-reaches-stage-2", ok, detail)
     target.wait_for_unit("multi-user.target")
     secure = secure_boot_status()
     enforcing_pcr7 = pcr7()
@@ -329,39 +383,45 @@ def main():
     target.log(f"PCR 7 authority events by data length (48 is a hash, more a certificate):\n{pcr7_authorities()}")
 
     # ── S6: bind ───────────────────────────────────────────────────────────
-    # The passphrase is what authorises a new slot: none, or the wrong one, binds nothing.
-    rc, out = bind(passphrase="")
-    tokens = tpm_tokens()
-    control(
-        "bind-refused-without-passphrase",
-        rc == 2 and "no passphrase on stdin" in out and set(tokens.values()) == {0},
-        f"rc={rc} tokens={tokens}\n{out}",
-    )
+    # A key that is not the node's authorises nothing: no slot is sealed, and the install's
+    # is still there and still opens. (A leg with no slot that opens, and no key: refused,
+    # in what_the_next_boot_needs, where there is such a leg.)
     rc, out = bind(passphrase=WRONG)
-    tokens = tpm_tokens()
+    tokens, sealed = tpm_tokens(), sealed_tokens()
+    rc_tpm, _ = tpm_answer()
     control(
         "bind-wrong-passphrase-binds-nothing",
-        rc != 0 and set(tokens.values()) == {0},
-        f"rc={rc} tokens={tokens}\n{out}",
+        rc != 0 and set(sealed.values()) == {0} and set(tokens.values()) == {1} and rc_tpm == 0,
+        f"rc={rc} tokens={tokens} sealed={sealed} TPM rc={rc_tpm}\n{out}",
     )
-    # One TPM slot on each leg, and the TPM opens both here, under the PCR 7 it sealed to.
-    rc, out = bind()
-    tokens = tpm_tokens()
+    # As `avc boot bind` runs it: nothing on stdin, so the recovery key never leaves the
+    # repository. Each leg's own slot authorises the new one. One TPM slot on each leg
+    # afterwards, sealed to PCR 7: the install's is gone. The TPM opens both here, under the
+    # PCR 7 it sealed to, and the recovery key's slot is untouched.
+    rc, out = bind(passphrase="")
+    tokens, sealed = tpm_tokens(), sealed_tokens()
     rc_tpm, answer = tpm_answer()
     control(
         "bind",
-        rc == 0 and set(tokens.values()) == {1} and rc_tpm == 0,
-        f"bind rc={rc} tokens={tokens}\n{out}\nTPM rc={rc_tpm}: {answer.strip()[-300:]}",
+        rc == 0
+        and set(tokens.values()) == {1}
+        and set(sealed.values()) == {1}
+        and rc_tpm == 0
+        and recovery_key_opens(),
+        f"bind rc={rc} tokens={tokens} sealed={sealed}\n{out}\nTPM rc={rc_tpm}: {answer.strip()[-300:]}",
     )
-    # Bound twice is refused, and the slots stay as they were.
+    text = audit_all()
+    unsealed = {d: audit_value(text, f'cluster_boot_tpm_unsealed_tokens{{device="{d}"}}') for d in LUKS_DEVICES.values()}
+    control("bind-leaves-nothing-unsealed", set(unsealed.values()) == {"0"}, f"{unsealed}\n{text}")
+    # Bound twice is refused, with a key or without, and the slots stay as they were.
     rc, out = bind()
+    rc_none, out_none = bind(passphrase="")
     tokens = tpm_tokens()
     control(
         "bind-twice-refused",
-        rc != 0 and "already bound" in out and set(tokens.values()) == {1},
-        f"rc={rc} tokens={tokens}\n{out}",
+        rc != 0 and "already bound" in out and rc_none != 0 and "already bound" in out_none and set(tokens.values()) == {1},
+        f"rc={rc} rc(no key)={rc_none} tokens={tokens}\n{out}\n{out_none}",
     )
-
     # ── a new generation, as a deploy installs one ─────────────────────────
     newgen = target.succeed(f"readlink -f {TOPLEVEL}/specialisation/newgen").strip()
     set_generation(newgen)
