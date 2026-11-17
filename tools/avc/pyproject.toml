@@ -7,7 +7,7 @@ name = "avc"
 version = "0.1.0"
 description = "Guided day-to-day operations for a nixos-cluster-orchestration cluster"
 requires-python = ">=3.12"
-dependencies = ["questionary", "rich"]
+dependencies = ["questionary", "rich", "cryptography"]
 
 [project.scripts]
 avc = "avc.cli:main"
