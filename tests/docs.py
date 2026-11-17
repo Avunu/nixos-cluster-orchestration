@@ -105,7 +105,10 @@ groups = {g for g, _ in actions}
 # Each action's flags, from its Arg(..., flag=True) and Arg(..., option=True) declarations.
 flags: dict[tuple[str, str], set[str]] = {}
 for m in re.finditer(r'@action\(\s*"([\w-]+)",\s*"([\w-]+)"(.*?)\)\ndef ', flows, re.S):
-    flags[(m.group(1), m.group(2))] = set(re.findall(r'Arg\(\s*"([\w-]+)"[^)]*(?:flag|option)=True', m.group(3)))
+    # A flag is its argument's name with hyphens, as tools/avc/avc/cli.py spells it.
+    flags[(m.group(1), m.group(2))] = {
+        name.replace("_", "-") for name in re.findall(r'Arg\(\s*"([\w-]+)"[^)]*(?:flag|option)=True', m.group(3))
+    }
 if len(actions) < 30 or ("boot", "bind") not in actions:
     failures.append(f"the avc action registry did not parse ({len(actions)} actions): this test proves nothing")
 

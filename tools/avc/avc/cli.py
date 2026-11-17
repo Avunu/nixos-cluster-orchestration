@@ -26,9 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
             ap = sub.add_parser(a.name, help=a.title, description=a.title)
             for arg in a.args:
                 if arg.flag:
-                    ap.add_argument(f"--{arg.name}", action="store_true", help=arg.help)
+                    ap.add_argument(f"--{arg.name.replace('_', '-')}", dest=arg.name, action="store_true", help=arg.help)
                 elif arg.option:
-                    ap.add_argument(f"--{arg.name}", help=arg.help)
+                    ap.add_argument(f"--{arg.name.replace('_', '-')}", dest=arg.name, help=arg.help)
                 else:
                     # Positionals are optional on the command line: a missing
                     # one is asked for, the same as in the menu.

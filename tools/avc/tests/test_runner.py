@@ -8,8 +8,10 @@ operator's machine does: the export is the shape `nix eval --json .#clusterSecre
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -104,6 +106,11 @@ def declare(root: Path, machine: str, name: str, files: dict, share=False, promp
                 "deploy": f.get("deploy", True),
                 "neededFor": f.get("neededFor", "services"),
                 "storedAs": f"secrets/{rel}/{name}/{n}" + (".age" if f.get("secret", True) else ""),
+                "path": (
+                    f"/run/partitioning-secrets/{rel}/{name}/{n}"
+                    if f.get("neededFor") == "partitioning"
+                    else f"/run/secrets/{rel}/{name}/{n}"
+                ),
             }
             for n, f in files.items()
         },
@@ -127,7 +134,16 @@ def machine_export(root: Path, machine: str, identities: list, mesh_hash="h1", e
         "luks": declare(root, machine, "luks", {"passphrase": {"neededFor": "partitioning"}}),
     }
     gens.update(extra or {})
-    return {"machine": machine, "recipient": None, "masterIdentities": identities, "extraRecipients": [], "generators": gens}
+    return {
+        "machine": machine,
+        "recipient": None,
+        "recipientStoredAs": f"secrets/recipients/{machine}.pub",
+        "identityStoredAs": f"secrets/identities/{machine}.age",
+        "identityPath": "/var/lib/cluster-secrets/identity.txt",
+        "masterIdentities": identities,
+        "extraRecipients": [],
+        "generators": gens,
+    }
 
 
 @dataclasses.dataclass
@@ -683,3 +699,208 @@ def test_set_and_reveal_through_the_commands(cluster, site, capsys):
         actions.find("secrets", "set").run(ctx, {"var": "node1:luks/passphrase"})
     assert refused.type.__name__ == "Aborted"
     assert not (site.root / "secrets/per-machine/node1/luks/passphrase.age").exists()
+
+
+# ── an install's step between the kexec and the partitioning ─────────────────
+
+from avc.flows import boot as boot_flow  # noqa: E402
+
+
+class FakeInstaller:
+    """The target in its installer, as `stage_node` uses it. Its "TPM" is the set of
+    identities made on it: one of those decrypts here, and nothing else does. The real
+    thing, on a real TPM and through a real nixos-anywhere, is tests/install-node.nix."""
+
+    target = "root@192.0.2.9"
+
+    def __init__(self, tmp: Path, tpm: bool = True) -> None:
+        self.tmp, self.tpm = tmp, tpm
+        self.keys: list[str] = []
+        self.copied: list[list[str]] = []
+        self.generated = 0
+
+    def copy(self, paths):
+        self.copied.append(list(paths))
+
+    def clear_tpm(self):
+        self.keys.clear()
+
+    def run(self, command, input=None, check=True, timeout=None):
+        done = lambda rc, out="": subprocess.CompletedProcess([], rc, out, "")  # noqa: E731
+        if command == boot_flow.WAIT_FOR_TPM:
+            return done(0 if self.tpm else 1)
+        if command.endswith("age-plugin-tpm --generate"):
+            self.generated += 1
+            f = self.tmp / f"tpm-key-{self.generated}"
+            keygen(f)
+            self.keys.append(f.read_text().strip())
+            return done(0, f.read_text())
+        if "/bin/age -d" in command:
+            # The identity is this command's stdin and the ciphertext is in it, base64.
+            if input.strip() not in self.keys:
+                return done(1)
+            ciphertext = base64.b64decode(re.search(r"printf %s (\S+) \| base64 -d", command).group(1))
+            ident = self.tmp / "presented"
+            ident.write_text(input)
+            p = subprocess.run(["age", "-d", "-i", str(ident)], input=ciphertext, capture_output=True)
+            return done(p.returncode, p.stdout.decode())
+        raise AssertionError(f"unexpected command on the installer: {command}")
+
+
+@pytest.fixture
+def staging(site, scratch, tmp_path, monkeypatch):
+    """node2, generated and never installed, and the two directories the installer hands
+    its hook: one copied to the new root, one (a tmpfs) sent into the installer's memory."""
+    monkeypatch.setenv(boot_flow.AGE_ENV, "/nix/store/age")
+    monkeypatch.setenv(boot_flow.AGE_TPM_ENV, "/nix/store/age-plugin-tpm")
+    store = site.store()
+    provision(store)
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    keys = scratch / "disk-keys"
+    keys.mkdir()
+    return store, FakeInstaller(tmp_path), extra, keys
+
+
+def files_under(d: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+def test_stage_makes_the_identity_rekeys_to_it_and_stages_what_the_install_reads(site, staging, monkeypatch):
+    store, installer, extra, keys = staging
+    rekeys = []
+    recipient = boot_flow.stage_node(store, "node2", installer, extra, keys, rekey=lambda: rekeys.append(store.fill_rekeyed()))
+
+    # Made on the target, with the plugin this library pins copied to it first.
+    assert installer.generated == 1 and installer.copied == [["/nix/store/age", "/nix/store/age-plugin-tpm"]]
+    identity = installer.keys[0]
+    assert recipient in identity
+    # In the repository: the recipient in the clear, the identity file as ciphertext that
+    # the operators' key opens.
+    assert (site.root / "secrets/recipients/node2.pub").read_text() == recipient + "\n"
+    assert site.plain("secrets/identities/node2.age").strip() == identity
+    assert identity.encode() not in b"".join(site.snapshot().values())
+    # Rekeyed before the system is built: what node2 reads now opens with the key made here.
+    assert len(rekeys) == 1 and len([f for f in rekeys[0] if f.startswith("secrets/rekeyed/node2/")]) == 5
+    made = site.root / "made-on-the-tpm"
+    made.write_text(identity + "\n")
+    token = next(p for p in (site.root / "secrets/rekeyed/node2").rglob("*.age") if p.name == "token.age")
+    assert site.plain(str(token), made) == TOKEN
+    assert store.readiness("node2").ok
+
+    # For the new root: the identity file, where the node's agenix looks, and only that.
+    staged = files_under(extra)
+    assert list(staged) == ["var/lib/cluster-secrets/identity.txt"]
+    assert staged["var/lib/cluster-secrets/identity.txt"].decode().strip() == identity
+    assert (extra / "var/lib/cluster-secrets/identity.txt").stat().st_mode & 0o777 == 0o400
+    # For the installer's memory: the partitioning secrets, at the paths disko reads, in plaintext.
+    disk = files_under(keys)
+    assert list(disk) == ["run/partitioning-secrets/per-machine/node2/luks/passphrase"]
+    assert disk["run/partitioning-secrets/per-machine/node2/luks/passphrase"].decode() == site.plain("secrets/per-machine/node2/luks/passphrase.age")
+    assert all(p.stat().st_mode & 0o777 == 0o400 for p in keys.rglob("*") if p.is_file())
+    # And nowhere else: no service secret, and nothing in the clear in the repository.
+    assert disk["run/partitioning-secrets/per-machine/node2/luks/passphrase"] not in b"".join(site.snapshot().values())
+
+
+def test_stage_keeps_the_identity_of_a_tpm_that_still_answers_for_it(site, staging):
+    store, installer, extra, keys = staging
+    first = boot_flow.stage_node(store, "node2", installer, extra, keys, rekey=store.fill_rekeyed)
+    before = site.snapshot()
+    # A reinstall on the same machine: the same identity, and nothing in the repository moves.
+    again = site.store()
+    assert boot_flow.stage_node(again, "node2", installer, extra, keys, rekey=again.fill_rekeyed) == first
+    assert installer.generated == 1 and site.snapshot() == before
+    assert files_under(extra)["var/lib/cluster-secrets/identity.txt"].decode().strip() == installer.keys[0]
+
+
+def test_stage_makes_a_new_identity_when_the_tpm_no_longer_answers_and_rekeys_all_of_it(site, staging):
+    store, installer, extra, keys = staging
+    old = boot_flow.stage_node(store, "node2", installer, extra, keys, rekey=store.fill_rekeyed)
+    old_files = set(files_under(site.root / "secrets/rekeyed/node2"))
+    # The TPM was cleared, or the mainboard replaced: the identity in the repository names a key that is gone.
+    installer.clear_tpm()
+    again = site.store()
+    new = boot_flow.stage_node(again, "node2", installer, extra, keys, rekey=again.fill_rekeyed)
+    assert new != old and installer.generated == 2
+    assert (site.root / "secrets/recipients/node2.pub").read_text() == new + "\n"
+    assert site.plain("secrets/identities/node2.age").strip() == installer.keys[0]
+    # Every file is named by the recipient it is for: all new, the old ones gone.
+    now = set(files_under(site.root / "secrets/rekeyed/node2"))
+    assert len(now) == 5 and not (now & old_files)
+    assert again.readiness("node2").ok
+
+
+def test_stage_refuses_before_anything_is_written(site, staging, tmp_path):
+    store, installer, extra, keys = staging
+    before = site.snapshot()
+
+    # A disk secret is never written to a disk on the operator's machine.
+    on_disk = tmp_path / "keys-on-a-disk"
+    on_disk.mkdir()
+    if secretstore.filesystem(on_disk) not in secretstore.RAM_FILESYSTEMS:
+        with pytest.raises(AvcError, match="not on a tmpfs"):
+            boot_flow.stage_node(store, "node2", installer, extra, on_disk, rekey=store.fill_rekeyed)
+
+    # A machine with no TPM could never unlock itself, or decrypt a secret.
+    with pytest.raises(AvcError, match="has no TPM"):
+        boot_flow.stage_node(store, "node2", FakeInstaller(tmp_path, tpm=False), extra, keys, rekey=store.fill_rekeyed)
+
+    # Its recovery key was never generated: an install without one could never be recovered.
+    (site.root / "secrets/per-machine/node2/luks/passphrase.age").rename(tmp_path / "away")
+    with pytest.raises(AvcError, match="luks/passphrase"):
+        boot_flow.stage_node(site.store(), "node2", installer, extra, keys, rekey=store.fill_rekeyed)
+    (tmp_path / "away").rename(site.root / "secrets/per-machine/node2/luks/passphrase.age")
+
+    assert site.snapshot() == before and installer.generated == 0
+    assert files_under(extra) == {} and files_under(keys) == {}
+
+
+def test_a_nodes_identity_file_follows_the_master_recipients(site, staging, tmp_path):
+    # `avc secrets fix` after an operator's key changes: the identity files are sources too.
+    store, installer, extra, keys = staging
+    boot_flow.stage_node(store, "node2", installer, extra, keys, rekey=store.fill_rekeyed)
+    assert site.root / "secrets/identities/node2.age" in store.sources()
+    other = tmp_path / "other-master.txt"
+    other_pub = keygen(other)
+    moved = site.store(identities=[{"identity": str(other), "pubkey": other_pub}])
+    moved._plain = dict(store._plain)  # what the old key could still read, as `fix` reads it
+    moved.fix()
+    assert site.plain("secrets/identities/node2.age", other).strip() == installer.keys[0]
+
+
+def test_identity_on_a_running_node_puts_the_file_back_or_makes_a_new_one(cluster, site, tmp_path, monkeypatch):
+    # `avc boot identity`: the step an install takes, on a node that already runs.
+    ctx, store, calls = cluster
+    monkeypatch.setenv(boot_flow.AGE_ENV, "/nix/store/age")
+    monkeypatch.setenv(boot_flow.AGE_TPM_ENV, "/nix/store/age-plugin-tpm")
+    monkeypatch.setattr(boot_flow.ship, "ship", lambda ctx, message, **k: calls["shipped"].append((message, k.get("paths"))) or True)
+    provision(store)
+    node = FakeInstaller(tmp_path)
+    written = []
+
+    def run(command, input=None, check=True, timeout=None):
+        if command.startswith("install -D -m 0400 /dev/stdin "):
+            written.append((command.split()[-1], input))
+            return subprocess.CompletedProcess([], 0, "", "")
+        return FakeInstaller.run(node, command, input=input, check=check, timeout=timeout)
+
+    node.run = run
+    monkeypatch.setattr(boot_flow, "Installer", lambda target, opts, control: node)
+    node.close = lambda: None
+
+    # node1's TPM has nothing for the recipient in the repository (the fixture's is a
+    # plain key): a new identity, committed, rekeyed, shipped, and the file on the node.
+    old = store.recipient("node1")
+    actions.find("boot", "identity").run(ctx, {"node": "node1"})
+    new = store.recipient("node1")
+    assert new != old and node.generated == 1
+    assert written == [("/var/lib/cluster-secrets/identity.txt", node.keys[0] + "\n")]
+    assert site.plain("secrets/identities/node1.age").strip() == node.keys[0]
+    assert calls["agenix"] == 1 and store.readiness("node1").ok
+    assert calls["shipped"][-1] == ("feat(secrets): node1's new age identity, and what it reads rekeyed to it", ["secrets/"])
+
+    # The file alone was lost: the same identity goes back, and the repository does not move.
+    before, shipped = site.snapshot(), len(calls["shipped"])
+    actions.find("boot", "identity").run(ctx, {"node": "node1"})
+    assert node.generated == 1 and site.snapshot() == before and len(calls["shipped"]) == shipped
+    assert written[-1] == ("/var/lib/cluster-secrets/identity.txt", node.keys[0] + "\n")

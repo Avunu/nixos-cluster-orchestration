@@ -1,9 +1,16 @@
 """Boot: install, unlock and seal an encrypted node (modules/boot-security.nix), and keep
 a node off a closure that did not survive a reboot.
 
-The order of a fresh install is the README's "Installing a node": preflight, install, unlock
-(S3), enroll (S4), unlock again (S5), bind (S6), reboot (S7). Each command runs one step and
-says what comes next.
+The order of a fresh install is the README's "Installing a node": preflight, install (which
+makes the node's age identity on its TPM, and leaves each leg a TPM slot bound to no PCR and
+a slot for the recovery key), a first boot nobody types into, enroll, reboot, bind (the TPM
+slot sealed to PCR 7), reboot. Each command runs one step and says what comes next.
+
+Where a disk secret is, at an install: the recovery key (`luks/passphrase`) is ciphertext in
+the repository, encrypted to the operators; `stage` decrypts it into a tmpfs here, the
+installer (nixos-anywhere) sends it into the target's /run, the disko hook gives each leg a
+slot for it, and the target's reboot and the installer's exit forget both copies. The key
+a leg is formatted with never leaves the target's memory. Nothing else opens a disk.
 
 Rollback's order: hold every node, revert or pin the private repo, boot the old
 generation at the console, then `avc boot rollback`.
@@ -11,9 +18,13 @@ generation at the console, then `avc boot rollback`.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
+import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -21,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 from avc import ui
 from avc.actions import Arg, action
-from avc.core import deploy_state, proc, repo, secretstore
+from avc.core import deploy_state, proc, repo, secretstore, ship
 from avc.core.node import HOLD_DIR, Node, NothingAfter
 from avc.errors import AvcError
 
@@ -90,6 +101,27 @@ def preflight_facts(ctx: Ctx, node: str) -> dict[str, Any]:
     return facts
 
 
+def _opted_out(ctx: Ctx, node: str) -> bool:
+    info = ctx.index.nodes.get(node)
+    if info is None:
+        raise AvcError(f"unknown node {node!r} (known: {', '.join(ctx.index.nodes)})")
+    return not (info.get("boot") or {}).get("enabled")
+
+
+PLAIN_PREFLIGHT_APPLY = "c: { toplevel = c.system.build.toplevel.drvPath; disko = c.system.build.diskoScript.drvPath; }"
+
+
+def plain_preflight(ctx: Ctx, node: str) -> None:
+    """Before installing a node that opted out of boot security: the same two refusals, less
+    what such a node does not have (an identity hash, an initrd host key)."""
+    changed = _changed_secrets(ctx.root)
+    if changed:
+        raise AvcError("secrets are not committed (git add secrets, then commit):\n  " + "\n  ".join(changed))
+    with ui.spin(f"evaluating {node}: toplevel and disko script"):
+        proc.out(["nix", "eval", "--json", f".#nixosConfigurations.{node}.config", "--apply", PLAIN_PREFLIGHT_APPLY], cwd=ctx.root)
+    ui.ok(f"{node} evaluates")
+
+
 def _fingerprint(pub: str | None) -> str:
     if not pub:
         return "(none: run `avc secrets provision`)"
@@ -107,15 +139,56 @@ def preflight(ctx: Ctx, node: str) -> None:
 
 
 # ── install ─────────────────────────────────────────────────────────────────
+#
+# `install` asks, then runs the site's installer for the node (`nix run .#install-<node>`,
+# lib/mk-cluster.nix): nixos-anywhere from nixos-install-helper, in two runs with `stage`
+# between them.
+#
+#   1. kexec: the rescue system becomes the NixOS installer, in memory.
+#   2. `avc boot stage <node>`, started by the installer as its pre-install hook:
+#        - the node's age identity, made on its TPM (age-plugin-tpm), or the one from the
+#          last install if this TPM still holds its key;
+#        - its recipient and its identity file (encrypted to the operators) written to the
+#          repository, and every secret the node reads rekeyed to it;
+#        - the identity file staged for the new root;
+#        - the partitioning secrets decrypted for the installer's /run.
+#   3. disko, nixos-install, reboot. The flake is evaluated only now, so the closure that
+#      is installed holds the secrets the node can decrypt.
+#
+# The identity is made in the kexec'd installer and not in the provider's rescue system:
+# that is the kernel and the TPM driver that will format the disks and enroll the TPM slot a
+# moment later, it has Nix, so the plugin is the one this library pins and not a static
+# build kept beside it, and a rescue system's kernel need not have a TPM driver at all.
+
+# Set by `install` for the hook, which the installer starts: how to reach the target.
+INSTALL_SSH_ENV = "AVC_INSTALL_SSH"
+# This program, for the hook to run (lib/mk-cluster.nix).
+SELF_ENV = "AVC"
+# Extra arguments for nixos-anywhere, for a site that needs them (--kexec <tarball>, …).
+INSTALL_ARGS_ENV = "AVC_INSTALL_ARGS"
+# The store paths copied to the installer (lib/avc.nix): age, and its TPM plugin.
+AGE_ENV = "AVC_AGE"
+AGE_TPM_ENV = "AVC_AGE_PLUGIN_TPM"
+# The installer's host key is made at each boot of it: there is nothing to pin.
+EPHEMERAL_HOST = ["-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR"]
+
+RECIPIENT = re.compile(r"^# (?:Recipient|public key): (\S+)$", re.M)
 
 
-# The installer is not here yet. Besides partitioning and installing, it is what will make the node's age identity on its TPM, commit the recipient
-# (secrets/recipients/<node>.pub), and set up LUKS. Until it lands, this step refuses, after
-# the preflight, and every other step of the flow works as before.
-INSTALLER_MISSING = (
-    "installing a node is not implemented until the installer (nixos-install-helper) lands: it partitions, "
-    "makes the node's TPM identity and its recipient, and installs. Nothing was changed on {target}."
-)
+def install_target(target: str) -> str:
+    return target if "@" in target else f"root@{target}"
+
+
+def install_argv(node: str, target: str, identity: str | None = None, extra: str = "") -> list[str]:
+    """The site's installer for `node`, and what follows the target, which is nixos-anywhere's."""
+    argv = ["nix", "run", f".#install-{node}", "--", install_target(target)]
+    if identity:
+        argv += ["-i", identity]
+    return argv + shlex.split(extra)
+
+
+def install_ssh(identity: str | None = None) -> list[str]:
+    return [*EPHEMERAL_HOST, *(["-i", identity] if identity else [])]
 
 
 @action(
@@ -124,10 +197,215 @@ INSTALLER_MISSING = (
     "Install a node from a rescue system (destroys its disks)",
     Arg("node", "Node", choices=_all_nodes),
     Arg("target", "Rescue system, root@<address>"),
+    Arg("identity", "SSH private key for the rescue system", option=True),
 )
-def install(ctx: Ctx, node: str, target: str) -> None:
-    preflight(ctx, node)
-    raise AvcError(INSTALLER_MISSING.format(target=target))
+def install(ctx: Ctx, node: str, target: str, identity: str | None = None) -> None:
+    opted_out = _opted_out(ctx, node)
+    if opted_out:
+        # Plain disks and no Secure Boot, by the topology's own word. Its secrets are still
+        # its TPM's to decrypt, so the rest of an install is the same.
+        plain_preflight(ctx, node)
+        ui.warn(f"{node} has boot security off (insecurePlaintextBoot): its disks will be plaintext")
+    else:
+        preflight(ctx, node)
+    ui.warn(f"this wipes every disk of {target} and installs {node} on it")
+    ui.type_to_confirm(f"Type the node's name to install {node} on {target}", node)
+    env = dict(os.environ)
+    env["IH_ASSUME_YES"] = "1"  # asked above
+    env[SELF_ENV] = os.path.abspath(sys.argv[0])
+    env[INSTALL_SSH_ENV] = shlex.join(install_ssh(identity))
+    rc = subprocess.run(install_argv(node, target, identity, os.environ.get(INSTALL_ARGS_ENV, "")), cwd=ctx.root, env=env).returncode
+    if rc != 0:
+        raise AvcError(
+            f"the install of {node} ended with status {rc}. Before the partitioning nothing on the disks has changed; "
+            "after it, run it again from the rescue system: it formats again. What it wrote under secrets/ is "
+            f"{node}'s recipient and what was rekeyed to it, and the next run uses the same identity if the TPM still has it."
+        )
+    ui.ok(f"{node} is installed and rebooting: its first boot unlocks from its TPM, and nobody types")
+    ctx.forget()
+    ship.ship(ctx, f"feat(secrets): {node}'s age identity, and what it reads rekeyed to it", paths=["secrets/"])
+    if not opted_out:
+        ui.say(
+            f"Next: `avc boot status {node}` (Setup Mode, both legs ONLINE, TPM slots not sealed yet), "
+            f"then `avc boot enroll {node}`, `avc boot reboot {node}`, `avc boot bind {node}`, `avc boot reboot {node}`."
+        )
+
+
+class Installer:
+    """The target, once it is the NixOS installer: root over SSH, to a host key nobody has
+    seen before. One connection for all of it, so that a key that wants a touch wants one."""
+
+    def __init__(self, target: str, ssh_opts: list[str], control: Path) -> None:
+        self.target = install_target(target)
+        self.opts = [*ssh_opts, "-o", "ControlMaster=auto", "-o", f"ControlPath={control}", "-o", "ControlPersist=120"]
+
+    def run(self, command: str, input: str | None = None, check: bool = True, timeout: float | None = 300) -> subprocess.CompletedProcess[str]:
+        return proc.run(["ssh", *self.opts, self.target, command], input=input, check=check, timeout=timeout)
+
+    def copy(self, paths: list[str]) -> None:
+        """Store paths, with what they need: the installer has Nix and nothing of ours."""
+        env = dict(os.environ, NIX_SSHOPTS=shlex.join(self.opts))
+        cmd = ["nix", "--extra-experimental-features", "nix-command", "copy", "--no-check-sigs", "--to", f"ssh-ng://{self.target}", *paths]
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise AvcError(f"could not copy age and its TPM plugin to {self.target}:\n{(p.stderr or p.stdout).strip()}")
+
+    def close(self) -> None:
+        subprocess.run(["ssh", *self.opts, "-O", "exit", self.target], capture_output=True)
+
+
+def _tools() -> tuple[str, str]:
+    age, plugin = os.environ.get(AGE_ENV), os.environ.get(AGE_TPM_ENV)
+    if not age or not plugin:
+        raise AvcError(f"{AGE_ENV} and {AGE_TPM_ENV} are not set: run avc from `nix run .#avc` or the devShell (lib/avc.nix)")
+    return age, plugin
+
+
+WAIT_FOR_TPM = (
+    "modprobe -a tpm_crb tpm_tis 2>/dev/null; i=0; "
+    "while [ ! -e /dev/tpmrm0 ] && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done; test -e /dev/tpmrm0"
+)
+
+
+def identity_works(installer: Installer, store: secretstore.Store, age: str, plugin: str, identity: str, recipient: str) -> bool:
+    """Whether this machine's TPM holds the key `identity` names: a value encrypted here to
+    the recipient, decrypted there. The identity goes in on stdin and is written nowhere."""
+    nonce = os.urandom(16).hex()
+    ciphertext = base64.b64encode(store.encrypt(nonce.encode(), ["-r", recipient])).decode()
+    script = (
+        "set -eu; d=$(mktemp -d -p /run); trap 'rm -rf \"$d\"' EXIT; cat > \"$d/identity\"; "
+        f"printf %s {shlex.quote(ciphertext)} | base64 -d > \"$d/ciphertext\"; "
+        f"PATH={shlex.quote(plugin)}/bin:$PATH {shlex.quote(age)}/bin/age -d -i \"$d/identity\" \"$d/ciphertext\""
+    )
+    p = installer.run(script, input=identity.rstrip() + "\n", check=False)
+    return p.returncode == 0 and p.stdout.strip() == nonce
+
+
+def node_identity(installer: Installer, store: secretstore.Store, node: str) -> tuple[str, str, bool]:
+    """(identity file, recipient, new) for the machine `installer` reaches. The one in the
+    repository when this TPM still answers for it (a reinstall: nothing to rekey), else a
+    new one made on the TPM."""
+    age, plugin = _tools()
+    if installer.run(WAIT_FOR_TPM, check=False).returncode != 0:
+        raise AvcError(f"{installer.target} has no TPM (/dev/tpmrm0): enable it in the firmware. Nothing on its disks was changed.")
+    with ui.spin("copying age and its TPM plugin to the installer"):
+        installer.copy([age, plugin])
+    kept = store.node_identity(node)
+    recipient = store.recipient(node)
+    if kept is not None and recipient is not None:
+        if identity_works(installer, store, age, plugin, kept, recipient):
+            ui.ok(f"{node}'s TPM still holds its age key: the identity in the repository is kept, and nothing is rekeyed")
+            return kept, recipient, False
+        ui.warn(f"{node}'s identity in the repository does not work on this TPM (cleared, or another machine): a new one is made")
+    made = installer.run(f"{shlex.quote(plugin)}/bin/age-plugin-tpm --generate").stdout
+    found = RECIPIENT.search(made)
+    if found is None or not any(line and not line.startswith("#") for line in made.splitlines()):
+        raise AvcError(f"age-plugin-tpm on {installer.target} did not print an identity and its recipient")
+    recipient = found.group(1)
+    if not identity_works(installer, store, age, plugin, made, recipient):
+        raise AvcError(f"the identity just made on {installer.target}'s TPM does not decrypt what is encrypted to it")
+    return made, recipient, True
+
+
+def _stage_file(base: Path, absolute: str, data: bytes) -> Path:
+    path = base / absolute.lstrip("/")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
+
+
+def stage_node(
+    store: secretstore.Store,
+    node: str,
+    installer: Installer,
+    extra_files: Path,
+    disk_keys: Path,
+    rekey: Any = None,
+) -> str:
+    """What `stage` does, with everything it touches given (tests/install-node.nix runs it in a
+    VM, against a real TPM and a real installer). Returns the node's recipient."""
+    partitioning = [(g, f) for g in store.generators(node) for f in g.files if f.secret and f.needed_for == "partitioning"]
+    missing = [f"{g.name}/{f.name}" for g, f in partitioning if not g.path(store.root, f).exists()]
+    if missing:
+        raise AvcError(f"{node}'s install secrets are not generated ({', '.join(missing)}): `avc secrets provision`. Nothing was partitioned.")
+    # Plaintext waits in this directory for the installer to send it: memory, or refuse.
+    if secretstore.filesystem(disk_keys) not in secretstore.RAM_FILESYSTEMS:
+        raise AvcError(f"{disk_keys} is not on a tmpfs: a disk secret is never written to a disk. Nothing was partitioned.")
+
+    identity, recipient, new = node_identity(installer, store, node)
+    if new:
+        store.set_node_identity(node, identity, recipient)
+    # Rekeyed before the build, which is the installer's next step: the closure it installs
+    # is the first one this node boots, and it must hold what the node can decrypt.
+    (rekey or store.rekey)()
+
+    cfg = store.export[node]
+    _stage_file(extra_files, cfg["identityPath"], identity.encode())
+    for g, f in partitioning:
+        _stage_file(disk_keys, cfg["generators"][g.name]["files"][f.name]["path"], store.decrypt(g.path(store.root, f)))
+    return recipient
+
+
+@action(
+    "boot",
+    "stage",
+    "The installer's step between the kexec and the partitioning (run by `avc boot install`, not by hand)",
+    Arg("node", "Node", choices=_all_nodes),
+)
+def stage(ctx: Ctx, node: str) -> None:
+    need = {v: os.environ.get(v) for v in ("IH_TARGET", "IH_EXTRA_FILES", "IH_DISK_KEYS")}
+    if not all(need.values()):
+        raise AvcError(
+            "`avc boot stage` is the installer's pre-install hook and reads "
+            f"{', '.join(need)} from it: run `avc boot install {node} root@<rescue address>`"
+        )
+    _opted_out(ctx, node)  # an unknown node is refused; an opted-out one has no partitioning secrets, and is staged
+    store = secretstore.store(ctx.root)
+    with tempfile.TemporaryDirectory(prefix="avc-ssh-", dir=secretstore.runtime_dir()) as control:
+        installer = Installer(need["IH_TARGET"], shlex.split(os.environ.get(INSTALL_SSH_ENV, shlex.join(EPHEMERAL_HOST))), Path(control) / "c")
+        try:
+            recipient = stage_node(store, node, installer, Path(need["IH_EXTRA_FILES"]), Path(need["IH_DISK_KEYS"]))
+        finally:
+            installer.close()
+    ui.ok(f"{node}'s recipient is {recipient}; its secrets are rekeyed to it, and the install secrets are staged")
+
+
+@action(
+    "boot",
+    "identity",
+    "Make a node's age identity on its TPM again (the TPM was cleared or replaced, or the identity file is gone)",
+    Arg("node", "Node", choices=_nodes),
+)
+def identity(ctx: Ctx, node: str) -> None:
+    """A node that boots and decrypts none of its secrets: its TPM no longer holds the key
+    its identity file names, or the file is gone from its disk. On the running node, the
+    same step an install takes: the identity in the repository when this TPM still answers
+    for it (the file is put back, nothing else changes), else a new one, its recipient
+    committed and everything the node reads rekeyed to it."""
+    n = ctx.node(node)
+    store = secretstore.store(ctx.root)
+    with tempfile.TemporaryDirectory(prefix="avc-ssh-", dir=secretstore.runtime_dir()) as control:
+        running = Installer(f"root@{n.host}", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"], Path(control) / "c")
+        try:
+            made, recipient, new = node_identity(running, store, node)
+            path = store.export[node]["identityPath"]
+            running.run(f"install -D -m 0400 /dev/stdin {shlex.quote(path)}", input=made.rstrip() + "\n")
+        finally:
+            running.close()
+    if not new:
+        ui.ok(f"{node}'s identity file is back at {path}: its secrets decrypt at the next activation (a deploy, or a reboot)")
+        return
+    store.set_node_identity(node, made, recipient)
+    store.rekey()
+    ui.ok(f"{node} has a new identity ({recipient}), and what it reads is rekeyed to it")
+    ui.warn(
+        f"{node} holds none of its secrets until a closure built from this tree is on it, and without them it cannot "
+        f"pull one: `avc deploy break-glass {node}` applies the working tree over SSH"
+    )
+    ship.ship(ctx, f"feat(secrets): {node}'s new age identity, and what it reads rekeyed to it", paths=["secrets/"])
 
 
 # ── unlock ──────────────────────────────────────────────────────────────────
@@ -158,7 +436,7 @@ def known_hosts_line(host: str, port: int, pub: str) -> str:
     return f"[{host}]:{port} {keytype} {key}\n"
 
 
-@action("boot", "unlock", "Type the disk passphrase over the initrd's SSH", Arg("node", "Node", choices=_all_nodes))
+@action("boot", "unlock", "Type the recovery key over the initrd's SSH (a node whose TPM refused)", Arg("node", "Node", choices=_all_nodes))
 def unlock(ctx: Ctx, node: str) -> None:
     boot = _boot_info(ctx, node)
     pub = boot.get("hostKeyPub")
@@ -166,7 +444,7 @@ def unlock(ctx: Ctx, node: str) -> None:
         raise AvcError(f"{node} has no initrd host key in the repository: run `avc secrets provision`")
     host = ctx.index.nodes[node]["deployHost"]
     port = int(boot["sshPort"])
-    ui.say(f"the passphrase is `avc secrets reveal {node}:luks/passphrase`. A typo puts the prompts out of step, so it may ask again.")
+    ui.say(f"the recovery key is `avc secrets reveal {node}:luks/passphrase`. A typo puts the prompts out of step, so it may ask again.")
     with tempfile.NamedTemporaryFile("w", prefix="avc-initrd-", suffix=".known_hosts") as f:
         f.write(known_hosts_line(host, port, pub))
         f.flush()
@@ -199,7 +477,7 @@ def enroll(ctx: Ctx, node: str) -> None:
     rc = ctx.node(node).stream("cluster-boot-seal enroll")
     if rc != 0:
         raise AvcError("enrollment refused or failed: see above")
-    ui.ok(f"enrolled. Reboot, unlock by hand once (`avc boot unlock {node}`), and check `avc boot status {node}`")
+    ui.ok(f"enrolled. Next: `avc boot reboot {node}` (still unlocked by the install's TPM slot), then `avc boot bind {node}`")
 
 
 def bind_command(replace: bool, device: str | None) -> str:
@@ -217,8 +495,8 @@ def bind_script(replace: bool, device: str | None, marker: str = BOUND_MARKER) -
     """The bind, then the marker: `marker` is written only if the bind returned 0. A failed
     bind (Setup Mode, a burned PCR 7, a missing identity) must not leave the marker that
     turns `avc boot reboot`'s refusal of a short TPM count into a note. Its exit status is
-    the bind's, or the marker's if writing it fails. The passphrase is this script's stdin,
-    and only the bind reads it."""
+    the bind's, or the marker's if writing it fails. The recovery key, when one is sent, is
+    this script's stdin, and only the bind reads it."""
     bind = bind_command(replace, device)
     return f'rc=0; {bind} || rc=$?; if [ "$rc" = 0 ]; then touch {shlex.quote(marker)} || rc=$?; fi; exit "$rc"'
 
@@ -230,16 +508,19 @@ def bind_script(replace: bool, device: str | None, marker: str = BOUND_MARKER) -
     Arg("node", "Node", choices=_nodes),
     Arg("replace", "Replace the existing TPM binding", flag=True),
     Arg("device", "Only this leg, e.g. after a disk replacement", option=True),
+    Arg("recovery_key", "Authorise with the node's recovery key, for a leg whose TPM slot is gone or does not open", flag=True),
 )
-def bind(ctx: Ctx, node: str, replace: bool = False, device: str | None = None) -> None:
+def bind(ctx: Ctx, node: str, replace: bool = False, device: str | None = None, recovery_key: bool = False) -> None:
     command = bind_script(replace, device)
-    # On stdin, from the repository (decrypted in memory) to the node, and nowhere in between
-    # that prints.
-    passphrase = secretstore.get_value(ctx.root, node, "luks/passphrase")
-    p = ctx.node(node).pipe(command, passphrase, check=False, timeout=600)
+    # Without the key, each leg's own TPM slot authorises its new one, and the key stays
+    # encrypted in the repository. With it: on stdin, from the repository (decrypted in
+    # memory) to the node, and nowhere in between that prints.
+    key = secretstore.get_value(ctx.root, node, "luks/passphrase") if recovery_key else ""
+    p = ctx.node(node).pipe(command, key, check=False, timeout=600)
     ui.out(p.stdout)
     if p.returncode != 0:
-        raise AvcError(f"bind refused or failed ({p.returncode}): {(p.stderr or '').strip()}")
+        hint = "" if recovery_key else f" (a leg with no TPM slot that opens needs `avc boot bind {node} --recovery-key`)"
+        raise AvcError(f"bind refused or failed ({p.returncode}): {(p.stderr or '').strip()}{hint}")
     ui.ok(f"bound. Next: `avc boot reboot {node}`, and nobody should have to type")
 
 
@@ -326,6 +607,11 @@ def reboot_verdict(text: str) -> tuple[list[str], list[str]]:
         refusals.append("cluster-boot-seal check says PCR 7 was burned, and the burn marker is gone: can't tell")
     elif seal not in ("0", "3"):
         refusals.append(f"cluster-boot-seal check could not run (rc={seal}): nothing says this node unlocks unattended")
+    if any(line.startswith("seal: OK") and "NOT SEALED" in line for line in lines):
+        notes.append(
+            "a leg's TPM slot is the install's, not sealed to PCR 7: the next boot is unattended, and so is anyone "
+            "else's boot of this machine. `avc boot bind` once Secure Boot is enforcing"
+        )
     if _field(lines, "identity_check=") != "0":
         why = "; ".join(line.removeprefix("identity: ") for line in lines if line.startswith("identity: "))
         refusals.append(
@@ -403,7 +689,7 @@ def _wait_back(n: Node, before: str, down_for: float = 120, back_in: float = 900
             if elapsed > down_for + back_in:
                 raise AvcError(
                     f"{n.name} did not come back within {down_for + back_in:.0f}s: it may be at the prompt "
-                    f"(`avc boot unlock {n.name}`)"
+                    f"(`avc boot unlock {n.name}`, with its recovery key)"
                 )
             time.sleep(every)
 
