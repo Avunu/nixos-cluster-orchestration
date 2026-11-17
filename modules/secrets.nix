@@ -309,6 +309,16 @@ let
 
   recipientFile = layout.recipient dir cfg.machine;
 
+  # A file of the site's repository by its path in it, so that the runner reads the
+  # working tree's copy; anything else (a recipient, a path outside) as it is.
+  inRepository =
+    p:
+    let
+      s = builtins.unsafeDiscardStringContext (toString p);
+      root = builtins.unsafeDiscardStringContext (toString dir) + "/";
+    in
+    if lib.hasPrefix root s then lib.removePrefix root s else s;
+
   textDir = "/var/lib/prometheus-node-exporter-text";
   check = pkgs.writeShellScript "cluster-secrets-check" ''
     set -u
@@ -401,17 +411,35 @@ in
       readOnly = true;
       description = ''
         Every generator of this machine as data, for the tool that runs them:
-        `nix eval --json .#clusterSecrets.<machine>`. `script` is a store path to build
-        and run with $out, $in and $prompts set; `storedAs` is where each file goes,
-        relative to the site's directory, a secret encrypted to the master identities.
+        `nix eval --json .#clusterSecrets.<machine>`. `script` is a store path to run
+        with $out, $in and $prompts set, and `scriptDrv` the derivation that builds it
+        (`nix build '<scriptDrv>^out'`); `storedAs` is where each file goes, relative to
+        the site's directory, a secret encrypted to the master recipients:
+        `masterIdentities` (each `{ identity; pubkey; }`, the identity relative to the
+        site's directory when it is a file in it) and `extraRecipients`.
+        `validationStoredAs` is where the runner records `validationHash`.
       '';
       default = {
         inherit (cfg) machine;
         recipient =
           if builtins.pathExists recipientFile then "secrets/recipients/${cfg.machine}.pub" else null;
+        # As agenix-rekey normalised them, so the runner and `agenix rekey` encrypt to
+        # and decrypt with the same keys.
+        masterIdentities = map (i: {
+          identity = inRepository i.identity;
+          inherit (i) pubkey;
+        }) config.age.rekey.masterIdentities;
+        extraRecipients = map inRepository config.age.rekey.extraEncryptionPubkeys;
         generators = lib.mapAttrs (_: g: {
           inherit (g) share dependencies validationHash;
+          validationStoredAs = layout.validationStoredAs "${
+            layout.scope {
+              inherit (g) share;
+              inherit (cfg) machine;
+            }
+          }/${g.name}";
           script = g.finalScript;
+          scriptDrv = g.finalScript.drvPath;
           inherit (g) runtimeInputs;
           prompts = lib.mapAttrs (_: p: { inherit (p) description type persist; }) g.prompts;
           files = lib.mapAttrs (_: f: {
@@ -437,6 +465,10 @@ in
       {
         assertion = lib.all (f: f.secret || !lib.hasSuffix ".age" f.name) allFiles;
         message = "cluster.secrets: a public file may not be named *.age: that is where its generator's secret of the same stem is kept (lib/secrets-layout.nix).";
+      }
+      {
+        assertion = lib.all (f: !lib.elem f.name layout.reserved) allFiles;
+        message = "cluster.secrets: no file may be named ${lib.concatStringsSep " or " layout.reserved}: the generator runner keeps its own record there (lib/secrets-layout.nix).";
       }
     ];
 
