@@ -790,6 +790,18 @@
           checks.boot-degraded = detach (_: bootTest ./tests/boot-degraded.nix { });
           checks.boot-install = detach (_: bootTest ./tests/boot-install.nix { });
           checks.boot-attack = detach (_: bootTest ./tests/boot-attack.nix { });
+          # A node installed through the real installer: nixos-install-helper's deploy,
+          # nixos-anywhere's kexec, `avc boot stage` between it and the partitioning, the
+          # identity made on the machine's TPM, the recovery key, and a TPM that is not the
+          # node's (tests/install-node.nix).
+          checks.install-node = detach (
+            _:
+            bootTest ./tests/install-node.nix {
+              inherit secretsModule nixpkgs;
+              installHelper = inputs.nixos-install-helper;
+              avc = self'.packages.avc;
+            }
+          );
 
           # What can be proven about a closure without booting it: the ESP budget, and when
           # the boot contract moves.
