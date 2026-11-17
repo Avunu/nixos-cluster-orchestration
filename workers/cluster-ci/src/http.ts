@@ -38,13 +38,25 @@ export async function handle(
       return json({ error: "bad signature" }, 401);
     }
     const event = request.headers.get("X-GitHub-Event");
-    return json({ ok: true, result: await pipeline.webhook(event, JSON.parse(body)) });
+    let payload: unknown;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return json({ error: "not JSON" }, 400);
+    }
+    return json({ ok: true, result: await pipeline.webhook(event, payload) });
   }
 
   if (pathname === "/agent/sync" || pathname === "/agent/token") {
     const node = nodeFor(env, request.headers.get("Authorization"));
     if (!node) return json({ error: "unauthorized" }, 401);
-    if (pathname === "/agent/sync") return json(await pipeline.sync(node, (await request.json()) as Report));
+    if (pathname === "/agent/sync") {
+      // A node's report is read field by field: anything but an object is refused here,
+      // where reading it would throw.
+      const report: unknown = await request.json().catch(() => undefined);
+      if (typeof report !== "object" || report === null || Array.isArray(report)) return json({ error: "not a report" }, 400);
+      return json(await pipeline.sync(node, report as Report));
+    }
     try {
       return json(await pipeline.tokens(node));
     } catch (e) {

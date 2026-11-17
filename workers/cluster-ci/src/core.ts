@@ -253,6 +253,16 @@ export function renderComment(r: Rendered): string {
   ].join("\n");
 }
 
+// The events whose handlers read `repository.full_name`, and what else each reads first.
+const REPOSITORY_EVENTS = new Set(["pull_request", "push", "delete", "issue_comment"]);
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+function wellFormed(event: string | null, p: unknown): boolean {
+  if (!isObject(p) || !isObject(p.repository) || typeof p.repository.full_name !== "string") return false;
+  if (event === "pull_request") return isObject(p.pull_request) && isObject(p.pull_request.head);
+  if (event === "issue_comment") return isObject(p.issue) && isObject(p.comment);
+  return true;
+}
+
 export class Pipeline {
   declare storage: Storage;
   declare github: PipelineGitHub;
@@ -317,6 +327,9 @@ export class Pipeline {
 
   webhook(event: string | null, p: unknown): Promise<string> {
     return this.locked<string>(() => {
+      // The signature says GitHub sent it, not what is in it: a delivery without the
+      // fields its event is read by is passed over, where reading them would throw.
+      if (REPOSITORY_EVENTS.has(event ?? "") && !wellFormed(event, p)) return "ignored: malformed";
       switch (event) {
         case "pull_request":
           return this.pullRequest(p as PullRequestEvent);
@@ -561,7 +574,7 @@ export class Pipeline {
         continue;
       }
       // A report about an earlier commit or copy says nothing about this one.
-      if (!p || p.sha !== r.sha || p.seed !== r.seed || !(p.state in STATUS)) continue;
+      if (!p || p.sha !== r.sha || p.seed !== r.seed || !Object.hasOwn(STATUS, p.state)) continue;
       const detail = String(p.detail ?? "").slice(0, 4000);
       if (p.state === r.state && detail === (r.detail ?? "")) continue;
       // One of STATUS's, by the test two lines up.

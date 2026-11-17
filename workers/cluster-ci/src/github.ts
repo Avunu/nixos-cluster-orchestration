@@ -120,6 +120,7 @@ export class GitHub {
     const part = (o: unknown) => b64url(enc.encode(JSON.stringify(o)));
     // Issued a minute ago, for a clock that runs ahead of GitHub's.
     const signed = `${part({ alg: "RS256", typ: "JWT" })}.${part({ iat: at - 60, exp: at + 540, iss: String(this.appId) })}`;
+    if (!this.privateKey) throw new Error("GITHUB_APP_PRIVATE_KEY is not set: `wrangler secret put GITHUB_APP_PRIVATE_KEY`");
     const key = await crypto.subtle.importKey(
       "pkcs8",
       pemToPkcs8(this.privateKey),

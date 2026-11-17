@@ -5,6 +5,7 @@ import { parseFlakeUrl, renderComment, trackingInputs } from "../src/core.ts";
 import { GitHub, pemToPkcs8, verifySignature } from "../src/github.ts";
 import { previewHost, previewLabel } from "../src/slug.ts";
 
+import { handle } from "../src/http.ts";
 import { REPO, SITE, harness } from "./harness.ts";
 
 test("a pull request becomes one preview with its own tunnel, hostname, comment and status", async () => {
@@ -246,4 +247,62 @@ test("the App signs in with the key as GitHub hands it out, and keeps the token"
   const fromB64 = (s: string) => Buffer.from(s, "base64url");
   assert.deepEqual(JSON.parse(fromB64(claims!)), { iat: 1_700_000_000 - 60, exp: 1_700_000_000 + 540, iss: "42" });
   assert.ok(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", publicKey, fromB64(sig!), Buffer.from(`${head}.${claims}`)));
+});
+
+test("a node's report of a state that is not one of ours changes nothing", async () => {
+  const h = harness();
+  await h.agent();
+  await h.pr("opened");
+  const before = h.calls.length;
+  // Names every object answers `in` for, which are no state of a preview.
+  for (const state of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    await h.agent([{ id: "shop/feat-x", sha: "a".repeat(40), seed: 1, state, detail: "x" }]);
+  }
+  assert.equal(h.stored.state!.previews["shop/feat-x"]!.state, "queued");
+  assert.equal(h.calls.length, before);
+});
+
+test("a delivery without the fields its event is read by is passed over", async () => {
+  const h = harness();
+  await h.agent();
+  for (const event of ["pull_request", "push", "delete", "issue_comment"]) {
+    for (const payload of [null, 7, "x", [], {}, { repository: null }, { repository: {} }, { repository: { full_name: 7 } }]) {
+      assert.equal(await h.pipeline.webhook(event, payload), "ignored: malformed", `${event} ${JSON.stringify(payload)}`);
+    }
+  }
+  const repository = { full_name: REPO, default_branch: "main" };
+  assert.equal(await h.pipeline.webhook("pull_request", { action: "opened", repository }), "ignored: malformed");
+  assert.equal(await h.pipeline.webhook("pull_request", { action: "opened", repository, pull_request: {} }), "ignored: malformed");
+  assert.equal(await h.pipeline.webhook("issue_comment", { action: "created", repository, issue: {} }), "ignored: malformed");
+  assert.deepEqual(h.of("tunnel"), []);
+  // And a well-formed one still does what it did.
+  assert.equal(await h.pr("opened"), "preview");
+});
+
+test("a body that is not what its endpoint reads is refused, not thrown on", async () => {
+  const h = harness();
+  const env = { AGENT_TOKENS: JSON.stringify({ "tok-1": "node1" }), GITHUB_WEBHOOK_SECRET: "hook" };
+  const post = (path: string, body: string, headers: Record<string, string>) =>
+    handle(new Request(`https://ci.example.com${path}`, { method: "POST", headers, body }), env, h.pipeline);
+  for (const body of ["null", "7", '"x"', "[]", "{", ""]) {
+    const res = await post("/agent/sync", body, { Authorization: "Bearer tok-1" });
+    assert.equal(res.status, 400, `sync ${body}`);
+  }
+  const ok = await post("/agent/sync", JSON.stringify({ version: 0, flake: `github:${SITE}`, apps: [], previews: [] }), { Authorization: "Bearer tok-1" });
+  assert.equal(ok.status, 200);
+
+  const sign = async (body: string) => {
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode("hook"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
+    return "sha256=" + [...mac].map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
+  const bad = await post("/webhook/github", "{", { "X-GitHub-Event": "push", "X-Hub-Signature-256": await sign("{") });
+  assert.equal(bad.status, 400);
+  const empty = await post("/webhook/github", "{}", { "X-GitHub-Event": "push", "X-Hub-Signature-256": await sign("{}") });
+  assert.deepEqual(await empty.json(), { ok: true, result: "ignored: malformed" });
+});
+
+test("a Worker without the App's key says which secret is missing", async () => {
+  const gh = new GitHub({ appId: 42, privateKey: undefined as unknown as string, fetch: async () => { throw new Error("not reached"); } });
+  await assert.rejects(gh.appJwt(), /GITHUB_APP_PRIVATE_KEY is not set/);
 });
