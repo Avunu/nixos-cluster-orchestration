@@ -9,7 +9,7 @@
 #     appsDir = ./apps;
 #     hostsDir = ./hosts;
 #   };
-#   # site.{nixosConfigurations,agenix-rekey,secrets,machineModules}
+#   # site.{nixosConfigurations,agenix-rekey,secrets,machineModules,installers,apps}
 #
 # See README.md "The interface".
 #
@@ -168,9 +168,64 @@ let
       modules = [ module ];
     }
   ) machineModules;
+  # ── installing a node ──────────────────────────────────────────────────────
+  # One nixos-install-helper project per node, all through this one call, which holds
+  # what they share. Of the project, a site uses the `deploy` app and nothing else:
+  # nixos-anywhere to a rescue system, with `avc boot stage` between the kexec and
+  # the partitioning (tools/avc/avc/flows/boot.py). `avc boot install` is what runs it.
+  #
+  #   hostAttr       the node's own name: what is installed is the site's
+  #                  nixosConfigurations.<node>, the same system the pull loop builds,
+  #                  not a variant of it made for installing.
+  #   diskName       null: the layout names both disks (lib/mk-disk-layout.nix).
+  #   questionnaire  false: the topology is the answer to every question.
+  #   lifecycle      false: a node follows the site's repository by its own pull loop
+  #                  (modules/pull-deploy.nix); the installer's auto-upgrade would be a
+  #                  second one.
+  #   guided         false, and with diskName = null no ISO either: a node is installed
+  #                  from its provider's rescue system.
+  #
+  # The hook is `avc`, from the PATH or as `avc boot install` names itself ($AVC): the
+  # tool the operator is already running, not a second copy built from this library.
+  system = "x86_64-linux";
+  installHelper =
+    libraryInputs.nixos-install-helper
+      or (throw "mkCluster: installers need the library's nixos-install-helper input");
+  installers = lib.mapAttrs (
+    name: _:
+    let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in
+    installHelper.lib.mkProject {
+      inherit
+        nixpkgs
+        system
+        self
+        specialArgs
+        ;
+      installModules = [ machineModules.${name} ];
+      hostAttr = name;
+      diskName = null;
+      questionnaire = false;
+      lifecycle = false;
+      guided = false;
+      # The operators' keys are YubiKeys: for an asset a site adds of its own.
+      agePlugins = [ pkgs.age-plugin-yubikey ];
+      preInstall = pkgs.writeShellScriptBin "cluster-pre-install" ''
+        exec "''${AVC:-avc}" boot stage ${lib.escapeShellArg name}
+      '';
+    }
+  ) topology.nodes;
 in
 {
   inherit nixosConfigurations machineModules;
+
+  # `nix run .#install-<node> -- root@<rescue address>`: what `avc boot install` runs,
+  # after its preflight and its question. A site's flake exports `apps`.
+  inherit installers;
+  apps.${system} = lib.mapAttrs' (
+    name: installer: lib.nameValuePair "install-${name}" installer.apps.${system}.deploy
+  ) installers;
 
   # What `agenix rekey`, `edit` and `view` read: a site's flake exports it as its own
   # `agenix-rekey` output, and `nix run .#agenix -- rekey` (this library's

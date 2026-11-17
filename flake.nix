@@ -33,6 +33,21 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    # The installer (lib/mk-cluster.nix, `installers`): nixos-anywhere with a step
+    # between the kexec and the partitioning, where `avc boot install` makes the node's
+    # TPM identity and hands over the partitioning secrets. Not part of what a node
+    # boots, so not in the boot stack.
+    #
+    # LOCAL PATH: the branch with `hostAttr`, `diskName = null`, `questionnaire` and
+    # `preInstall` is not pushed yet. Once it is, this becomes
+    # github:Avunu/nixos-install-helper (pinned by rev, like the inputs above) and the
+    # lock is updated; until then this flake only locks on the machine that has it.
+    nixos-install-helper = {
+      url = "git+file:///home/batonac/Development/nix-dev/projects/nixos-install-helper?ref=feat/cluster-install";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.disko.follows = "disko";
+    };
+
     # Payload modules, imported by the kinds (modules/kinds/). A consumer can set
     # its own input of the same name, and mkCluster prefers it.
     wordpress-nix = {

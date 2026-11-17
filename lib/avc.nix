@@ -60,6 +60,14 @@ python.pkgs.buildPythonApplication {
   # Python apps) a "--prefix X : y" string stays a single arg and makeWrapper
   # rejects it.
   makeWrapperArgs = [
+    # What `avc boot stage` copies into the installer a node is booted into, to make the
+    # node's age identity on its TPM there (tools/avc/avc/flows/boot.py).
+    "--set-default"
+    "AVC_AGE"
+    "${pkgs.age}"
+    "--set-default"
+    "AVC_AGE_PLUGIN_TPM"
+    "${pkgs.age-plugin-tpm}"
     "--prefix"
     "PATH"
     ":"

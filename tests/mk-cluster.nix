@@ -171,6 +171,28 @@ let
           == "secrets/per-machine/node1/nomad-tls/agent.key.age";
     }
     {
+      # One installer per node, each nixos-install-helper's `deploy` for the site's own
+      # system of that name, and nothing of the installer a cluster does not use.
+      name = "mkCluster returns an installer per node: its deploy app, for the node's own system, with avc's step as its hook";
+      ok =
+        let
+          apps = site.apps.x86_64-linux;
+          installer = site.installers.node1;
+          program = builtins.unsafeDiscardStringContext apps.install-node1.program;
+          hook = installer.apps.x86_64-linux.deploy.program;
+        in
+        lib.attrNames apps == map (n: "install-${n}") (lib.attrNames topology.nodes)
+        && lib.all (a: a.type == "app") (lib.attrValues apps)
+        && lib.hasSuffix "/bin/deploy" program
+        && hook == apps.install-node1.program
+        # No ISO, no questionnaire: a node is installed over the network, from its topology.
+        && !(installer.packages.x86_64-linux ? installerIso)
+        && !(installer.packages.x86_64-linux ? guidedIso)
+        && !(installer.apps.x86_64-linux ? configure)
+        && installer.resolvedRoots == [ ]
+        && installer.checks.x86_64-linux == { };
+    }
+    {
       name = "admins reach root and admin";
       ok =
         c.users.users.root.openssh.authorizedKeys.keys == [ "ssh-ed25519 AAAA-consumer-test-key" ]
@@ -228,7 +250,9 @@ let
         templateNode.config.clusterApps == { }
         && template ? agenix-rekey
         && template ? clusterSecrets
-        && template ? opsIndex;
+        && template ? opsIndex
+        # `avc boot install node1` runs this.
+        && template.apps.x86_64-linux ? install-node1;
     }
     # .github/workflows/merge-gate.yml builds these at the site's own lock (WS17).
     {

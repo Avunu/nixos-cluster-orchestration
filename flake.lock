@@ -91,7 +91,7 @@
           "odoo-nix",
           "nixpkgs"
         ],
-        "treefmt-nix": "treefmt-nix_4"
+        "treefmt-nix": "treefmt-nix_5"
       },
       "locked": {
         "lastModified": 1757452022,
@@ -1121,6 +1121,28 @@
         "type": "github"
       }
     },
+    "nix-vm-test": {
+      "inputs": {
+        "nixpkgs": [
+          "nixos-install-helper",
+          "nixos-anywhere",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789916284,
+        "narHash": "sha256-lv8kCCNM04qFsEMjDVrx6Z4q1afk46CBCQQq1wk5yNM=",
+        "owner": "numtide",
+        "repo": "nix-vm-test",
+        "rev": "f6688c8cc9185daccbeb89b2ff6e57dd66e5474a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "nix-vm-test",
+        "type": "github"
+      }
+    },
     "nix2container": {
       "inputs": {
         "nixpkgs": [
@@ -1295,7 +1317,7 @@
           "devenv",
           "nixpkgs"
         ],
-        "treefmt-nix": "treefmt-nix_5"
+        "treefmt-nix": "treefmt-nix_6"
       },
       "locked": {
         "lastModified": 1792826393,
@@ -1323,7 +1345,7 @@
           "devenv",
           "nixpkgs"
         ],
-        "treefmt-nix": "treefmt-nix_6"
+        "treefmt-nix": "treefmt-nix_7"
       },
       "locked": {
         "lastModified": 1788165251,
@@ -1337,6 +1359,90 @@
         "owner": "nix-community",
         "repo": "nixd",
         "type": "github"
+      }
+    },
+    "nixos-anywhere": {
+      "inputs": {
+        "disko": [
+          "nixos-install-helper",
+          "disko"
+        ],
+        "nix-vm-test": "nix-vm-test",
+        "nixos-images": "nixos-images",
+        "nixos-stable": [
+          "nixos-install-helper",
+          "nixpkgs"
+        ],
+        "nixpkgs": [
+          "nixos-install-helper",
+          "nixpkgs"
+        ],
+        "treefmt-nix": "treefmt-nix_4"
+      },
+      "locked": {
+        "lastModified": 1793171667,
+        "narHash": "sha256-8h9MU32SjnFWIWRdtP9vYVNV5QrVbai8Oo1LW1rAmwc=",
+        "owner": "nix-community",
+        "repo": "nixos-anywhere",
+        "rev": "58132e1d1f813b845382a2aeca4203b18d2ac807",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "nixos-anywhere",
+        "type": "github"
+      }
+    },
+    "nixos-images": {
+      "inputs": {
+        "nixos-stable": [
+          "nixos-install-helper",
+          "nixos-anywhere",
+          "nixos-stable"
+        ],
+        "nixos-unstable": [
+          "nixos-install-helper",
+          "nixos-anywhere",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791456080,
+        "narHash": "sha256-VDnm81L/1YLrPklNacGCNwpPhHi5Tya1XbfdnCB/Zd0=",
+        "owner": "nix-community",
+        "repo": "nixos-images",
+        "rev": "50939ddf1a0339f289a9dbd810bdfd4e4fba6df4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "nixos-images",
+        "type": "github"
+      }
+    },
+    "nixos-install-helper": {
+      "inputs": {
+        "disko": [
+          "disko"
+        ],
+        "nixos-anywhere": "nixos-anywhere",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794884833,
+        "narHash": "sha256-Gnd7Qr1JOV+2HUbPtTwXQnreFmBZwo+pNy9WhAnoee8=",
+        "ref": "feat/cluster-install",
+        "rev": "98fa82e98815d64ac6f19322d799cec830108a8a",
+        "revCount": 64,
+        "type": "git",
+        "url": "file:///home/batonac/Development/nix-dev/projects/nixos-install-helper"
+      },
+      "original": {
+        "ref": "feat/cluster-install",
+        "type": "git",
+        "url": "file:///home/batonac/Development/nix-dev/projects/nixos-install-helper"
       }
     },
     "nixpkgs": {
@@ -1894,6 +2000,7 @@
         "flake-parts": "flake-parts",
         "frappe-nix": "frappe-nix",
         "lanzaboote": "lanzaboote",
+        "nixos-install-helper": "nixos-install-helper",
         "nixpkgs": "nixpkgs_2",
         "odoo-nix": "odoo-nix",
         "wordpress-nix": "wordpress-nix"
@@ -2085,6 +2192,28 @@
     "treefmt-nix_4": {
       "inputs": {
         "nixpkgs": [
+          "nixos-install-helper",
+          "nixos-anywhere",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791885023,
+        "narHash": "sha256-C3alQ2MEt0zVrUSho5NUDo3jmhbff72++bfwoqT9Omo=",
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "rev": "0d6d739a833ba9a9c93034862e4a7b061a062a1c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "type": "github"
+      }
+    },
+    "treefmt-nix_5": {
+      "inputs": {
+        "nixpkgs": [
           "odoo-nix",
           "agenix-shell",
           "nixpkgs"
@@ -2104,7 +2233,7 @@
         "type": "github"
       }
     },
-    "treefmt-nix_5": {
+    "treefmt-nix_6": {
       "inputs": {
         "nixpkgs": [
           "odoo-nix",
@@ -2127,7 +2256,7 @@
         "type": "github"
       }
     },
-    "treefmt-nix_6": {
+    "treefmt-nix_7": {
       "inputs": {
         "nixpkgs": [
           "wordpress-nix",

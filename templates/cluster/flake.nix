@@ -58,9 +58,10 @@
       };
     in
     {
-      # `nixos-rebuild --flake .#<node>` (the pull loop) reads the first, and
-      # `nix run .#agenix -- rekey` the second.
-      inherit (site) nixosConfigurations agenix-rekey;
+      # `nixos-rebuild --flake .#<node>` (the pull loop) reads the first,
+      # `nix run .#agenix -- rekey` the second, and `avc boot install <node>` runs the
+      # third's `install-<node>`: the node's installer.
+      inherit (site) nixosConfigurations agenix-rekey apps;
       # Every machine's secret generators, as data.
       clusterSecrets = site.secrets;
 
