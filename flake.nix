@@ -37,11 +37,8 @@
     # between the kexec and the partitioning, where `avc boot install` makes the node's
     # TPM identity and hands over the partitioning secrets. Not part of what a node
     # boots, so not in the boot stack.
-    #
-    # Pinned to the feat/cluster-install branch (Avunu/nixos-install-helper#22) until
-    # it merges; then pin a rev of its main.
     nixos-install-helper = {
-      url = "github:Avunu/nixos-install-helper/98fa82e98815d64ac6f19322d799cec830108a8a";
+      url = "github:Avunu/nixos-install-helper";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.disko.follows = "disko";
     };
