@@ -24,10 +24,20 @@
 # What a VM does not let run, and what stands in for it:
 #
 #   - `avc boot install` itself evaluates the site's flake (its preflight, and `nix run
-#     .#install-<node>`), which a VM without a network cannot. The test starts the same
-#     `deploy` app with the environment `avc boot install` gives it, and its hook calls
-#     `stage_node` with the site's export given instead of evaluated
-#     (tools/avc/tests/test_boot.py holds `install` to that environment and command).
+#     .#install-<node>`), which a VM without a network cannot. The test runs what
+#     `avc boot install` runs after its preflight, `install_pinned`: the rescue system's
+#     host key read and held to a fingerprint, the keys the kexec carries read over that
+#     connection, and the same `deploy` app under the pin. Its hook calls `stage_node`
+#     with the site's export given instead of evaluated (tools/avc/tests/test_boot.py
+#     holds `install` to that call, tools/avc/tests/test_install_pin.py the pin to what it
+#     promises).
+#   - The fingerprint is given (--host-key-fingerprint), read by the test on the rescue
+#     VM, which is what an operator reads at the console: nobody is at a terminal here.
+#     Likewise the hook answers the question about the new recipient, after printing it.
+#   - Nobody else answers on the rescue system's address. The second control gives the
+#     pin another machine's key instead, once the real one is verified: to ssh that is
+#     the same thing, a far end whose key is not the pinned one, and what it shows is
+#     that nixos-anywhere's own connections (which ask for no checking) are refused.
 #   - The system is built before the test, so it cannot hold what was rekeyed during it.
 #     The one secret the node reads is rekeyed by the hook to the identity it has just
 #     made, and reaches the node beside the identity file; on a site it is in the closure,
@@ -155,10 +165,10 @@ let
       ''
         import json
         import os
-        import shlex
         import shutil
         from pathlib import Path
 
+        from avc.core import hostpin
         from avc.core.secretstore import Store
         from avc.flows import boot
 
@@ -166,20 +176,31 @@ let
         export = json.loads(Path("${pkgs.writeText "install-node-export.json" (builtins.toJSON (exportFor nodes))}").read_text())
         store = Store(root, export)
         extra = Path(os.environ["IH_EXTRA_FILES"])
-        installer = boot.Installer(
-            os.environ["IH_TARGET"],
-            shlex.split(os.environ[boot.INSTALL_SSH_ENV]),
-            Path("/run/install-test-ssh"),
-        )
-        try:
-            # No flake to evaluate here: the rekeyed files are the runner's own, which the
-            # flake's `agenix rekey` would find already made (tests/secrets-tpm.nix).
-            recipient = boot.stage_node(
-                store, "target", installer, extra, Path(os.environ["IH_DISK_KEYS"]),
-                rekey=store.fill_rekeyed,
-            )
-        finally:
-            installer.close()
+        keys = Path(os.environ["IH_DISK_KEYS"])
+
+
+        def confirm(node, recipient, where):
+            # An operator is asked here, at a terminal (tools/avc/tests/test_runner.py).
+            rekeyed = list(store.rekeyed_dir(node).rglob("*.age"))
+            print(f"new recipient shown: {recipient} from {where}; rekeyed by then: {len(rekeyed)}")
+
+
+        # `avc boot stage`'s own entry: refuses unless nixos-anywhere's connections went
+        # through the pin, and gives the pinned options.
+        with boot.staging(extra, keys) as ssh_opts:
+            pin = hostpin.Pin.load(Path(os.environ[hostpin.PIN_ENV]))
+            print(f"pinned: {pin.uses()} connections before the hook, {len(pin.keys())} keys")
+            installer = boot.Installer(os.environ["IH_TARGET"], ssh_opts, Path("/run/install-test-ssh"))
+            try:
+                print("installer host key: " + installer.run("cat /etc/ssh/ssh_host_ed25519_key.pub").stdout.strip())
+                # No flake to evaluate here: the rekeyed files are the runner's own, which the
+                # flake's `agenix rekey` would find already made (tests/secrets-tpm.nix).
+                recipient = boot.stage_node(
+                    store, "target", installer, extra, keys,
+                    rekey=store.fill_rekeyed, confirm=confirm,
+                )
+            finally:
+                installer.close()
         # This test's own: the system was built before this identity existed, so what
         # was rekeyed to it travels beside it. On a site it is in the closure.
         (rekeyed,) = store.rekeyed_dir("target").rglob("*.age")
@@ -187,6 +208,39 @@ let
         there.parent.mkdir(parents=True)
         shutil.copy(rekeyed, there)
         print(f"staged for {recipient}")
+      '';
+
+  # `avc boot install`, after its preflight and less its `nix run`: the installer app is
+  # given. With INSTALL_TEST_SOMEONE_ELSE (a public key), the pin holds that key from the
+  # moment the real one is verified: someone else's machine, as ssh sees it.
+  installRun =
+    pkgs.writers.writePython3Bin "install-test-run"
+      {
+        libraries = [ (pkgs.python3.pkgs.toPythonModule avc) ];
+        flakeIgnore = [ "E501" ];
+      }
+      ''
+        import os
+        import sys
+        from pathlib import Path
+
+        from avc.errors import AvcError
+        from avc.flows import boot
+
+        fingerprint, target, *argv = sys.argv[1:]
+        someone_else = os.environ.get("INSTALL_TEST_SOMEONE_ELSE")
+        if someone_else:
+
+            def carry(pin, *a, **k):
+                pin.known_hosts.write_text(f"{pin.alias} {someone_else}\n")
+                return []
+
+            boot.carry_host_key = carry
+        try:
+            boot.install_pinned(Path("${site}"), "target", target, argv, identity="/root/id", fingerprint=fingerprint)
+        except AvcError as e:
+            print(f"avc: {e}", file=sys.stderr)
+            sys.exit(1)
       '';
 
   project =
@@ -228,6 +282,10 @@ harness.mkTest {
       ];
       networking.firewall.enable = false;
       services.openssh.enable = true;
+      # The controls make, in a minute, the refused and unauthenticated connections of
+      # several installs, and sshd (PerSourcePenalties) then resets the next ones from
+      # this address for a while. One install makes a handful (the read of the host key).
+      services.openssh.settings.PerSourcePenalties = "no";
       users.users.root.openssh.authorizedKeys.keys = [ harness.sshKeys.snakeOilEd25519PublicKey ];
       # kexec's tarball is unpacked in memory.
       boot.tmp.useTmpfs = false;
@@ -275,6 +333,7 @@ harness.mkTest {
 
   prelude = nodes: ''
     DEPLOY = "${(project nodes).apps.${system}.deploy.program}"
+    INSTALL_RUN = "${lib.getExe installRun}"
     KEXEC = "/etc/install-test/kexec-installer.tar.gz"
     AGE = "${pkgs.age}"
     AGE_PLUGIN_TPM = "${pkgs.age-plugin-tpm}"

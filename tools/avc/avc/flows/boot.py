@@ -10,7 +10,9 @@ Where a disk secret is, at an install: the recovery key (`luks/passphrase`) is c
 the repository, encrypted to the operators; `stage` decrypts it into a tmpfs here, the
 installer (nixos-anywhere) sends it into the target's /run, the disko hook gives each leg a
 slot for it, and the target's reboot and the installer's exit forget both copies. The key
-a leg is formatted with never leaves the target's memory. Nothing else opens a disk.
+a leg is formatted with never leaves the target's memory. Nothing else opens a disk. It is
+sent over SSH to a host key the operator compared with the server's console before
+anything else was sent, and to no other (avc/core/hostpin.py).
 
 Rollback's order: hold every node, revert or pin the private repo, boot the old
 generation at the console, then `avc boot rollback`.
@@ -19,20 +21,23 @@ generation at the console, then `avc boot rollback`.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from avc import ui
 from avc.actions import Arg, action
-from avc.core import deploy_state, proc, repo, secretstore, ship
+from avc.core import deploy_state, hostpin, proc, repo, secretstore, ship
 from avc.core.node import HOLD_DIR, Node, NothingAfter
 from avc.errors import AvcError
 
@@ -140,16 +145,24 @@ def preflight(ctx: Ctx, node: str) -> None:
 
 # ── install ─────────────────────────────────────────────────────────────────
 #
-# `install` asks, then runs the site's installer for the node (`nix run .#install-<node>`,
-# lib/mk-cluster.nix): nixos-anywhere from nixos-install-helper, in two runs with `stage`
-# between them.
+# `install` verifies the rescue system's SSH host key, asks, then runs the site's installer
+# for the node (`nix run .#install-<node>`, lib/mk-cluster.nix): nixos-anywhere from
+# nixos-install-helper, in two runs with `stage` between them.
 #
-#   1. kexec: the rescue system becomes the NixOS installer, in memory.
+#   0. The rescue system's host key, read from it and compared by the operator with what
+#      the server's console shows (or with --host-key-fingerprint), then pinned: every
+#      connection of the run, avc's and nixos-anywhere's, is checked against it and against
+#      nothing else (avc/core/hostpin.py). Over the first of them the host keys the kexec
+#      will carry into the installer are read, and pinned too.
+#   1. kexec: the rescue system becomes the NixOS installer, in memory, with the rescue
+#      system's host keys (nixos-images' kexec `run` copies /etc/ssh/ssh_host_* into the
+#      installer's initrd, and its restore-remote-access module puts them back).
 #   2. `avc boot stage <node>`, started by the installer as its pre-install hook:
 #        - the node's age identity, made on its TPM (age-plugin-tpm), or the one from the
 #          last install if this TPM still holds its key;
-#        - its recipient and its identity file (encrypted to the operators) written to the
-#          repository, and every secret the node reads rekeyed to it;
+#        - a new recipient shown and confirmed, then it and its identity file (encrypted to
+#          the operators) written to the repository, and every secret the node reads
+#          rekeyed to it;
 #        - the identity file staged for the new root;
 #        - the partitioning secrets decrypted for the installer's /run.
 #   3. disko, nixos-install, reboot. The flake is evaluated only now, so the closure that
@@ -160,7 +173,8 @@ def preflight(ctx: Ctx, node: str) -> None:
 # moment later, it has Nix, so the plugin is the one this library pins and not a static
 # build kept beside it, and a rescue system's kernel need not have a TPM driver at all.
 
-# Set by `install` for the hook, which the installer starts: how to reach the target.
+# Set by `install` for the hook, which the installer starts: what its ssh takes besides
+# the pinned host key (an identity file). The pin itself is hostpin.PIN_ENV.
 INSTALL_SSH_ENV = "AVC_INSTALL_SSH"
 # This program, for the hook to run (lib/mk-cluster.nix).
 SELF_ENV = "AVC"
@@ -169,10 +183,10 @@ INSTALL_ARGS_ENV = "AVC_INSTALL_ARGS"
 # The store paths copied to the installer (lib/avc.nix): age, and its TPM plugin.
 AGE_ENV = "AVC_AGE"
 AGE_TPM_ENV = "AVC_AGE_PLUGIN_TPM"
-# The installer's host key is made at each boot of it: there is nothing to pin.
-EPHEMERAL_HOST = ["-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR"]
 
 RECIPIENT = re.compile(r"^# (?:Recipient|public key): (\S+)$", re.M)
+
+NOTHING_SENT = "Nothing was sent to it, and nothing on its disks, on its TPM or in the repository was changed."
 
 
 def install_target(target: str) -> str:
@@ -188,7 +202,156 @@ def install_argv(node: str, target: str, identity: str | None = None, extra: str
 
 
 def install_ssh(identity: str | None = None) -> list[str]:
-    return [*EPHEMERAL_HOST, *(["-i", identity] if identity else [])]
+    return ["-i", identity] if identity else []
+
+
+def install_port(extra: list[str]) -> int | None:
+    """The rescue system's SSH port, when nixos-anywhere is told one."""
+    for flag, value in zip(extra, extra[1:], strict=False):
+        if flag in ("-p", "--ssh-port") and value.isdigit():
+            return int(value)
+    return None
+
+
+def _console_command(key: hostpin.HostKey) -> str:
+    kind = key[0].removeprefix("ssh-").split("-")[0]  # ed25519, rsa, ecdsa
+    return f"ssh-keygen -lf /etc/ssh/ssh_host_{kind}_key.pub"
+
+
+def verify_host_key(host: str, keys: list[hostpin.HostKey], expected: str | None) -> hostpin.HostKey:
+    """The one key of `keys` (what `host` presented, to a connection nothing authenticated)
+    that is known to be the machine's: by the fingerprint given up front, or by the operator
+    comparing it with the server's console. --yes does not answer this, and without a
+    terminal only the fingerprint does."""
+    shown = [(k, hostpin.fingerprint(k)) for k in keys]
+    listing = "\n".join(f"  {fp} ({k[0]})" for k, fp in shown)
+    if expected is not None:
+        want = expected.strip().rstrip("=")
+        if not want.startswith("SHA256:"):
+            raise AvcError(f"--host-key-fingerprint takes a fingerprint as `ssh-keygen -lf` prints it (SHA256:…), not {expected!r}. {NOTHING_SENT}")
+        for key, fp in shown:
+            if fp == want:
+                ui.ok(f"{host} presents the host key given: {fp} ({key[0]})")
+                return key
+        raise AvcError(
+            f"{host} does not present the host key {want}. It presents:\n{listing}\n"
+            f"That is another machine, or someone between you and it. {NOTHING_SENT}"
+        )
+    key, fp = shown[0]
+    ui.info(f"{host} presents this SSH host key, and nothing has verified it yet:")
+    ui.say(f"{fp} ({key[0]})")
+    ui.say(f"At the server's console (IPMI/KVM, not SSH), in the rescue system, run: {_console_command(key)}")
+    if not ui.can_ask():
+        raise AvcError(
+            f"{host}'s host key has to be compared with what its console shows, and there is no terminal to ask at: "
+            f"read it there and give --host-key-fingerprint SHA256:…. {NOTHING_SENT}"
+        )
+    if not ui.attest(f"Does the console show exactly {fp}?"):
+        raise AvcError(f"{host}'s host key was not confirmed. {NOTHING_SENT}")
+    return key
+
+
+# In the verified session: the host keys the kexec carries into the installer are the
+# files /etc/ssh/ssh_host_*, which need not be the key the rescue system's sshd presents,
+# and the installer's sshd reads the ed25519 and the rsa one. So an ed25519 key is made
+# there if there is none (in the rescue system's memory: the installer will present it),
+# and the public half of each, computed from the private file, is this command's output.
+CARRIED_HOST_KEYS = (
+    's=; [ "$(id -u)" = 0 ] || s="sudo -n"; k=/etc/ssh/ssh_host_ed25519_key; '
+    'if ! $s test -s "$k"; then { $s mkdir -p /etc/ssh && $s ssh-keygen -q -t ed25519 -N "" -f "$k"; } </dev/null >/dev/null 2>&1 || true; fi; '
+    'for t in ed25519 rsa; do k=/etc/ssh/ssh_host_${t}_key; if $s test -s "$k"; then $s ssh-keygen -y -f "$k" 2>/dev/null || true; fi; done'
+)
+
+
+def carry_host_key(pin: hostpin.Pin, target: str, identity: str | None = None, port: int | None = None) -> list[hostpin.HostKey]:
+    """The first authenticated connection of an install: reads, over it, the host keys the
+    installer will present after the kexec, and pins them. No key is trusted that did not
+    come over a connection the pin had already checked."""
+    cmd = ["ssh", *pin.options(), "-o", "ConnectTimeout=15", *(["-i", identity] if identity else []), *(["-p", str(port)] if port else [])]
+    # ssh's own words go to the terminal: a password or a touch may be asked for there.
+    p = subprocess.run([*cmd, target, CARRIED_HOST_KEYS], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+    if p.returncode == 255:
+        raise AvcError(
+            f"no verified SSH connection to {target} (ssh's message is above): if it names the host key, the machine that "
+            f"answers now is not the one whose key was just verified; if the connection was reset, its sshd may be holding off an "
+            f"address that has just made several connections without logging in (wait a minute, and run this again). {NOTHING_SENT}"
+        )
+    keys = hostpin.parse_keys(p.stdout, hosted=False)
+    for key in keys:
+        pin.trust(key)
+    if not keys:
+        ui.warn(
+            f"could not read the host keys {target} will carry into the installer (/etc/ssh/ssh_host_*): if the installer "
+            "presents a key other than the one verified, the install stops there, before anything is partitioned or sent"
+        )
+    return keys
+
+
+def _refusal(node: str, target: str, pin: hostpin.Pin) -> str:
+    head = (
+        f"{target} answered with an SSH host key that is not one verified for this install, and the connection was "
+        f"refused ({pin.note('refused').strip() or 'ssh'}). Whatever answers there now is not known to be the machine. "
+    )
+    if not pin.marked("staging"):
+        return head + (
+            "That was before `avc boot stage`: nothing on its disks was changed, nothing was rekeyed or written to "
+            "the repository, and no secret was sent."
+        )
+    kept = (
+        f"If secrets/ changed (`git status secrets/`), it holds {node}'s recipient, read from the verified machine, "
+        "and what was rekeyed to it; nothing was shipped."
+    )
+    if not pin.marked("staged"):
+        return head + f"That was during `avc boot stage`: nothing on its disks was changed, and no disk secret was sent. {kept}"
+    return head + (
+        "That was after `avc boot stage`: the disks may be partitioned or partly installed, so install again from the "
+        "rescue system. What had been sent by then (the recovery key, the volume identity secret and the initrd host "
+        f"key, once the partitioning began) went to the verified machine, and the refused connection was sent nothing. {kept}"
+    )
+
+
+def install_pinned(
+    root: Path,
+    node: str,
+    target: str,
+    argv: list[str],
+    identity: str | None = None,
+    fingerprint: str | None = None,
+    port: int | None = None,
+    ask: Any = None,
+) -> None:
+    """Everything of an install that reaches the machine, under one pinned host key: the
+    key verified, `ask` (the question about the disks), the keys the kexec carries, then the
+    installer `argv` with the pin on its PATH and in its environment, watched for a refused
+    key. tests/install-node.nix runs this with the installer app itself as `argv`."""
+    target = install_target(target)
+    host = target.split("@", 1)[1]
+    with hostpin.pinned(node, host) as pin:
+        with ui.spin(f"reading {host}'s SSH host key"):
+            keys = hostpin.scan(host, port)
+        pin.trust(verify_host_key(host, keys, fingerprint))
+        if ask is not None:
+            ask()
+        carry_host_key(pin, target, identity, port)
+        env = dict(os.environ)
+        env["IH_ASSUME_YES"] = "1"  # asked above
+        env[SELF_ENV] = os.path.abspath(sys.argv[0])
+        env[INSTALL_SSH_ENV] = shlex.join(install_ssh(identity))
+        env[hostpin.PIN_ENV] = str(pin.dir)
+        # nixos-anywhere, ssh-copy-id and Nix find `ssh` on PATH: this one holds them to the pin.
+        env["PATH"] = f"{pin.shim()}{os.pathsep}{env.get('PATH', '')}"
+        rc = hostpin.run_watched(argv, root, env, pin)
+        if pin.marked("refused"):
+            # The installer was stopped, not left to end: what it staged in memory goes now.
+            for left in pin.note("staged").splitlines():
+                shutil.rmtree(left, ignore_errors=True)
+            raise AvcError(_refusal(node, target, pin))
+    if rc != 0:
+        raise AvcError(
+            f"the install of {node} ended with status {rc}. Before the partitioning nothing on the disks has changed; "
+            "after it, run it again from the rescue system: it formats again. What it wrote under secrets/ is "
+            f"{node}'s recipient and what was rekeyed to it, and the next run uses the same identity if the TPM still has it."
+        )
 
 
 @action(
@@ -198,8 +361,9 @@ def install_ssh(identity: str | None = None) -> list[str]:
     Arg("node", "Node", choices=_all_nodes),
     Arg("target", "Rescue system, root@<address>"),
     Arg("identity", "SSH private key for the rescue system", option=True),
+    Arg("host_key_fingerprint", "The SHA256:… fingerprint of the rescue system's SSH host key, read at its console: given, nothing is asked", option=True),
 )
-def install(ctx: Ctx, node: str, target: str, identity: str | None = None) -> None:
+def install(ctx: Ctx, node: str, target: str, identity: str | None = None, host_key_fingerprint: str | None = None) -> None:
     opted_out = _opted_out(ctx, node)
     if opted_out:
         # Plain disks and no Secure Boot, by the topology's own word. Its secrets are still
@@ -208,19 +372,22 @@ def install(ctx: Ctx, node: str, target: str, identity: str | None = None) -> No
         ui.warn(f"{node} has boot security off (insecurePlaintextBoot): its disks will be plaintext")
     else:
         preflight(ctx, node)
-    ui.warn(f"this wipes every disk of {target} and installs {node} on it")
-    ui.type_to_confirm(f"Type the node's name to install {node} on {target}", node)
-    env = dict(os.environ)
-    env["IH_ASSUME_YES"] = "1"  # asked above
-    env[SELF_ENV] = os.path.abspath(sys.argv[0])
-    env[INSTALL_SSH_ENV] = shlex.join(install_ssh(identity))
-    rc = subprocess.run(install_argv(node, target, identity, os.environ.get(INSTALL_ARGS_ENV, "")), cwd=ctx.root, env=env).returncode
-    if rc != 0:
-        raise AvcError(
-            f"the install of {node} ended with status {rc}. Before the partitioning nothing on the disks has changed; "
-            "after it, run it again from the rescue system: it formats again. What it wrote under secrets/ is "
-            f"{node}'s recipient and what was rekeyed to it, and the next run uses the same identity if the TPM still has it."
-        )
+
+    def ask() -> None:
+        ui.warn(f"this wipes every disk of {target} and installs {node} on it")
+        ui.type_to_confirm(f"Type the node's name to install {node} on {target}", node)
+
+    extra = os.environ.get(INSTALL_ARGS_ENV, "")
+    install_pinned(
+        ctx.root,
+        node,
+        target,
+        install_argv(node, target, identity, extra),
+        identity=identity,
+        fingerprint=host_key_fingerprint,
+        port=install_port(shlex.split(extra)),
+        ask=ask,
+    )
     ui.ok(f"{node} is installed and rebooting: its first boot unlocks from its TPM, and nobody types")
     ctx.forget()
     ship.ship(ctx, f"feat(secrets): {node}'s age identity, and what it reads rekeyed to it", paths=["secrets/"])
@@ -232,8 +399,10 @@ def install(ctx: Ctx, node: str, target: str, identity: str | None = None) -> No
 
 
 class Installer:
-    """The target, once it is the NixOS installer: root over SSH, to a host key nobody has
-    seen before. One connection for all of it, so that a key that wants a touch wants one."""
+    """A machine whose TPM makes a node's identity, root over SSH: the target once it is the
+    NixOS installer, under the install's pinned host key, or a running node, under the
+    operator's known_hosts. One connection for all of it, so that a key that wants a touch
+    wants one."""
 
     def __init__(self, target: str, ssh_opts: list[str], control: Path) -> None:
         self.target = install_target(target)
@@ -307,6 +476,20 @@ def node_identity(installer: Installer, store: secretstore.Store, node: str) -> 
     return made, recipient, True
 
 
+def confirm_recipient(node: str, recipient: str, where: str) -> None:
+    """A new identity: everything `node` reads is about to be encrypted to a recipient that
+    `where` printed. Shown, and confirmed by a person: --yes does not answer, and without a
+    terminal it is refused. An identity the repository already holds asks nothing."""
+    ui.warn(f"{where} made a new age identity for {node}, on its TPM. Its recipient:")
+    ui.say(recipient)
+    ui.say(f"Every secret {node} reads, the fleet's shared keys among them, is about to be encrypted to it and written to the repository.")
+    refusal = f"Nothing was rekeyed or written to the repository, and nothing on {node}'s disks was changed."
+    if not ui.can_ask():
+        raise AvcError(f"a new recipient for {node} is confirmed at a terminal, and there is none. {refusal}")
+    if not ui.attest(f"Encrypt everything {node} reads to this recipient?"):
+        raise AvcError(f"{node}'s new recipient was not confirmed. {refusal}")
+
+
 def _stage_file(base: Path, absolute: str, data: bytes) -> Path:
     path = base / absolute.lstrip("/")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +507,7 @@ def stage_node(
     extra_files: Path,
     disk_keys: Path,
     rekey: Any = None,
+    confirm: Any = None,
 ) -> str:
     """What `stage` does, with everything it touches given (tests/install-node.nix runs it in a
     VM, against a real TPM and a real installer). Returns the node's recipient."""
@@ -337,6 +521,8 @@ def stage_node(
 
     identity, recipient, new = node_identity(installer, store, node)
     if new:
+        # Before the repository or a single secret is touched.
+        (confirm or confirm_recipient)(node, recipient, installer.target)
         store.set_node_identity(node, identity, recipient)
     # Rekeyed before the build, which is the installer's next step: the closure it installs
     # is the first one this node boots, and it must hold what the node can decrypt.
@@ -356,7 +542,7 @@ def stage_node(
     Arg("node", "Node", choices=_all_nodes),
 )
 def stage(ctx: Ctx, node: str) -> None:
-    need = {v: os.environ.get(v) for v in ("IH_TARGET", "IH_EXTRA_FILES", "IH_DISK_KEYS")}
+    need = {v: os.environ.get(v) for v in ("IH_TARGET", "IH_EXTRA_FILES", "IH_DISK_KEYS", hostpin.PIN_ENV)}
     if not all(need.values()):
         raise AvcError(
             "`avc boot stage` is the installer's pre-install hook and reads "
@@ -364,13 +550,39 @@ def stage(ctx: Ctx, node: str) -> None:
         )
     _opted_out(ctx, node)  # an unknown node is refused; an opted-out one has no partitioning secrets, and is staged
     store = secretstore.store(ctx.root)
-    with tempfile.TemporaryDirectory(prefix="avc-ssh-", dir=secretstore.runtime_dir()) as control:
-        installer = Installer(need["IH_TARGET"], shlex.split(os.environ.get(INSTALL_SSH_ENV, shlex.join(EPHEMERAL_HOST))), Path(control) / "c")
+    extra_files, disk_keys = Path(need["IH_EXTRA_FILES"]), Path(need["IH_DISK_KEYS"])
+    with staging(extra_files, disk_keys) as ssh_opts, tempfile.TemporaryDirectory(prefix="avc-ssh-", dir=secretstore.runtime_dir()) as control:
+        installer = Installer(need["IH_TARGET"], ssh_opts, Path(control) / "c")
         try:
-            recipient = stage_node(store, node, installer, Path(need["IH_EXTRA_FILES"]), Path(need["IH_DISK_KEYS"]))
+            recipient = stage_node(store, node, installer, extra_files, disk_keys)
         finally:
             installer.close()
     ui.ok(f"{node}'s recipient is {recipient}; its secrets are rekeyed to it, and the install secrets are staged")
+
+
+@contextlib.contextmanager
+def staging(extra_files: Path, disk_keys: Path) -> Iterator[list[str]]:
+    """The hook's side of an install's pin (hostpin.PIN_ENV): the ssh options for the
+    installer, the pinned ones first, and the marks `avc boot install` reads to say what had
+    and had not happened if a host key is refused. Refuses to begin unless the installer's
+    own connections went through the pin: the kexec is behind it, and if those were not
+    checked, what answers now is not known to be the machine whose key was verified."""
+    pin = hostpin.Pin.load(Path(os.environ.get(hostpin.PIN_ENV, "")))
+    if not pin.keys():
+        raise AvcError(f"this install has no verified host key for {pin.host}. Nothing was partitioned, rekeyed or sent.")
+    if pin.uses() == 0:
+        raise AvcError(
+            f"the installer reached {pin.host} without this install's pinned host key: its ssh is not the one "
+            f"`avc boot install` put on its PATH ({pin.dir}/bin). Nothing was partitioned, rekeyed or sent."
+        )
+    pin.mark("staging")
+    try:
+        yield [*pin.options(), *shlex.split(os.environ.get(INSTALL_SSH_ENV, ""))]
+    except AvcError as e:
+        if hostpin.refused(str(e)):
+            pin.mark("refused", "avc boot stage")
+        raise
+    pin.mark("staged", f"{disk_keys}\n{extra_files}\n")
 
 
 @action(
@@ -391,6 +603,9 @@ def identity(ctx: Ctx, node: str) -> None:
         running = Installer(f"root@{n.host}", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"], Path(control) / "c")
         try:
             made, recipient, new = node_identity(running, store, node)
+            if new:
+                # Before the node, the repository or a secret is touched.
+                confirm_recipient(node, recipient, running.target)
             path = store.export[node]["identityPath"]
             running.run(f"install -D -m 0400 /dev/stdin {shlex.quote(path)}", input=made.rstrip() + "\n")
         finally:
