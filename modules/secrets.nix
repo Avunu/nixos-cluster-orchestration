@@ -33,6 +33,13 @@
 # A node with no recipient in the repository yet (not installed) gets agenix-rekey's
 # placeholders, which decrypt nowhere, and its warning.
 #
+# The identity is made on the node's TPM before anything is installed (`avc boot
+# install`, from the installer the node is booted into): the recipient is committed,
+# what the node reads is rekeyed to it, and only then is the system built, so the first
+# closure a node ever boots already holds its secrets. The identity file goes to
+# `identityPath` on the new root, and a copy, encrypted to the master identities, to
+# secrets/identities/<node>.age.
+#
 # ── fail closed ─────────────────────────────────────────────────────────────
 # agenix decrypts during activation and carries on when a file does not decrypt: the
 # boot completes, the secret is absent, and after a live switch the previous values are
@@ -418,11 +425,19 @@ in
         `masterIdentities` (each `{ identity; pubkey; }`, the identity relative to the
         site's directory when it is a file in it) and `extraRecipients`.
         `validationStoredAs` is where the runner records `validationHash`.
+        `recipientStoredAs`, `identityStoredAs` and `identityPath` are where an install
+        puts the node's recipient, its identity file (encrypted to the master
+        recipients) and, on the node, the identity file itself.
       '';
       default = {
         inherit (cfg) machine;
-        recipient =
-          if builtins.pathExists recipientFile then "secrets/recipients/${cfg.machine}.pub" else null;
+        recipient = if builtins.pathExists recipientFile then layout.recipientStoredAs cfg.machine else null;
+        # What an install writes (tools/avc/avc/flows/boot.py): the recipient, the
+        # identity file encrypted to the master recipients, and the identity file itself
+        # on the node.
+        recipientStoredAs = layout.recipientStoredAs cfg.machine;
+        identityStoredAs = layout.identityStoredAs cfg.machine;
+        inherit (cfg) identityPath;
         # As agenix-rekey normalised them, so the runner and `agenix rekey` encrypt to
         # and decrypt with the same keys.
         masterIdentities = map (i: {

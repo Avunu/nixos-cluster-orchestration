@@ -56,7 +56,9 @@ from avc.errors import AvcError
 # lib/secrets-layout.nix.
 SECRETS = "secrets"
 MASTER_RECIPIENTS = f"{SECRETS}/.master-recipients"
-SOURCE_SCOPES = (f"{SECRETS}/shared", f"{SECRETS}/per-machine")
+# Every directory that holds master-encrypted files: the generators' two, and the nodes'
+# identity files, which an install writes (`set_node_identity`).
+SOURCE_SCOPES = (f"{SECRETS}/shared", f"{SECRETS}/per-machine", f"{SECRETS}/identities")
 
 # An identity file used before the flake's master identities, for a key the flake names
 # only as a recipient: the offline one. Several, separated by `:`.
@@ -683,6 +685,30 @@ class Store:
     def recipient(self, machine: str) -> str | None:
         f = self.root / SECRETS / "recipients" / f"{machine}.pub"
         return f.read_text().removesuffix("\n") if f.exists() else None
+
+    def _stored_as(self, machine: str, key: str, default: str) -> Path:
+        if machine not in self.export:
+            raise AvcError(f"unknown machine {machine!r} (known: {', '.join(self.machines())})")
+        return self.root / self.export[machine].get(key, default)
+
+    def node_identity(self, machine: str) -> str | None:
+        """The node's age identity file as its last install left it in the repository: a
+        handle to a key in that machine's TPM, encrypted to the operators like any source."""
+        f = self._stored_as(machine, "identityStoredAs", f"{SECRETS}/identities/{machine}.age")
+        return self.decrypt(f).decode() if f.exists() else None
+
+    def set_node_identity(self, machine: str, identity: str, recipient: str) -> list[str]:
+        """A node's new identity: the recipient in the clear, the identity file encrypted
+        to the master recipients. What was rekeyed to the old recipient is named by it, so
+        `rekey` after this makes all of it again and removes the old."""
+        had = bool(self.sources())
+        rec = self._stored_as(machine, "recipientStoredAs", f"{SECRETS}/recipients/{machine}.pub")
+        ident = self._stored_as(machine, "identityStoredAs", f"{SECRETS}/identities/{machine}.age")
+        _replace(ident, self.encrypt(identity.encode(), self.master_recipient_args()))
+        self._plain[ident] = identity.encode()
+        _replace(rec, (recipient.strip() + "\n").encode())
+        self._record_recipients(had)
+        return [self._rel(rec), self._rel(ident)]
 
     def rekeyed_dir(self, machine: str) -> Path:
         return self.root / SECRETS / "rekeyed" / machine

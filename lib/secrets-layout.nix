@@ -12,6 +12,7 @@
 #   secrets/.master-recipients                            who every `.age` above is encrypted to
 #   secrets/rekeyed/<node>/                               agenix-rekey's localStorageDir
 #   secrets/recipients/<node>.pub                         the node's age recipient
+#   secrets/identities/<node>.age                         the node's age identity file
 #
 # A `.age` file is encrypted to the operators' master identities and to nothing else:
 # no node can read it. `agenix rekey` re-encrypts what a node reads to that node's
@@ -19,6 +20,13 @@
 # <hash of recipient and source>-<scope>/<generator>/<file>.age; those files are what a
 # node's closure carries. A file with `secret = false` is committed as it is, beside
 # the ciphertexts, which is why no public file may be named `<something>.age`.
+#
+# A node's identity file is what `age-plugin-tpm --generate` wrote on that node's TPM at
+# install: a handle to a key the TPM holds, and useless on any other machine. The node
+# keeps it on its encrypted disk (`cluster.secrets.identityPath`). The copy here is
+# encrypted to the master identities like every `.age` file, and is what a reinstall on
+# the same machine puts back, so that nothing has to be rekeyed. No generator makes it
+# and no node is given it.
 #
 # `.validation-hash` is the generator's `validationHash` (modules/secrets.nix) as it was
 # when the generator last ran, one line, in the clear; a generator without `validation`
@@ -32,7 +40,8 @@
 # On a node, a file a service reads is at /run/secrets/<scope>/<generator>/<file>, where
 # <scope> is `shared` or `per-machine/<node>`. A file read only at install
 # (`neededFor = "partitioning"`) is at /run/partitioning-secrets/<scope>/<generator>/<file>,
-# put there by whatever installs the node, and is on no running node.
+# put there by `avc boot install` (decrypted on the operator's machine, sent into the
+# installer's memory), and is on no running node.
 #
 # `dir` may be a path or a string (the fixtures pass a string, tests/fixtures/default.nix).
 {
@@ -65,6 +74,9 @@
 
   rekeyed = dir: machine: dir + "/secrets/rekeyed/${machine}";
   recipient = dir: machine: dir + "/secrets/recipients/${machine}.pub";
+  # Relative to `dir`: what the install writes.
+  recipientStoredAs = machine: "secrets/recipients/${machine}.pub";
+  identityStoredAs = machine: "secrets/identities/${machine}.age";
 
   runtimeDir = "/run/secrets";
   partitioningDir = "/run/partitioning-secrets";
