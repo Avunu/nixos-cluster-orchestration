@@ -126,6 +126,21 @@ def confirm(question: str, default: bool = False) -> bool:
     return bool(_ask(questionary.confirm(question, default=default)))
 
 
+def can_ask() -> bool:
+    return _script is not None or sys.stdin.isatty()
+
+
+def attest(question: str) -> bool:
+    """A confirmation --yes does not give: the operator has compared something on the
+    screen with something that is not, and only a person at a terminal can say so."""
+    if _script is not None:
+        return bool(_scripted_answer(question))
+    _interactive(question)
+    import questionary
+
+    return bool(_ask(questionary.confirm(question, default=False)))
+
+
 def choose(question: str, choices: Sequence[str | tuple[str, Any]], default: Any = None) -> Any:
     """Pick one. A choice is a label, or (label, value)."""
     if _script is not None:
