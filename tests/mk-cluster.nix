@@ -304,10 +304,12 @@ let
             (gh.check {
               inherit pkgs directory repos;
             }).buildCommand;
-          listed = pkgs.writeTextDir "github-repos.json" (builtins.toJSON [
-            "customer/content"
-            "acme/addons"
-          ]);
+          listed = pkgs.writeTextDir "github-repos.json" (
+            builtins.toJSON [
+              "customer/content"
+              "acme/addons"
+            ]
+          );
         in
         site.githubRepos == [ ]
         && site.checks.x86_64-linux.github-repos.buildCommand == "touch $out"
@@ -315,16 +317,19 @@ let
         && lib.hasInfix "avc ci repos" (check ./fixtures/mk-cluster [ "customer/content" ])
         && lib.hasInfix "exit 1" (check ./fixtures/mk-cluster [ "customer/content" ])
         # Order is not part of it; one name more or less is.
-        && check listed [
-          "acme/addons"
-          "customer/content"
-        ] == "touch $out"
+        &&
+          check listed [
+            "acme/addons"
+            "customer/content"
+          ] == "touch $out"
         && lib.hasInfix "exit 1" (check listed [ "acme/addons" ])
-        && lib.hasInfix "exit 1" (check listed [
-          "acme/addons"
-          "customer/content"
-          "customer/more"
-        ]);
+        && lib.hasInfix "exit 1" (
+          check listed [
+            "acme/addons"
+            "customer/content"
+            "customer/more"
+          ]
+        );
     }
     {
       name = "with ci.url a node asks the Worker for its GitHub tokens: on a timer and before each pull, never as part of boot";
@@ -355,10 +360,11 @@ let
         && helper.useHttpPath
         && lib.hasSuffix " credential" helper.helper
         && withWorker.githubRepos == [ "customer/private-addons" ]
-        && (mkOpsIndex {
-          site = withWorker;
-          inherit topology;
-        }).githubRepos == [ "customer/private-addons" ];
+        &&
+          (mkOpsIndex {
+            site = withWorker;
+            inherit topology;
+          }).githubRepos == [ "customer/private-addons" ];
     }
     {
       name = "the App's key is the operators' and the Worker's: no node is given it, and no node holds a GitHub token of its own";
