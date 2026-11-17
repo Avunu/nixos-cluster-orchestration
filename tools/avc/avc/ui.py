@@ -38,6 +38,10 @@ def scripted(answers: Sequence[Any]) -> Iterator[None]:
         _script = saved
 
 
+def is_scripted() -> bool:
+    return _script is not None
+
+
 def _scripted_answer(question: str) -> Any:
     assert _script is not None
     if not _script:

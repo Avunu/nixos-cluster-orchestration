@@ -178,3 +178,51 @@ def test_a_per_machine_path_names_its_machine(tmp_path):
     gen = GeneratorInfo("initrd-ssh", False, (f,))
     assert gen.path(tmp_path, f) == tmp_path / "secrets/per-machine/node2/initrd-ssh/ssh_host_ed25519_key.age"
     assert f.age_name == "per-machine/node2/initrd-ssh/ssh_host_ed25519_key" and not f.lowered
+
+
+# ── replacing a data-bound key, after a node left the operators' control ─────
+
+
+@pytest.fixture
+def with_data_keys(fleet, monkeypatch):
+    extra = [GeneratorInfo(n, True, (SecretFile("x", True, True),), (), ()) for n in ("juicefs-rsa", "restic", "blog-jfs")]
+    gens = {m: [*secretstore.generators(fleet.root, m), *extra] for m in ("node1", "node2", "node3")}
+    monkeypatch.setattr(secretstore, "generators", lambda root, machine: gens[machine])
+    return fleet
+
+
+@pytest.mark.parametrize("generator", ["juicefs-rsa", "restic", "blog-jfs"])
+def test_replace_makes_a_data_bound_key_only_for_its_name_typed_back(with_data_keys, generated, generator):
+    # What `rotate` and `provision` refuse for good has one way through, and it is typed.
+    with ui.scripted([f"replace {generator}"]):
+        actions.find("secrets", "replace").run(with_data_keys, {"generator": generator})
+    assert generated == [([("node1", generator)], True)]
+
+
+@pytest.mark.parametrize("answer", ["juicefs-rsa", "yes", "replace restic", ""])
+def test_replace_makes_nothing_for_any_other_answer(with_data_keys, generated, answer):
+    from avc.errors import Aborted
+
+    with ui.scripted([answer]), pytest.raises(Aborted):
+        actions.find("secrets", "replace").run(with_data_keys, {"generator": "juicefs-rsa"})
+    assert generated == []
+
+
+def test_replace_is_not_something_yes_answers(with_data_keys, generated, monkeypatch):
+    # `avc -y` takes confirmations as given. This is not a confirmation.
+    monkeypatch.setattr(ui, "assume_yes", True)
+    with pytest.raises(AvcError, match="not something `-y` answers"):
+        actions.find("secrets", "replace").run(with_data_keys, {"generator": "restic"})
+    assert generated == []
+
+
+@pytest.mark.parametrize("generator", ["luks", "initrd-ssh", "nomad-ca", "wg-ctrl"])
+def test_replace_is_for_data_bound_keys_and_nothing_else(with_data_keys, generated, generator):
+    # The disk-bound ones stay refused by every command: a new recovery key opens no disk.
+    with pytest.raises(AvcError, match="is not bound to data"):
+        actions.find("secrets", "replace").run(with_data_keys, {"generator": generator})
+    assert generated == []
+
+
+def test_replace_offers_only_the_data_bound_keys(with_data_keys):
+    assert secrets.replaceable(with_data_keys) == ["blog-jfs", "juicefs-rsa", "restic"]

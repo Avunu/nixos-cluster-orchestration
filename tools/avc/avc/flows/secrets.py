@@ -36,11 +36,12 @@ if TYPE_CHECKING:
     from avc.context import Ctx
     from avc.core.secretstore import GeneratorInfo
 
-# Bound to an installed node's disks: the LUKS passphrase opens them and the identity check
-# compares the secret on them with the hash in the signed initrd. Regenerating either locks
+# Bound to an installed node's disks: `luks/passphrase` is the node's recovery key, with a
+# slot on each leg, and the identity check compares the secret on them with the hash in the
+# signed initrd. Regenerating either locks
 # the node out, whatever secrets/policy.toml says, so these are refused here as well.
 BOUND_TO_DISKS = {
-    "luks": "the disks' LUKS passphrase: a new one opens nothing",
+    "luks": "the disks' recovery key: a new one opens nothing",
     "volume-identity": "compared with the secret on the root at every boot: a new one halts the node",
 }
 
@@ -71,13 +72,13 @@ HELD_ON_THE_NODE = {
 BOUND_TO_DATA = {
     "juicefs-rsa": (
         "the JuiceFS volume's key: its PEM is in the volume's metadata, encrypted with this passphrase, and every "
-        "mount after the next restart could not open it. Changing it means a new volume "
-        "(README, Recovery: 'A node left your control')"
+        "mount after the next restart could not open it. Changing it means a new volume: "
+        "`avc secrets replace juicefs-rsa`, by the README's Recovery, 'A node left your control'"
     ),
     "restic": (
         "every app's restic repository password: a new one opens none of the existing repositories (rc 12). "
-        "Per repository, `restic key add` / `restic key remove` instead; after a lost node, new repositories "
-        "(README, Recovery: 'A node left your control')"
+        "Per repository, `restic key add` / `restic key remove` instead; after a lost node, new repositories: "
+        "`avc secrets replace restic`, by the README's Recovery, 'A node left your control'"
     ),
 }
 
@@ -88,7 +89,7 @@ NOT_ON_INSTALLED = BOUND_TO_DISKS | HELD_ON_THE_NODE | BOUND_TO_DATA
 APP_VOLUME_KEY = "-jfs"
 APP_VOLUME_KEY_WHY = (
     "one app's JuiceFS volume key: its PEM is in the volume's metadata, encrypted with this passphrase, and a "
-    "new one reads none of the app's files. Changing it means a new volume for that app"
+    "new one reads none of the app's files. Changing it means a new volume for that app (`avc secrets replace`)"
 )
 
 
@@ -353,6 +354,56 @@ def rotate(ctx: Ctx, generator: str) -> None:
     _stored(ctx)
     if ship.ship(ctx, f"chore(secrets): rotate {generator}", paths=["secrets/"], post=post) and g.prompts:
         ui.info("deployed and restarted — now revoke the old credential at its issuer")
+
+
+def replaceable(ctx: Ctx) -> list[str]:
+    return [n for n in _gen_names(ctx) if bound_to_data(n)]
+
+
+@action(
+    "secrets",
+    "replace",
+    "Replace a data-bound key (a new JuiceFS volume, new restic repositories), after a node left your control",
+    Arg("generator", "Generator", choices=replaceable),
+)
+def replace(ctx: Ctx, generator: str) -> None:
+    """The one way to a new `juicefs-rsa`, `restic` or `<app>-jfs`. `rotate` and
+    `provision` refuse them on an installed node, because a new value opens nothing that
+    exists. After a lost node that is the purpose (README, Recovery: 'A node left your
+    control'): the old value is disclosed, so the data moves to a new volume, or to new
+    repositories, under a key the lost machine never held. This makes that key and
+    nothing else: the steps before and after it are the README's, and they are what keep
+    the data."""
+    why = bound_to_data(generator)
+    if why is None:
+        raise AvcError(f"{generator} is not bound to data: `avc secrets rotate {generator}`")
+    gens = _gens(ctx)
+    closure = [generator, *secretstore.dependents(gens, generator)]
+    for name in closure[1:]:
+        if not_on_installed(name):
+            raise AvcError(f"{name} derives from {generator} and is {not_on_installed(name)}: not replaced")
+    ui.header(f"Replace {generator}")
+    ui.err(f"{generator} is {why}")
+    ui.say("After this the repository holds the old value only in its history. Before going on:")
+    ui.say("  - the old value is in the offline kit, and compares equal to `avc secrets reveal` of it;")
+    if generator == "restic":
+        ui.say("  - every app has been restored or backed up as far as it will be from the old repositories;")
+        ui.say("  - this commit also changes `backup.repoSalt`, so that every app moves to a new, empty repository.")
+    else:
+        ui.say("  - every app on the volume has a backup you have looked at (`cluster-backup-list <app>`);")
+        ui.say("  - every node is held, the apps and the mounts are stopped;")
+        ui.say("  - this commit also names a new, empty bucket, and the volume's metadata database is emptied before the nodes are released.")
+    if len(closure) > 1:
+        ui.warn(f"also regenerated (they derive from it): {', '.join(closure[1:])}")
+    # Typed, and never taken as given: `-y` answers confirmations, and this is not one.
+    if ui.assume_yes and not ui.is_scripted():
+        raise AvcError(f"replacing {generator} is not something `-y` answers: run it at a terminal and type the name")
+    ui.type_to_confirm(f"Make a new {generator}, which opens nothing that exists", f"replace {generator}")
+    targets = rotation_targets(ctx, generator)
+    secretstore.generate(ctx.root, [(m, generator) for m in targets], regenerate=True, reference=_machine(ctx))
+    _stored(ctx)
+    ui.ok(f"{generator} is new. It is on no node yet: commit it with the change it belongs to (the bucket, or the salt)")
+    ui.say("`avc deploy ship` ships the working tree; put the new value in the offline kit, with a new bundle.")
 
 
 @action("secrets", "set", "Set a value by hand", Arg("var", "Secret (generator/file, or machine:generator/file)", choices=_var_ids))
