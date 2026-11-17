@@ -435,17 +435,24 @@
               ''
           );
 
-          # The pipeline's Worker: what a webhook and a node's report make of each other
-          # (node --test, no dependencies).
+          # The pipeline's Worker: what a webhook and a node's report make of each other.
+          # TypeScript, with no dependencies: tsc checks the types (the Workers runtime
+          # and Node are declared in src/workers.d.ts and test/node.d.ts, for want of
+          # npm), and `node --test` runs the sources as they are, removing the types
+          # itself, which Node does unasked from 24 on.
           checks.cluster-ci = detach (
             _:
             pkgs.runCommand "cluster-ci-tests"
               {
-                nativeBuildInputs = [ pkgs.nodejs_22 ];
+                nativeBuildInputs = [
+                  pkgs.nodejs_24
+                  pkgs.typescript
+                ];
               }
               ''
                 cp -r ${./workers/cluster-ci} w && cd w
-                node --test test/*.test.js
+                tsc --noEmit -p .
+                node --test test/*.test.ts
                 touch $out
               ''
           );

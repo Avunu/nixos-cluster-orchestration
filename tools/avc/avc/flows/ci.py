@@ -91,7 +91,7 @@ def app(ctx: Ctx, value: str) -> None:
 
 
 # ── which repositories the site uses ─────────────────────────────────────────
-# The same reading as the Worker's (workers/cluster-ci/src/access.js, siteRepos); both
+# The same reading as the Worker's (workers/cluster-ci/src/access.ts, siteRepos); both
 # are held to workers/cluster-ci/test/site-repos.json.
 
 

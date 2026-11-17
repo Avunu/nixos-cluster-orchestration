@@ -1,20 +1,34 @@
 // The Worker's HTTP surface: who is asking, and which of the pipeline's three questions
-// it is. `pipeline` is the Durable Object's stub (src/index.js) or, under `node --test`,
+// it is. `pipeline` is the Durable Object's stub (src/index.ts) or, under `node --test`,
 // the Pipeline itself.
 //
 //   POST /webhook/github   GitHub's deliveries, checked against the App's webhook secret
 //   POST /agent/sync       a node's report, answered with what it should run; a bearer
 //                          token per node (AGENT_TOKENS), held open while nothing changes
 //   POST /agent/token      the same bearer token; answered with read-only installation
-//                          tokens for the site's repositories (src/access.js). The body
+//                          tokens for the site's repositories (src/access.ts). The body
 //                          is not read: nothing a node says decides what it may read.
 
-import { nodeFor } from "./auth.js";
-import { verifySignature } from "./github.js";
+import type { TokensAnswer } from "./access.ts";
+import { nodeFor } from "./auth.ts";
+import type { Report, SyncAnswer } from "./core.ts";
+import { verifySignature } from "./github.ts";
+import type { Env, Thrown } from "./types.ts";
 
-const json = (body, status = 200) => Response.json(body, { status });
+// The pipeline as it is asked here: the Durable Object's stub, or the Pipeline.
+export interface Asked {
+  webhook(event: string | null, payload: unknown): Promise<string>;
+  sync(node: string, report: Report): Promise<SyncAnswer>;
+  tokens(node: string): Promise<TokensAnswer>;
+}
 
-export async function handle(request, env, pipeline) {
+const json = (body: unknown, status = 200) => Response.json(body, { status });
+
+export async function handle(
+  request: Request,
+  env: Partial<Pick<Env, "GITHUB_WEBHOOK_SECRET" | "AGENT_TOKENS">>,
+  pipeline: Asked,
+): Promise<Response> {
   const { pathname } = new URL(request.url);
   if (request.method !== "POST") return json({ error: "not found" }, 404);
 
@@ -30,13 +44,13 @@ export async function handle(request, env, pipeline) {
   if (pathname === "/agent/sync" || pathname === "/agent/token") {
     const node = nodeFor(env, request.headers.get("Authorization"));
     if (!node) return json({ error: "unauthorized" }, 401);
-    if (pathname === "/agent/sync") return json(await pipeline.sync(node, await request.json()));
+    if (pathname === "/agent/sync") return json(await pipeline.sync(node, (await request.json()) as Report));
     try {
       return json(await pipeline.tokens(node));
     } catch (e) {
       // GitHub away, or the Worker not told which repository is the site's. The node
       // keeps the tokens it has.
-      return json({ error: String(e?.message ?? e) }, 502);
+      return json({ error: String((e as Thrown | null | undefined)?.message ?? e) }, 502);
     }
   }
 
