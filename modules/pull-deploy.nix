@@ -4,8 +4,9 @@
 # `boot`. Each node rebuilds ITSELF from <flakeUrl>#<hostName> on a timer.
 #
 # Bootstrap is still push (the install); this takes over once a node
-# is up. Private-repo access (this flake + private flake inputs) comes from a
-# github token kept OUT of the Nix store (a nix.conf `!include`).
+# is up. Private-repo access (this flake + private flake inputs) is
+# modules/github-access.nix: short-lived, read-only tokens the cluster-ci Worker hands
+# the node, asked for before every tick.
 #
 # This loop is why the whole secrets design has to work with no operator and no
 # operator key: every secret a node reads is in its closure, encrypted to the identity
@@ -190,38 +191,6 @@ in
           lib.concatStringsSep "\n" (lib.sort lib.lessThan boot.ssh.authorizedKeys)
         );
       };
-
-  # Private GitHub access for `nix build`/`nixos-rebuild` flake fetches. The
-  # vars file's CONTENT is a nix.conf line ("access-tokens = github.com=…"), so
-  # the token never lands in the store — see the github-token generator in
-  # modules/vars.nix.
-  #
-  # `!include` (not `include`) is deliberate and load-bearing: it makes the file
-  # OPTIONAL, so a node whose token has not been generated yet degrades to
-  # "public repos only" instead of every single nix command failing to parse its
-  # config — which on a pull-deployed fleet would be unrecoverable remotely.
-  nix.extraOptions = ''
-    !include ${config.cluster.secrets.generators.github-token.files."nix.conf".path}
-  '';
-
-  # `access-tokens` above only covers Nix's own `github:` fetcher. A
-  # `git+https://` input makes Nix shell out to `git fetch`, which prompts for
-  # a username and fails non-interactively — so private git+https inputs need
-  # netrc as well. Nix's `netrc-file` setting feeds only Nix's OWN downloader
-  # (tarballs, `github:`), never the git subprocess; git reads ~/.netrc through
-  # curl. Every flake fetch on a node runs as root — the pull loop and a
-  # pushed `nixos-rebuild` — so root's ~/.netrc
-  # is the secret file. A symlink, so the target stays root-only (0400) and the
-  # token never sits in a second place; created before any unit that fetches.
-  #
-  # Verified on node1 (2026-09-21): with only netrc-file set, every private
-  # git+https input failed with "could not read Username for
-  # 'https://github.com'", and a pushed rebuild reported "Failed to fetch
-  # git repository" on the remote; with the symlink, 401 -> Basic -> 200.
-  nix.settings.netrc-file = config.cluster.secrets.generators.github-token.files."netrc".path;
-  systemd.tmpfiles.rules = [
-    "L+ /root/.netrc - - - - ${config.cluster.secrets.generators.github-token.files."netrc".path}"
-  ];
 
   systemd.services.cluster-upgrade.description = "Pull + apply cluster config from ${d.flakeUrl}#${host}";
 

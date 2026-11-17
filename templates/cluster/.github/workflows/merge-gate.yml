@@ -30,9 +30,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # A token that can read this site's private flake inputs, as a nix.conf line:
-  # "access-tokens = github.com=<token>". Optional; leave the secret unset if every input
-  # is public or in this repository.
+  # The runner's own read access to this site's private flake inputs, as a nix.conf line:
+  # "access-tokens = github.com=<token>". The runner is not a node: the nodes get theirs
+  # from the cluster-ci Worker. Optional; leave the secret unset if every input is public
+  # or in this repository.
   NIX_CONFIG: ${{ secrets.NIX_ACCESS_TOKENS }}
 
 jobs:
@@ -73,6 +74,19 @@ jobs:
           drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.nixpkgs-follows-library.drvPath)
           nix build --no-link --print-build-logs "$drv^*"
 
+  # github-repos.json says what the nodes may read at GitHub besides the lock's inputs,
+  # and the cluster-ci Worker believes the committed file. It must be what the
+  # configuration fetches: `avc ci repos` writes it.
+  github-repos:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checks.x86_64-linux.github-repos
+        run: |
+          drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.github-repos.drvPath)
+          nix build --no-link --print-build-logs "$drv^*"
+
   nodes:
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 30
@@ -107,7 +121,7 @@ jobs:
           nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
 
   merge-gate:
-    needs: [boot-install, boot-fallback, nixpkgs-follows-library, nodes, toplevel]
+    needs: [boot-install, boot-fallback, nixpkgs-follows-library, github-repos, nodes, toplevel]
     if: always()
     runs-on: ubuntu-latest
     steps:

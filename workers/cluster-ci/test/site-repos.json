@@ -1,0 +1,46 @@
+{
+  "comment": "One site, and the repositories it uses. The Worker (src/access.js, siteRepos) and avc (tools/avc/avc/flows/ci.py, site_repos) are both held to `expect`, so the operator's listing and the Worker's tokens name the same set.",
+  "site": "acme/cluster",
+  "lock": {
+    "root": "root",
+    "version": 7,
+    "nodes": {
+      "root": { "inputs": { "cluster": "cluster", "nixpkgs": ["cluster", "nixpkgs"], "shop": "shop" } },
+      "cluster": {
+        "locked": { "type": "github", "owner": "Avunu", "repo": "nixos-cluster-orchestration", "rev": "0000000000000000000000000000000000000001" },
+        "original": { "type": "github", "owner": "Avunu", "repo": "nixos-cluster-orchestration", "rev": "0000000000000000000000000000000000000001" }
+      },
+      "nixpkgs": {
+        "locked": { "type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": "0000000000000000000000000000000000000002" },
+        "original": { "type": "github", "owner": "NixOS", "repo": "nixpkgs", "ref": "nixos-unstable" }
+      },
+      "shop": {
+        "locked": { "type": "git", "url": "https://github.com/acme/shop.git", "rev": "0000000000000000000000000000000000000003", "submodules": true },
+        "original": { "type": "git", "url": "https://github.com/acme/shop.git", "ref": "main", "submodules": true }
+      },
+      "shop-again": { "original": { "type": "github", "owner": "acme", "repo": "SHOP" } },
+      "addons": { "original": { "type": "git", "url": "ssh://git@github.com/Acme/addons" } },
+      "scp-style": { "original": { "type": "git", "url": "git@github.com:customer/app.git" } },
+      "archive": { "locked": { "type": "tarball", "url": "https://github.com/customer/theme/archive/0000000000000000000000000000000000000004.tar.gz" } },
+      "api-tarball": { "locked": { "type": "tarball", "url": "https://api.github.com/repos/customer/plugin/tarball/0000000000000000000000000000000000000005" } },
+      "elsewhere": { "locked": { "type": "git", "url": "https://git.example.net/acme/hidden.git" } },
+      "enterprise": { "locked": { "type": "github", "host": "github.example.net", "owner": "acme", "repo": "internal" } },
+      "lookalike": { "locked": { "type": "git", "url": "https://github.com.example.net/acme/lookalike.git" } },
+      "a-path": { "locked": { "type": "path", "path": "/nix/store/github.com/acme/path" } },
+      "bad-owner": { "locked": { "type": "github", "owner": "ac me", "repo": "x" } },
+      "no-repo": { "locked": { "type": "git", "url": "https://github.com/acme" } }
+    }
+  },
+  "extra": ["customer/content", "acme/shop", "not a repository", "one/two/three", "acme/..", 5],
+  "expect": [
+    "Acme/addons",
+    "acme/cluster",
+    "acme/shop",
+    "Avunu/nixos-cluster-orchestration",
+    "customer/app",
+    "customer/content",
+    "customer/plugin",
+    "customer/theme",
+    "NixOS/nixpkgs"
+  ]
+}

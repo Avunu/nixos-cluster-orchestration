@@ -379,7 +379,8 @@ in
     # ── The pipeline's agent (modules/ci-agent.nix) ─────────────────────────
     # Per machine, like the audit trail's: the cluster-ci Worker answers a token with
     # that node's previews and their tunnel secrets, so a stolen one speaks for one
-    # node. Declared only when the topology names a Worker. Regenerating it needs the
+    # node, and with read-only tokens for the site's repositories
+    # (modules/github-access.nix). Declared only when the topology names a Worker. Regenerating it needs the
     # Worker's AGENT_TOKENS updated too (`avc ci tokens`), or the node's agent is
     # refused with 401 until it is.
     ci = lib.mkIf ((topology.ci.url or null) != null) {
@@ -389,6 +390,39 @@ in
         pkgs.coreutils
       ];
       script = ''openssl rand -hex 32 | tr -d '\n' > "$out/token"'';
+    };
+
+    # ── The GitHub App (workers/cluster-ci) ─────────────────────────────────
+    # All of the cluster's GitHub access is one App: the Worker's webhooks, comments and
+    # statuses, and the read-only tokens it hands the nodes (modules/github-access.nix).
+    # Its private key is the operators' and the Worker's: `deploy = false` keeps it off
+    # every node, and `avc ci app private-key | wrangler secret put
+    # GITHUB_APP_PRIVATE_KEY` is how the Worker gets it. `avc ci installations` signs
+    # with it on the operator's machine, to list who has installed the App.
+    #
+    # The id is not a secret (it is in the Worker's wrangler.toml). The webhook secret
+    # is ours to choose, so it is generated: paste it into the App's settings.
+    # Regenerating: a new private key is made at GitHub (the App's settings), then
+    # prompted for here; either value changed needs its `wrangler secret put` again.
+    github-app = lib.mkIf ((topology.ci.url or null) != null) {
+      share = true;
+      prompts.app-id = {
+        description = "GitHub App: its App ID (the number on the App's settings page)";
+        persist = true;
+      };
+      prompts.private-key = {
+        description = "GitHub App: a private key, the .pem as GitHub downloads it (the App's settings, Private keys)";
+        type = "multiline-hidden";
+        persist = true;
+      };
+      files.app-id.secret = false;
+      files.private-key.deploy = false;
+      files.webhook-secret.deploy = false;
+      runtimeInputs = [
+        pkgs.openssl
+        pkgs.coreutils
+      ];
+      script = ''openssl rand -hex 32 | tr -d '\n' > "$out/webhook-secret"'';
     };
 
     # ── the canary (modules/canary-scan.nix) ──────────────────────────────────
@@ -406,44 +440,6 @@ in
         pkgs.coreutils
       ];
       script = ''printf 'CANARY-%s\n' "$(openssl rand -hex 16)" | tr -d '\n' > "$out/value"'';
-    };
-
-    # ── GitHub token for the pull loop ──────────────────────────────────────
-    # modules/pull-deploy.nix adds this file to nix.conf with `!include`, so the
-    # FILE CONTENT must be a nix.conf line rather than a bare token. Rendering
-    # it here keeps the token itself out of every other consumer's shape.
-    github-token = {
-      share = true;
-      files."nix.conf" = { };
-      # A SECOND rendering of the same token, as netrc. Both are needed and they
-      # cover different fetchers:
-      #
-      #   nix.conf `access-tokens`  -> Nix's own `github:` fetcher
-      #   netrc                     -> `git+https://` inputs, where Nix shells
-      #                                out to git, which knows nothing about
-      #                                access-tokens and prompts for a username
-      #
-      # app files commonly pull project flakes (a Frappe bench, an Odoo project) as
-      # `git+https://…` (they need submodules, which the `github:` fetcher
-      # cannot do), so without netrc every evaluation on a node fails with
-      #   fatal: could not read Username for 'https://github.com'
-      # modules/pull-deploy.nix links it as root's ~/.netrc: that is where the
-      # git subprocess looks, not Nix's netrc-file setting.
-      #
-      # The token needs read access to the CONTENTS of every private input
-      # (a fine-grained PAT: Contents: read on the cluster repo and each
-      # private project repo), not just repository metadata.
-      files."netrc" = { };
-      prompts.token = {
-        description = "GitHub token with read access to the private cluster repo";
-        type = "hidden";
-      };
-      runtimeInputs = [ pkgs.coreutils ];
-      script = ''
-        tok=$(tr -d '\n' < "$prompts/token")
-        printf 'access-tokens = github.com=%s\n' "$tok" > "$out/nix.conf"
-        printf 'machine github.com login x-access-token password %s\n' "$tok" > "$out/netrc"
-      '';
     };
   };
 }

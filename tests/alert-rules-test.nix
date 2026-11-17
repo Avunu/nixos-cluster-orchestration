@@ -1319,6 +1319,28 @@ let
       (s ''cluster_secrets_missing{instance="n"}'' "0 1 0x10")
     ] "5m" none)
 
+    # ── GitHub tokens (modules/github-access.nix) ───────────────────────────
+    # No answer from the Worker since boot, or since a refresh long ago.
+    (case "GitHubTokenStale"
+      [ (s ''cluster_github_token_last_success_timestamp_seconds{instance="n"}'' "0x40") ]
+      "26m"
+      [
+        (crit "warning")
+      ]
+    )
+    # Not yet: the tokens held are good for longer than this, and one refresh may miss.
+    (case "GitHubTokenStale" [
+      (s ''cluster_github_token_last_success_timestamp_seconds{instance="n"}'' "0x40")
+    ] "24m" none)
+    # Refreshed every ten minutes, as the timer does.
+    (case "GitHubTokenStale" [
+      (s ''cluster_github_token_last_success_timestamp_seconds{instance="n"}'' "0x9 600x9 1200x9 1800x9 2400x9")
+    ] "45m" none)
+    # A Worker that came back: the next refresh clears it.
+    (case "GitHubTokenStale" [
+      (s ''cluster_github_token_last_success_timestamp_seconds{instance="n"}'' "0x39 2400x20")
+    ] "45m" none)
+
     # ── audit delivery (WS13) ───────────────────────────────────────────────
     (case "AuditDeliveryStale"
       [ (s ''cluster_audit_spool_oldest_timestamp_seconds{instance="n"}'' "0x200") ]

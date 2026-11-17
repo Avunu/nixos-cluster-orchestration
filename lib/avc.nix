@@ -38,6 +38,9 @@ python.pkgs.buildPythonApplication {
   dependencies = with python.pkgs; [
     questionary
     rich
+    # `avc ci installations` signs in as the site's GitHub App, with its private key,
+    # on the operator's machine (tools/avc/avc/flows/ci.py).
+    cryptography
   ];
 
   # git: the ship pipeline's tests run against a real clone and a protected remote
@@ -55,6 +58,9 @@ python.pkgs.buildPythonApplication {
   # A site with real ciphertext and what agenix-rekey made of it: the runner's names for
   # a node's rekeyed files are held to those (tools/avc/tests/test_runner.py).
   env.AVC_AGENIX_FIXTURE = "${../tests/fixtures/agenix}";
+  # One site and the repositories it uses: avc's reading of them is held to the same
+  # answer as the cluster-ci Worker's (tools/avc/tests/test_ci.py).
+  env.AVC_SITE_REPOS_FIXTURE = "${../workers/cluster-ci/test/site-repos.json}";
 
   # One element per wrapper argument: under __structuredAttrs (the default for
   # Python apps) a "--prefix X : y" string stays a single arg and makeWrapper

@@ -10,10 +10,16 @@
 //
 //   previews[<app>/<branch>]   one record per preview; its tunnel is made here, its
 //                              container on the node whose agent offers the app
-//   agents[<node>]             what the node last offered: its flake, and its apps
-//                              that take previews
+//   agents[<node>]             what the node last offered: its apps that take
+//                              previews (and its flake, which is only kept)
 //   deploySeq                  counts pushes to the branch the nodes rebuild from
+//
+// The App is public: anyone can install it on anything, and GitHub then delivers that
+// repository's events here. Which repository is the site's is the Worker's own
+// configuration (SITE_FLAKE), never a node's report, and a repository the site does not
+// use (src/access.js) gets nothing: no preview, no lock update, no token.
 
+import { Access } from "./access.js";
 import { previewHost, previewLabel } from "./slug.js";
 
 // What the agent reports -> the commit status GitHub shows.
@@ -93,8 +99,10 @@ export function renderComment(r) {
 }
 
 export class Pipeline {
-  constructor({ storage, github, cloudflare, config, now = Date.now, log = console.error }) {
+  constructor({ storage, github, cloudflare, config, now = Date.now, log = console.error, access }) {
     Object.assign(this, { storage, github, cloudflare, config, now, log });
+    this.site = parseFlakeUrl(config.site);
+    this.access = access ?? new Access({ storage, github, site: this.site, now, log });
     this.state = null;
     this.tail = Promise.resolve();
     this.waiters = new Set();
@@ -150,6 +158,11 @@ export class Pipeline {
           return p.ref_type === "branch" ? this.release(p.repository.full_name, p.ref, null) : "ignored";
         case "issue_comment":
           return this.comment(p);
+        case "installation":
+        case "installation_repositories":
+          // Someone installed the App, or changed what an installation covers: the
+          // next token is made from what is covered now.
+          return this.access.invalidate("cover").then(() => "noted");
         default:
           return "ignored";
       }
@@ -192,6 +205,9 @@ export class Pipeline {
     if (!sameRepo(pr.head.repo?.full_name, repo)) return "ignored: fork";
     const targets = this.targets(repo);
     if (!targets.length) return "ignored: no app previews this repository";
+    // A node offered the app; that the repository is one of the site's is read from
+    // the site, so no node can point a preview at a stranger's installation.
+    if (!(await this.access.allows(repo))) return "ignored: not a repository of this site";
     for (const t of targets) await this.want(t, repo, pr);
     this.bump();
     return "preview";
@@ -275,45 +291,37 @@ export class Pipeline {
     return reset ? "reset" : "ignored";
   }
 
-  sites() {
-    const out = new Map();
-    for (const agent of Object.values(this.state.agents)) {
-      const site = parseFlakeUrl(agent.flake);
-      if (site) out.set(`${site.repo.toLowerCase()}@${site.ref ?? ""}`, site);
-    }
-    return [...out.values()];
-  }
-
   // A branch moved. If the nodes rebuild from it, they are told now and not at their
   // next timer. If the site's lock follows it, the site's own workflow updates the lock:
   // that takes Nix, and the result still has to pass the site's merge gate, whose merge
-  // is the push that lands in the first case.
+  // is the push that lands in the first case. A push anywhere else, which for a public
+  // App is anywhere at all, is answered from what is already known of the site.
   async push(p) {
     if (!p.ref?.startsWith("refs/heads/") || p.deleted) return "ignored";
     const branch = p.ref.slice("refs/heads/".length);
     const repo = p.repository.full_name;
-    const done = [];
-    for (const site of this.sites()) {
-      try {
-        if (sameRepo(site.repo, repo)) {
-          if ((site.ref ?? p.repository.default_branch) !== branch) continue;
-          this.state.deploySeq += 1;
-          this.bump();
-          done.push("deploy");
-          continue;
-        }
-        const ref = site.ref ?? (await this.github.api(site.repo, "GET", "")).default_branch;
-        const lock = JSON.parse(await this.github.readFile(site.repo, "flake.lock", ref));
-        const inputs = trackingInputs(lock, repo, branch, p.repository.default_branch);
-        if (!inputs.length) continue;
-        await this.github.dispatchWorkflow(site.repo, this.config.workflow, ref, { inputs: inputs.join(" ") });
-        done.push(`update ${inputs.join(" ")}`);
-      } catch (e) {
-        this.log(`cluster-ci: push to ${repo}@${branch}, site ${site.repo}: ${e.message}`);
-        done.push("error");
-      }
+    const site = this.site;
+    if (!site) return "ignored: SITE_FLAKE is not set";
+    if (sameRepo(site.repo, repo)) {
+      if ((site.ref ?? p.repository.default_branch) !== branch) return "ignored";
+      // Its lock, and what it fetches outside it, may have changed with it.
+      await this.access.invalidate("allow");
+      this.state.deploySeq += 1;
+      this.bump();
+      return "deploy";
     }
-    return done.length ? done.join(", ") : "ignored";
+    try {
+      if (!(await this.access.allows(repo))) return "ignored: not a repository of this site";
+      const ref = site.ref ?? (await this.github.api(site.repo, "GET", "")).default_branch;
+      const lock = JSON.parse(await this.github.readFile(site.repo, "flake.lock", ref));
+      const inputs = trackingInputs(lock, repo, branch, p.repository.default_branch);
+      if (!inputs.length) return "ignored";
+      await this.github.dispatchWorkflow(site.repo, this.config.workflow, ref, { inputs: inputs.join(" ") });
+      return `update ${inputs.join(" ")}`;
+    } catch (e) {
+      this.log(`cluster-ci: push to ${repo}@${branch}, site ${site.repo}: ${e.message}`);
+      return "error";
+    }
   }
 
   // The pull request's comment and the commit's status. GitHub being down must not
@@ -340,6 +348,12 @@ export class Pipeline {
   }
 
   // ── what a node says ─────────────────────────────────────────────────────
+
+  // Read access to the site's repositories, for an hour (src/access.js). Any node of
+  // the site gets the same answer: what it may read is the site's, not the node's.
+  tokens() {
+    return this.access.tokens();
+  }
 
   // The node's report in, what it should run out. Held open up to `waitMs` when the
   // node already knows everything, and answered as soon as that stops being true.

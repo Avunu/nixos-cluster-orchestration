@@ -9,7 +9,8 @@
 #     appsDir = ./apps;
 #     hostsDir = ./hosts;
 #   };
-#   # site.{nixosConfigurations,agenix-rekey,secrets,machineModules,installers,apps}
+#   # site.{nixosConfigurations,agenix-rekey,secrets,machineModules,installers,apps,
+#   #       githubRepos,checks}
 #
 # See README.md "The interface".
 #
@@ -238,4 +239,15 @@ in
   # Every machine's generators as data (modules/secrets.nix, `cluster.secrets.export`),
   # for the tool that runs them. A site's flake exports it as `clusterSecrets`.
   secrets = lib.mapAttrs (_: s: s.config.cluster.secrets.export) nixosConfigurations;
+
+  # The GitHub repositories the site fetches that its flake.lock does not name, which
+  # the committed github-repos.json must list for the nodes to be given read access to
+  # them (lib/github-repos.nix). `checks.<system>.github-repos` fails when it does not:
+  # a site's flake exports it among its checks, and its merge gate builds it.
+  githubRepos = clusterLib.githubRepos.collect nixosConfigurations;
+  checks.${system}.github-repos = clusterLib.githubRepos.check {
+    pkgs = nixpkgs.legacyPackages.${system};
+    inherit directory;
+    repos = clusterLib.githubRepos.collect nixosConfigurations;
+  };
 }

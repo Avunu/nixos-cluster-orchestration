@@ -146,9 +146,6 @@ let
     # The canary scan's literal (modules/canary-scan.nix). Shaped as the generator makes it,
     # and not a substring of any fixture's store path name, which the journal can show.
     "canary/value" = "CANARY-ci-fixture-value";
-    # pull-deploy.nix `!include`s this into nix.conf, so it must parse.
-    "github-token/nix.conf" = "# no GitHub token in the VM tests\n";
-    "github-token/netrc" = "";
   };
   fixtureFor =
     gen: file:

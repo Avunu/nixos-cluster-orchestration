@@ -41,6 +41,8 @@ in
   # node answers.
   inherit reference;
   flakeUrl = topology.deploy.flakeUrl;
+  # What github-repos.json must say (lib/github-repos.nix): `avc ci repos` writes it.
+  githubRepos = clusterLib.githubRepos.collect nixosConfigurations;
 
   nodes = lib.mapAttrs (
     name: node:

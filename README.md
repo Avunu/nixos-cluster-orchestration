@@ -537,7 +537,7 @@ What the node held, and what replaces it:
 | --- | --- |
 | Client data: every app's local state, since each node holds a copy of each app's ([Where an app runs](#where-an-app-runs)), and through its mount every file on the JuiceFS volume | Nothing replaces it. It is disclosed, and whom to tell is your decision and your clients'. |
 | The machine's age identity (the key in its TPM, and the identity file on its disk), which decrypts everything rekeyed to that machine at every commit in the repository's history | Nothing fixes history, so each value below gets a new value. Re-encrypting the old one changes nothing. |
-| `github-token` | Revoke the token at GitHub first: it reads the private repository, ciphertext included. Then `avc secrets rotate github-token` with a new one. |
+| `ci` (the machine's own), and what it held for GitHub | Push `AGENT_TOKENS` again without the node (`avc ci tokens`, after it is out of `nodes`): the Worker then answers it nothing. The GitHub tokens it held read the site's repositories, ciphertext included, and nothing else; they expire within the hour and cannot be renewed without the Worker. No GitHub credential that lasts was on the node. |
 | `ovh-s3`, `backup-target`, `backup-state-target` | New pairs from the provider, `avc secrets rotate ovh-s3`, `avc secrets rotate backup-target` and `avc secrets rotate backup-state-target`, then delete the old pairs at the provider. |
 | `wg-ctrl`, `audit`, `nomad-tls`, `nomad-login` (the machine's own) | Take the node out of `nodes` and ship it, so every peer drops its mesh key, and push `AUDIT_TOKENS` again without it. Nomad can't revoke one certificate or one login JWT: regenerate `nomad-ca` (a hard cut, every node at once) and `nomad-jwt`, by their rotation notes in [Secrets](#secrets). |
 | `nomad-gossip` on a server, `nomad-acl` on a server, the alerting tokens on every node | The gossip key by its rotation note. The alerting tokens with `avc secrets rotate`. The library has no procedure for replacing the management token. Nomad's own is an ACL bootstrap reset on the servers, which is not rehearsed here. |
@@ -547,7 +547,7 @@ What the node held, and what replaces it:
 | every `<app>-jfs-s3` | As `ovh-s3`: a new pair from the provider (`avc cloud apply` after removing the old key there), then delete the old one. |
 | `luks`, `volume-identity`, `initrd-ssh`, `emergency-access`, the node's identity file and the Secure Boot keys | The lost machine's own, and they open nothing else. With the node out of `nodes`, `git rm -r` its `secrets/per-machine/<node>`, `secrets/rekeyed/<node>`, `secrets/recipients/<node>.pub` and `secrets/identities/<node>.age`. Its replacement is a new install, S0 to S8, under new values. |
 
-The order: the GitHub token and the S3 pairs first, because they are what reaches the data from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
+The order: the node's token out of the Worker's `AGENT_TOKENS` and the S3 pairs first, because they are what reaches the data and the repository from outside. Then the node out of `nodes`, then Nomad, then the two data-bound keys, which need a window.
 
 **The data-bound keys.** `avc secrets rotate` and `avc secrets provision` refuse `juicefs-rsa`, every `<app>-jfs` and `restic`, and go on refusing: a new value opens nothing that exists. Here that is the purpose, and it has one command of its own, `avc secrets replace <generator>`. It takes only these generators, says what must already be true, and makes the new value only when you type `replace <generator>` back: `-y` does not answer it. It generates and rekeys and ships nothing: the new key belongs in one commit with the bucket or the salt it goes with, below. Before either procedure, compare the [offline kit](#the-offline-kit)'s `juicefs-rsa/rsa.pem`, `juicefs-rsa/rsa-passphrase` and `restic/password` with the repository's (`avc secrets reveal juicefs-rsa/rsa.pem`, and so on). The old volume and the old repositories open with those and with nothing else, and after a replacement the repository holds them only in its history.
 
@@ -697,7 +697,7 @@ The topology is pure data. [`templates/cluster/topology.nix`](templates/cluster/
 | `deploy.flakeUrl` | What nodes rebuild from, as `github:owner/repo`. Also how `avc` finds the deploy remote. |
 | `deploy.pullInterval` | systemd `OnCalendar` for the pull loop. |
 | `deploy.withoutCanary` | `"<reason>"` to run a site of more than one node without a canary node (see `canary` below, and [Deploying](#deploying)). Leave it out otherwise. |
-| `ci.url` | The cluster-ci Worker's URL. Set, every node runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for neither. |
+| `ci.url` | The cluster-ci Worker's URL. Set, every node asks it for read access to the site's GitHub repositories (short-lived tokens; without it a node reads public repositories only) and runs the pipeline's agent: deploys the moment the deploy branch moves, and previews for apps with `preview.slots` ([Previews and continuous deployment](#previews-and-continuous-deployment)). Leave it out for none of that. |
 | `cloud` | Optional: what `avc cloud` makes at the providers ([Providers](#providers)). `cloud.ovh` is `{ endpoint; project; region; noncurrentDays; }`: the API endpoint (`ovh-us`, `ovh-eu`, `ovh-ca`), the Public Cloud project's id, the region its buckets are made in, and how long a hidden object version is kept (30). `cloud.cloudflare` is `{ accountId; zones; auditBucket; auditLockDays; }`: `zones` maps a zone's name to its id (`zones."example.com" = "<zone id>"`), and only hostnames in one of them get a DNS record; `auditBucket` is the audit trail's R2 bucket, locked for `auditLockDays` (365). Leave a provider out and nothing of its is touched. |
 | `objectStorage` | `{ endpoint; region; juicefsBucket; appBucketPrefix; }`. `juicefsBucket` is the cluster's own volume; each app's bucket is `<appBucketPrefix>-<app>`, and the prefix is `juicefsBucket` unless set. Credentials come from the `ovh-s3` vars generator, whichever provider you use. Loki does not use it: each node's store is its own encrypted disk (`/var/lib/loki`). |
 | `logging.retention` | Loki retention, one number and one unit (`m`, `h`, `d`, `w`, `y`), such as `"720h"`. Older lines are deleted from the store, and a node that no longer runs Loki deletes what is left in its `/var/lib/loki` once it is this old. |
@@ -839,7 +839,7 @@ Odoo and Frappe databases are not initialised for you. Restore or create one aft
 
 ### First install
 
-Minimum before the first node: both operators' YubiKey identities in `masterIdentities`, your SSH keys in `admins`, the topology filled in, and the `ovh-s3` and `github-token` generators. Then [Installing a node](#installing-a-node), S0 to S8:
+Minimum before the first node: both operators' YubiKey identities in `masterIdentities`, your SSH keys in `admins`, the topology filled in, and the `ovh-s3` generator. A site whose repository or inputs are private also needs the cluster-ci Worker and its GitHub App before the first node pulls ([Previews and continuous deployment](#previews-and-continuous-deployment), steps 1 to 4): the install itself is pushed, but the node's pull loop reads GitHub with tokens that Worker hands it. Then [Installing a node](#installing-a-node), S0 to S8:
 
 ```sh
 nix develop
@@ -879,9 +879,9 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `nomad-tls/{agent,cli}.{key,crt}` | Each machine's Nomad certificates (per machine) | Generated, signed by `nomad-ca` |
 | `wg-ctrl/{private,public}` | Each machine's mesh key (per machine); every peer reads the public half | Generated |
 | `audit/token` | Each machine's token for the audit trail (per machine), listed in the Worker's `AUDIT_TOKENS` | Generated |
-| `ci/token` | Each machine's token for the cluster-ci Worker (per machine), listed in the Worker's `AGENT_TOKENS`. Only with `ci.url` | Generated |
+| `ci/token` | Each machine's token for the cluster-ci Worker (per machine), listed in the Worker's `AGENT_TOKENS`: what the pipeline's agent and the node's GitHub token refresh sign in with. Only with `ci.url` | Generated |
 | `canary/value` | The string the [canary scan](#canary-scan) plants and looks for | Generated |
-| `github-token/{nix.conf,netrc}` | Pull loop access to private flakes | Prompt, a fine-grained PAT with read access to contents |
+| `github-app/{app-id,private-key,webhook-secret}` | The site's GitHub App, for the cluster-ci Worker and for `avc ci installations`; never deployed to a node. `avc ci app <value>` prints one for `wrangler secret put`. Only with `ci.url` | Prompt for the id and the private key, from the App's settings; the webhook secret is generated |
 | `restic/password` | Every app's backup repositories, nightly and state. Never regenerate it: a new one opens none of them, and `avc` refuses to rotate it | Generated |
 | `backup-target/{access-key,secret-key}` | The backup target | Prompt |
 | `backup-state-target/{access-key,secret-key}` | The state backup's target, only with `backup.state` | Prompt |
@@ -997,7 +997,7 @@ Bump `agenix` and `agenix-rekey` alone, each as one reviewable commit: they deci
 
 ### Previews and continuous deployment
 
-A GitHub App closes the two gaps the pull loop leaves: the wait between a merge and the nodes' next tick, and having nowhere to look at a pull request before it merges. Its endpoint is a Cloudflare Worker, [`workers/cluster-ci`](workers/cluster-ci), because a node accepts nothing inbound. Every node runs an agent (`modules/ci-agent.nix`, on once `ci.url` is set) that asks the Worker what to do, with a token of its own, and the Worker holds each request until it has an answer.
+All of a cluster's GitHub access is one GitHub App. It is how the nodes read the site's repository and its private inputs ([GitHub access](#github-access), below), and it closes the two gaps the pull loop leaves: the wait between a merge and the nodes' next tick, and having nowhere to look at a pull request before it merges. Its endpoint is a Cloudflare Worker, [`workers/cluster-ci`](workers/cluster-ci), because a node accepts nothing inbound. Every node runs an agent (`modules/ci-agent.nix`, on once `ci.url` is set) that asks the Worker what to do, with a token of its own, and the Worker holds each request until it has an answer.
 
 **A merge deploys at once.** Three pushes matter, and GitHub tells the Worker of each:
 
@@ -1036,22 +1036,57 @@ One preview per app and branch, whatever the number of pull requests on the bran
 
 Setting it up, once per site:
 
-1. Create a GitHub App from [`workers/cluster-ci/app-manifest.json`](workers/cluster-ci/app-manifest.json) (repository permissions: contents read, pull requests write, commit statuses write, actions write; events: pull request, push, delete, issue comment). Install it on the site's repository and on each project's.
-2. Fill in `wrangler.toml` (`PREVIEW_DOMAIN`, `CF_ACCOUNT_ID`, `CF_ZONE_ID`, `GITHUB_APP_ID`), then:
+1. Create **one** GitHub App, under the account that owns the site's repository, from [`workers/cluster-ci/app-manifest.json`](workers/cluster-ci/app-manifest.json): repository permissions contents read, metadata read, pull requests write, commit statuses write, actions write; events pull request, push, delete, issue comment. Make it **public** ("Any account" may install it): GitHub lets a private App be installed on its owner's account only, and an app whose project belongs to another organization is onboarded by that organization installing this App. Being public gives nobody anything: see [GitHub access](#github-access). Generate a private key and note the App ID.
+2. Set `ci.url` in `topology.nix` to where the Worker will answer, and run `avc secrets provision`: it asks for the App ID and the private key (paste the `.pem`), generates the webhook secret and each node's `ci/token`, and ships them. The key is then in the repository, encrypted to the operators, and on no node.
+3. Fill in `wrangler.toml` (`PREVIEW_DOMAIN`, `CF_ACCOUNT_ID`, `CF_ZONE_ID`, `GITHUB_APP_ID`, and `SITE_FLAKE`, the same value as `deploy.flakeUrl`), then:
    ```sh
    cd workers/cluster-ci
    wrangler deploy
-   wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem
-   wrangler secret put GITHUB_WEBHOOK_SECRET
+   avc ci app private-key    | wrangler secret put GITHUB_APP_PRIVATE_KEY   # one YubiKey touch
+   avc ci app webhook-secret | wrangler secret put GITHUB_WEBHOOK_SECRET    # one touch
+   avc ci tokens             | wrangler secret put AGENT_TOKENS             # one touch per node
    wrangler secret put CF_API_TOKEN          # Cloudflare Tunnel: Edit, and DNS: Edit on the preview zone
    ```
-   Point the App's webhook at the Worker's `/webhook/github`.
-3. Set `ci.url` in `topology.nix`, run `avc secrets provision` for each node's `ci/token` (it ships them), and give the Worker the tokens: `avc ci tokens | wrangler secret put AGENT_TOKENS`.
-4. Add `preview` to an app and ship it. The slots exist once the nodes have deployed.
+   In the App's settings, point its webhook at the Worker's `/webhook/github` and paste the webhook secret (`avc ci app webhook-secret`).
+4. Install the App on the site's repository and on each private repository the site uses, then `avc ci installations`: it lists who has installed the App and, for every repository the site uses, whether an installation covers it (one touch: it signs in as the App with the private key, on your machine, and only reads).
+5. Add `preview` to an app and ship it. The slots exist once the nodes have deployed.
 
-The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previews` by `state`. No alert rule reads them yet.
+The agent exports `cluster_ci_last_sync_timestamp_seconds` and `cluster_ci_previews` by `state`; no alert rule reads those yet. The token refresh exports `cluster_github_token_last_success_timestamp_seconds`, `cluster_github_token_expiry_timestamp_seconds`, `cluster_github_token_repositories` and `cluster_github_token_uncovered_repositories`, and `GitHubTokenStale` reads the first.
 
-**What is proven.** `checks.cluster-ci` runs the Worker's decisions (which webhook makes, moves, resets or removes a preview, what a node's report does to the pull request, which push deploys and which updates a lock) with GitHub and Cloudflare stood in for. `checks.ci-agent` runs the agent as a process against a stand-in Worker and stand-in `nix`, `zfs`, `juicefs` and `systemd`, and holds it to what it asks of them and in which order. A slot's container and its host evaluate on the fixture cluster. Nothing here has met GitHub, Cloudflare or a node: no slot has been started, no clone taken, no copy migrated. The first preview on a real site is that test.
+#### GitHub access
+
+No node holds a GitHub credential that lasts, and no personal access token exists anywhere. The App's private key is in two places: the Worker, and the site's repository, encrypted to the operators (`github-app`). A node asks the Worker, with its own `ci/token`, and is handed installation tokens that GitHub itself has narrowed:
+
+- **read-only:** contents and metadata, whatever else the App is permitted;
+- **the site's repositories only:** one token per owner, naming each repository;
+- **one hour:** the Worker hands out nothing with under half an hour left, and a node asks every ten minutes and before each pull.
+
+**Which repositories is never the node's to say.** The Worker reads it from the site's repository, at the branch the nodes deploy (`SITE_FLAKE`): that repository itself, every github.com input in its `flake.lock`, and `github-repos.json` at its root, for what no lock names (a WordPress site's content repository, an app's `preview.repo`, and whatever a site adds to `cluster.github.repositories`, such as a project's private submodules). That file is not written by hand: `avc ci repos` writes it from the flake, and the template's merge gate fails when the committed file differs (`checks.github-repos`), so the list changes by a merge, like the lock. A repository of the set that no installation covers is named in the Worker's answer and in the node's log (`journalctl -u cluster-github-token`): a public one needs no token, a private one is waiting for its owner to install the App.
+
+On the node, `cluster-github-token.service` (`modules/github-access.nix`) writes two files under `/run/cluster-github`, root's alone, each replaced whole: a `nix.conf` fragment with `access-tokens` per repository, which Nix's `github:` fetcher reads, and the tokens for git's credential helper, which answers `git+https://` inputs and `builtins.fetchGit` with the token of the repository git names, or with nothing. A refresh that fails keeps every token that is still good.
+
+**The Worker is therefore required** for the pull loop of a site with private repositories. `GitHubTokenStale` fires after 25 minutes without an answer, while the tokens a node holds are still good. A site with only public repositories and no `ci.url` runs with no tokens at all. A site with private repositories and no `ci.url` evaluates (whether a repository is private cannot be known at evaluation) and fails at the fetch, in `cluster-upgrade`'s log, with GitHub's "not found".
+
+**The App is public, and that gives nobody anything.** Anyone can install it on their own repositories; what that does is nothing. The Worker's site is its own configuration, not what installs the App and not what a node reports; a webhook about a repository outside the site's set makes no preview, starts no workflow and moves no deploy; and no token is ever made for a repository outside the set, since GitHub is asked for each by name.
+
+| Who is compromised | What they reach at GitHub |
+| --- | --- |
+| A node | Read access to the repositories the site uses, for at most an hour after its `ci/token` is taken out of `AGENT_TOKENS`. That is what the node could already read: the site's repository holds every secret as ciphertext, and the node's own as files it can decrypt. No write, no other repository of the same owner, and nothing that renews without the Worker. |
+| The Worker (its secrets, or the Cloudflare account) | The App itself: on every repository of every installation, read contents, write pull requests and commit statuses, start workflows (`actions: write`). Not push: the App holds no `contents: write`, so nothing merges that the merge gate did not pass, though a workflow it starts runs with that repository's own secrets. Also the preview tunnels, and each node's `ci/token`. Replace the App's private key at GitHub, then `avc secrets rotate github-app` and the `wrangler secret put` lines again. |
+| An operator's YubiKey | Everything in the repository, the App's key included. See [A node left your control](#a-node-left-your-control) for the rest. |
+
+#### Onboarding an app from another organization
+
+A customer's project stays in the customer's organization. What the cluster needs is to read it, and to comment on its pull requests if it gets previews:
+
+1. **The customer installs the App** on that repository: its public page, `https://github.com/apps/<app>/installations/new`, "Only select repositories". Nothing happens yet: the site does not name the repository, so the Worker gives it nothing.
+2. **Add it to the site:** the project as a flake input, the app in `apps/` (with `preview.repo` if it gets previews), then `avc ci repos`, which rewrites `github-repos.json` when the app fetches something the lock does not name. `avc ci installations` should show the repository as covered.
+3. **Ship it** (`avc deploy ship`). Your own workstation and the merge gate's runner need their own read access to the customer's repository to lock and build it; the nodes do not use yours.
+4. **After the merge** the Worker reads the new lock and file from the deploy branch, and its next answer to each node includes a token for the customer's organization that names that repository and no other. From then on a push to the branch the input follows starts the lock update, and a pull request gets its preview.
+
+If the customer removes the installation, the nodes' tokens for it are not renewed, the next pull that has to fetch the repository fails, and the running system stays as it is.
+
+**What is proven.** `checks.cluster-ci` runs the Worker's decisions (which webhook makes, moves, resets or removes a preview, what a node's report does to the pull request, which push deploys and which updates a lock) with GitHub and Cloudflare stood in for. It also runs what a node is handed for GitHub: that only a node's bearer token is answered, that GitHub is asked for read-only tokens naming the site's repositories, where that set comes from, what a stranger's installation causes (nothing), and when a token is replaced. `checks.github-access` runs the node's refresh against a stand-in Worker (files whole and root's alone, a failed refresh keeping what is still good) and asks git itself what the credential helper answers for each repository. `checks.ci-agent` runs the agent as a process against a stand-in Worker and stand-in `nix`, `zfs`, `juicefs` and `systemd`, and holds it to what it asks of them and in which order. A slot's container and its host evaluate on the fixture cluster. Nothing here has met GitHub, Cloudflare or a node: no installation token has been narrowed by the real API, no Nix on a node has fetched with one, no slot has been started, no clone taken, no copy migrated. The first preview on a real site is that test.
 
 ### Providers
 
@@ -1226,6 +1261,7 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `CanaryFound` | critical | The canary turned up in plaintext somewhere it must never be: find the writer. |
 | `CanaryScanStale` | warning | The canary scan has not run for 8 days. |
 | `JuiceFSVolumeNotEncrypted` | critical | A node refused a JuiceFS volume that is not encrypted. |
+| `GitHubTokenStale` | warning | A node has had no GitHub tokens from the cluster-ci Worker for 25 minutes. The ones it holds last up to an hour; after that its pull loop reads public repositories only. Only with `ci.url`. |
 | `SecretsMissing` | critical | Secrets the node was given did not decrypt: its TPM does not hold the identity they were rekeyed to. A boot that began this way did not start Nomad. |
 | `JuiceFSUnwritable` | critical | `/mnt/jfs` is not writable. |
 | `JuiceFSProbeStale` | warning | The JuiceFS probe has not run. |
@@ -1326,6 +1362,7 @@ This version is written for fresh installs. A cluster running an earlier version
 - **The `nomad-leader` tag is gone.** Remove it from the node that had it (evaluation warns while it is there). Every `nomad-server` node now holds `nomad-acl` and a `registrar` login: `avc secrets provision` makes them for each server that did not have them, and add `nomad_acl` to those servers' kinds in the watchdog Worker's `AUDIT_TOKENS` (`avc audit tokens` prints the new value), or the Worker refuses their ACL events and they stay in the spool.
 - **`homeNode` is gone, and local state moves into datasets.** Remove `homeNode` from every app (evaluation refuses it). An app's database is then a plain directory on the node it was pinned to, and the app has to start there once more: that start copies the directory into `<pool>/state/apps/<app>` (as long as the copy takes, inside `startTimeout`) and keeps the original as `/state/clients/.<app>.before-datasets`, to remove by hand. Started on any other node first, it refuses and Nomad tries again elsewhere, so an app may take a few attempts to land. To choose instead of waiting: `nomad node eligibility -disable` the other nodes, `nomad job restart app-<name>`, and enable them again. Each other node then receives a whole copy, which needs the disk. `/state` must be ZFS, as the installer makes it. Not rehearsed on a site with data.
 - **The scheduler algorithm.** New clusters spread apps over nodes. One bootstrapped before keeps Nomad's packing until told, once, on a server: `nomad operator scheduler set-config -scheduler-algorithm=spread`.
+- **The `github-token` secret is gone.** A node no longer holds a personal access token: it asks the cluster-ci Worker for short-lived, read-only ones ([GitHub access](#github-access)). The closure that removes the token is the last one a node fetches with it, so everything the next pull needs must be there before that closure merges: the App created and installed on the site's repository and every private input, the Worker deployed with `SITE_FLAKE`, the App's key and `AGENT_TOKENS`, and `ci.url` set with every node's `ci/token` shipped. `avc ci installations` shows each of the site's repositories as covered, and `curl -sS -X POST -H "Authorization: Bearer <a node's ci/token>" <ci.url>/agent/token` answers with tokens. Then merge the library bump with `secrets/shared/github-token` and its rekeyed files removed, watch `journalctl -u cluster-github-token -u cluster-upgrade` on the canary, and revoke the old token at GitHub once every node has pulled without it. A node that cannot get tokens after the switch is reached with `avc deploy break-glass <node>`.
 - **The `backup` tag does nothing now.** Each app is backed up by the node running it. Leave the tag or remove it.
 - **The database archive is gone.** `archive.*` on an app, `objectStorage.dbArchiveBucket` and the `<app>-db-archive*` vars no longer exist: remove them, and the archive bucket and its keys at the provider when its last week is no longer wanted. What replaces it is replication between the nodes and, off them, `backup.state`.
 - **The `metrics` tag does nothing now, and the autoscaler is gone.** Every node runs Prometheus, Loki and Alertmanager. The node that had the tag keeps its history; the others start empty and fill from then on, and each needs `rpool/loki` (above). Remove the tag or leave it. The Nomad autoscaler ran on that node and never acted, since no job carries a scaling policy; its `autoscaler` login role went with it, so `avc secrets provision` reissues each node's `nomad-login`.
@@ -1356,8 +1393,9 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | Check | What it proves |
 | --- | --- |
 | `avc` | The operations tool's own tests: policy gate, ship ordering, registry, boot, secrets, audit and pipeline flows. And the generator runner for real, with a plain age key where a site has a YubiKey: order and `$in`, prompts, shared and per-machine, a changed `validation`, a failing script leaving nothing, no plaintext in the repository or off the tmpfs, the sandbox, one decryption per source, rekeyed files under agenix-rekey's names, and `avc secrets check` refusing what is ungenerated or not rekeyed. |
-| `cluster-ci` | The pipeline's Worker: a pull request becomes one preview per app and branch with its own tunnel and hostname, a fork gets nothing, a node's report reaches the pull request only for the commit it is about, a preview's tunnel is deleted only after its node let go of it, and which push deploys and which updates the site's lock. |
-| `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
+| `cluster-ci` | The pipeline's Worker: a pull request becomes one preview per app and branch with its own tunnel and hostname, a fork gets nothing, a node's report reaches the pull request only for the commit it is about, a preview's tunnel is deleted only after its node let go of it, and which push deploys and which updates the site's lock. And a node's GitHub tokens: only a node's bearer token is answered, GitHub is asked for read-only tokens naming the site's repositories, the set comes from the site's repository and never from a node, a stranger's installation of the public App causes nothing, a token is minted once and replaced with half an hour left, and an uncovered repository is named. |
+| `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden and fresh GitHub tokens asked for first, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
+| `github-access` | A node's GitHub token refresh as a process, against a stand-in Worker: both files replaced by rename, mode 0600 in a 0700 directory, one `access-tokens` entry per repository that the nodes' Nix parses, a missing include ignored, a failed refresh keeping the tokens still good and dropping the expired, an answer that is not tokens and names refused. And git's credential helper, asked by git: the token of the repository named, nothing for an unknown owner, another repository of a known owner, an expiring token or another host. |
 | `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
 | `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
 | `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that every generator of a new site can be read. Evaluation only. |

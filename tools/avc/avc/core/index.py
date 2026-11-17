@@ -29,6 +29,9 @@ class Index:
     flake_url: str
     nodes: dict[str, dict[str, Any]]
     apps: dict[str, App]
+    # What the site fetches from GitHub that its flake.lock does not name
+    # (lib/github-repos.nix): what github-repos.json must say.
+    github_repos: tuple[str, ...] = ()
 
     def apps_using(self, generator: str) -> list[App]:
         return [a for a in self.apps.values() if generator in a.generators]
@@ -46,7 +49,13 @@ def parse_index(data: dict[str, Any]) -> Index:
         )
         for name, a in data["apps"].items()
     }
-    return Index(reference=data["reference"], flake_url=data["flakeUrl"], nodes=data["nodes"], apps=apps)
+    return Index(
+        reference=data["reference"],
+        flake_url=data["flakeUrl"],
+        nodes=data["nodes"],
+        apps=apps,
+        github_repos=tuple(data.get("githubRepos", [])),
+    )
 
 
 def load_index(root: Path) -> Index:

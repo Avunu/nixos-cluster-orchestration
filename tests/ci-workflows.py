@@ -182,6 +182,11 @@ check(
     and 'all(.[]; .result == "success")' in runs(gjobs["merge-gate"]),
 )
 check(
+    "merge-gate.yml holds github-repos.json to what the site fetches",
+    ".#checks.x86_64-linux.github-repos.drvPath" in runs(gjobs["github-repos"]) and '"$drv^*"' in runs(gjobs["github-repos"]),
+    runs(gjobs.get("github-repos", {})),
+)
+check(
     "merge-gate.yml builds every node's system",
     "nixosConfigurations.$NODE.config.system.build.toplevel.drvPath" in runs(gjobs["toplevel"]),
 )

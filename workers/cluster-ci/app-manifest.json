@@ -1,8 +1,9 @@
 {
-  "name": "my-cluster-ci",
+  "name": "REPLACE_WITH_THE_APP_NAME",
+  "description": "Deploys, previews and read access for one cluster (workers/cluster-ci in nixos-cluster-orchestration). Installed on a repository, it lets that cluster read it, comment on its pull requests and set commit statuses. The cluster only uses repositories its own site names.",
   "url": "https://github.com/Avunu/nixos-cluster-orchestration",
   "hook_attributes": { "url": "https://cluster-ci.example.workers.dev/webhook/github" },
-  "public": false,
+  "public": true,
   "default_permissions": {
     "metadata": "read",
     "contents": "read",

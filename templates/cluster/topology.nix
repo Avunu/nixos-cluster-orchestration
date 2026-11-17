@@ -66,8 +66,10 @@
 
   # The cluster-ci Worker, a GitHub App's endpoint (README.md in the library, "Previews
   # and continuous deployment"). With it set, every node deploys the moment this
-  # repository's branch moves, and an app with `preview.slots` gets a container per
-  # pull request of its project.
+  # repository's branch moves, an app with `preview.slots` gets a container per
+  # pull request of its project, and the nodes read this repository and its private
+  # inputs with short-lived tokens the Worker hands them. Without it a node reads
+  # public repositories only.
   # ci.url = "https://cluster-ci.example.workers.dev";
 
   # S3-compatible storage for JuiceFS. Credentials: the `ovh-s3` secret. Loki keeps its logs
