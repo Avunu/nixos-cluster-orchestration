@@ -13,6 +13,7 @@ A private flake on top of [nixos-cluster-orchestration](https://github.com/Avunu
 | `secrets/shared/`, `secrets/per-machine/<node>/` | One file per secret, age-encrypted to the operators' master identities, and public values in the clear. Committed |
 | `secrets/rekeyed/<node>/` | What `nix run .#agenix -- rekey` made of them for each node: the files a node decrypts with its TPM. Committed with the secret they came from |
 | `secrets/recipients/<node>.pub` | Each node's age recipient, from its TPM. `avc boot install` writes it |
+| `github-repos.json` | The GitHub repositories this site fetches that `flake.lock` does not name. Written by `avc ci repos`, held to the flake by the merge gate, read by the cluster-ci Worker. Absent when there are none |
 | `secrets/identities/<node>.age` | Each node's identity file, a handle to the key in its TPM, encrypted to the operators. A reinstall on the same machine puts it back |
 
 Keep this repository private: it names your addresses and customers, and it holds your encrypted secrets.
@@ -68,9 +69,15 @@ The first deploy of a library version with boot security waits on every such nod
 
 Write `apps/<name>.nix`, `git add` it, and run `avc secrets provision`: it generates the app's secrets, rekeys them for the nodes and ships the lot. To give it ingress, create its Cloudflare tunnel and set `tunnel.id`. The library's README has the full steps and the list of kinds.
 
-## Deploying on merge, and previews
+## GitHub access, deploying on merge, and previews
 
-Without anything more, a merge reaches the nodes at their next timer, and a project's new commits reach this repository's lock once a week. A GitHub App and its Worker (`workers/cluster-ci` in the library) remove both waits, and give each pull request of a project a container of its own on a copy of production. Set `ci.url` in `topology.nix` and `preview` on an app; the library's README, "Previews and continuous deployment", has the setup and what a preview is trusted with. `.github/workflows/flake-update.yml` is what the Worker starts when a project's branch moves, so keep its file name, or set the Worker's `FLAKE_UPDATE_WORKFLOW`.
+One GitHub App and its Worker (`workers/cluster-ci` in the library) are all of this site's GitHub access. Set `ci.url` in `topology.nix`; the library's README, "Previews and continuous deployment", has the setup, the security model and what a preview is trusted with.
+
+- **The nodes read this repository through it.** No node holds a GitHub credential that lasts: each asks the Worker and is handed read-only tokens, good for an hour, for this repository, the github.com inputs in `flake.lock` and what `github-repos.json` names. If this repository or any input is private, the Worker has to be up before the first node pulls, and stay up: `GitHubTokenStale` says when a node stops getting answers. `avc ci installations` shows which repositories the App's installations cover.
+- **A merge deploys at once**, where without the Worker it waits for the nodes' next timer, and a project's new commits reach this repository's lock when they are pushed, not once a week. `.github/workflows/flake-update.yml` is what the Worker starts when a project's branch moves, so keep its file name, or set the Worker's `FLAKE_UPDATE_WORKFLOW`.
+- **A pull request of a project gets a container** of its own on a copy of production: `preview` on an app.
+
+**An app whose project belongs to another organization:** that organization installs the App on the repository, you add the input and the app here and run `avc ci repos`, and after the merge the Worker gives the nodes a token for that repository and no other of theirs. The library's README, "Onboarding an app from another organization".
 
 ## Updating the library
 
@@ -80,7 +87,7 @@ Change the `cluster` input's revision and bump nothing else in the same commit. 
 
 Every node rebuilds itself from `main` and first runs a new kernel and initrd at its next reboot. So a lock that cannot boot an encrypted node would pass every build, reach every node, and stop them all at their next reboots. Two things stop that: a merge gate, and a canary node.
 
-**The merge gate.** `.github/workflows/merge-gate.yml` builds, at this repository's own `flake.lock`, which is what the nodes run: the library's `boot-install` and `boot-fallback` VM tests (re-exported as `checks.x86_64-linux` in `flake.nix`), a check that this flake's nixpkgs is the library's, and every node's system. It needs a self-hosted runner with KVM: Nix with flakes, `/dev/kvm` writable by the runner, `system-features = kvm nixos-test`, and 16 GB of RAM. The two boot tests take about 6 and 17 minutes.
+**The merge gate.** `.github/workflows/merge-gate.yml` builds, at this repository's own `flake.lock`, which is what the nodes run: the library's `boot-install` and `boot-fallback` VM tests (re-exported as `checks.x86_64-linux` in `flake.nix`), a check that this flake's nixpkgs is the library's, a check that `github-repos.json` names what the site fetches from GitHub outside the lock (`avc ci repos` writes it), and every node's system. It needs a self-hosted runner with KVM: Nix with flakes, `/dev/kvm` writable by the runner, `system-features = kvm nixos-test`, and 16 GB of RAM. The two boot tests take about 6 and 17 minutes.
 
 Set a ruleset (or branch protection) on `main`, in the repository's settings:
 
@@ -98,6 +105,6 @@ In the repository's settings, turn on "Allow auto-merge" and allow squash mergin
 
 What that costs: every operation waits for the gate. The two boot tests are built from the lock and the library, not from your vars or apps, so on a runner that keeps its Nix store a pull request that leaves `flake.lock` alone finds them already built and waits for the evaluation and each node's system. One that changes the lock waits for the boot tests too, about 20 minutes. And while the runner is down nothing merges at all. For a fix that cannot wait for that, `avc deploy break-glass <node>` applies the working tree to one node and holds the node there until the pull request has merged. That hold does not survive a reboot.
 
-With those rules auto-merge is safe: GitHub merges a pull request only once the required checks pass, and never on a red or skipped run. `.github/workflows/flake-update.yml` updates the lock on a branch, opens a pull request and asks for auto-merge. It needs a `FLAKE_UPDATE_TOKEN` secret (contents and pull-requests write), not the built-in token, whose pull requests start no workflows; and "Allow auto-merge" turned on. If your project flakes are private, put a read token in a `NIX_ACCESS_TOKENS` secret as `access-tokens = github.com=<token>`. An auto-merge that pushes to `main` itself, or merges without these checks, is exactly the gap this closes: replace it.
+With those rules auto-merge is safe: GitHub merges a pull request only once the required checks pass, and never on a red or skipped run. `.github/workflows/flake-update.yml` updates the lock on a branch, opens a pull request and asks for auto-merge. It needs a `FLAKE_UPDATE_TOKEN` secret (contents and pull-requests write), not the built-in token, whose pull requests start no workflows; and "Allow auto-merge" turned on. If your project flakes are private, the runner needs its own read access to them: a `NIX_ACCESS_TOKENS` secret, as `access-tokens = github.com=<token>`. That is the runner's, not a node's; the nodes get theirs from the Worker. An auto-merge that pushes to `main` itself, or merges without these checks, is exactly the gap this closes: replace it.
 
 **The canary.** One node, `canary = true` in `topology.nix`, takes each new boot stack first: a nixpkgs, kernel, Lanzaboote, agenix or library bump. The others build it and wait (`DeployWaitingForCanary` after a day) until the canary has been rebooted into it and unlocked from the TPM on its own. Reboot it with `avc boot reboot <canary>` and watch the console; if it fails to come back, nothing else has the bad stack as its boot entry. If the canary cannot be rebooted, list the closure in `/run/cluster-upgrade.skip-canary` on each node you accept it on. A site of one node needs no canary; a site of more needs one, or `deploy.withoutCanary = "<reason>"`.
