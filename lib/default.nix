@@ -11,4 +11,5 @@ net
   mkAppContainer = import ./mk-app-container.nix { inherit lib; };
   nomad = import ./nomad.nix;
   nomadPki = import ./nomad-pki.nix { inherit lib; };
+  githubRepos = import ./github-repos.nix { inherit lib; };
 }

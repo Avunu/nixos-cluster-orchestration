@@ -70,6 +70,24 @@ let
     admins = [ "ssh-ed25519 AAAA-consumer-test-key" ];
   };
 
+  # A site with the cluster-ci Worker: its nodes read GitHub through it
+  # (modules/github-access.nix).
+  withWorker = mkCluster {
+    self = {
+      inputs = { };
+      outPath = ./fixtures;
+    };
+    directory = toString ./fixtures/mk-cluster; # see tests/fixtures/default.nix
+    topology = topology // {
+      ci.url = "https://cluster-ci.example.org/";
+    };
+    meta.name = "with-worker";
+    masterIdentities = import ./fixtures/master-identities.nix;
+    admins = [ "ssh-ed25519 AAAA-consumer-test-key" ];
+    extraModules = [ { cluster.github.repositories = [ "customer/private-addons" ]; } ];
+  };
+  w = withWorker.nixosConfigurations.node1.config;
+
   # The template's own flake outputs, over a stand-in for the library input.
   mkTemplate = mkTemplateWith { };
   mkTemplateWith =
@@ -267,12 +285,124 @@ let
         lib.attrNames checks == [
           "boot-fallback"
           "boot-install"
+          "github-repos"
           "nixpkgs-follows-library"
         ]
         && checks.boot-install == "the library's boot-install"
         && checks.boot-fallback == "the library's boot-fallback"
         && checks.nixpkgs-follows-library.buildCommand == "touch $out"
         && lib.hasInfix "exit 1" diverged.buildCommand;
+    }
+    # What the nodes may read at GitHub besides the lock's inputs (lib/github-repos.nix).
+    {
+      name = "github-repos.json is held to what the site fetches outside its lock: absent for nothing, refused when it differs";
+      ok =
+        let
+          gh = (import ../lib { inherit lib; }).githubRepos;
+          check =
+            directory: repos:
+            (gh.check {
+              inherit pkgs directory repos;
+            }).buildCommand;
+          listed = pkgs.writeTextDir "github-repos.json" (builtins.toJSON [
+            "customer/content"
+            "acme/addons"
+          ]);
+        in
+        site.githubRepos == [ ]
+        && site.checks.x86_64-linux.github-repos.buildCommand == "touch $out"
+        && template.checks.x86_64-linux.github-repos.buildCommand == "touch $out"
+        && lib.hasInfix "avc ci repos" (check ./fixtures/mk-cluster [ "customer/content" ])
+        && lib.hasInfix "exit 1" (check ./fixtures/mk-cluster [ "customer/content" ])
+        # Order is not part of it; one name more or less is.
+        && check listed [
+          "acme/addons"
+          "customer/content"
+        ] == "touch $out"
+        && lib.hasInfix "exit 1" (check listed [ "acme/addons" ])
+        && lib.hasInfix "exit 1" (check listed [
+          "acme/addons"
+          "customer/content"
+          "customer/more"
+        ]);
+    }
+    {
+      name = "with ci.url a node asks the Worker for its GitHub tokens: on a timer and before each pull, never as part of boot";
+      ok =
+        let
+          svc = w.systemd.services.cluster-github-token;
+          timer = w.systemd.timers.cluster-github-token;
+          up = w.systemd.services.cluster-upgrade;
+          helper = (lib.head w.programs.git.config).credential."https://github.com";
+        in
+        w.cluster.github.enable
+        && svc.environment.GITHUB_ACCESS_URL == "https://cluster-ci.example.org/agent/token"
+        && svc.serviceConfig.LoadCredential == [ "token:/run/secrets/per-machine/node1/ci/token" ]
+        # A oneshot nothing at boot waits for, and that systemd never holds a start job
+        # of: no Restart=, and a bound on how long one run may take.
+        && svc.serviceConfig.Type == "oneshot"
+        && !(svc.serviceConfig ? Restart)
+        && svc.serviceConfig ? TimeoutStartSec
+        && svc.wantedBy == [ ]
+        && svc.requiredBy == [ ]
+        && timer.wantedBy == [ "timers.target" ]
+        # Wanted, so a Worker that is away does not stop a pull; after, so the pull
+        # reads what the refresh wrote.
+        && lib.elem "cluster-github-token.service" up.wants
+        && lib.elem "cluster-github-token.service" up.after
+        && !(lib.elem "cluster-github-token.service" (up.requires or [ ]))
+        && lib.hasInfix "!include /run/cluster-github/nix.conf" w.nix.extraOptions
+        && helper.useHttpPath
+        && lib.hasSuffix " credential" helper.helper
+        && withWorker.githubRepos == [ "customer/private-addons" ]
+        && (mkOpsIndex {
+          site = withWorker;
+          inherit topology;
+        }).githubRepos == [ "customer/private-addons" ];
+    }
+    {
+      name = "the App's key is the operators' and the Worker's: no node is given it, and no node holds a GitHub token of its own";
+      ok =
+        let
+          gens = w.cluster.secrets.generators;
+          app = gens.github-app.files;
+        in
+        !app.private-key.deploy
+        && !app.webhook-secret.deploy
+        && !app.app-id.secret
+        && !(lib.any (f: f.generator == "github-app") w.cluster.secrets.deployed)
+        && !(gens ? github-token)
+        && !(c.cluster.secrets.generators ? github-token)
+        && !(w.nix.settings ? netrc-file)
+        && !(lib.any (lib.hasInfix "netrc") w.systemd.tmpfiles.rules);
+    }
+    {
+      name = "without ci.url a node has no tokens and nothing that asks for them: public repositories only";
+      ok =
+        !c.cluster.github.enable
+        && !(c.systemd.services ? cluster-github-token)
+        && !(c.systemd.timers ? cluster-github-token)
+        && !(lib.hasInfix "!include" c.nix.extraOptions)
+        && !(c.nix.settings ? netrc-file)
+        && !(c.cluster.secrets.generators ? github-app)
+        && !(lib.elem "cluster-github-token.service" c.systemd.services.cluster-upgrade.wants);
+    }
+    {
+      name = "a github.com URL is its repository, over https, ssh or git's scp form, and nothing else is";
+      ok =
+        let
+          inherit ((import ../lib { inherit lib; }).githubRepos) repoOf;
+        in
+        repoOf "https://github.com/acme/shop.git" == "acme/shop"
+        && repoOf "https://github.com/Acme/shop" == "Acme/shop"
+        && repoOf "git+https://github.com/acme/shop.git?ref=main&submodules=1" == "acme/shop"
+        && repoOf "ssh://git@github.com/acme/shop.git" == "acme/shop"
+        && repoOf "git@github.com:acme/shop.git" == "acme/shop"
+        && repoOf "https://git.example.net/demo/site.git" == null
+        && repoOf "https://github.com.example.net/acme/shop.git" == null
+        && repoOf "https://example.net/github.com/acme/shop" == null
+        && repoOf "https://github.com/acme" == null
+        && repoOf "" == null;
     }
     {
       name = "the template, without the wrapper's opt-out, fails closed and names the opt-out";

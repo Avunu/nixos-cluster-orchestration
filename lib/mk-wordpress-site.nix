@@ -90,11 +90,13 @@ let
   # ── the content the public face serves ─────────────────────────────────────
   # Fetched at EVAL time from the pinned rev, so the public face is a store path
   # that cannot drift and can be rolled back by reverting one JSON field. A full
-  # rev makes builtins.fetchGit pure; a private repo resolves through root's
-  # ~/.netrc, which the pull-deploy already relies on for its own flake inputs.
+  # rev makes builtins.fetchGit pure; a private repo resolves through git's
+  # credential helper on the node (modules/github-access.nix), which answers with the
+  # read-only token the cluster-ci Worker handed the node for this repository:
+  # modules/kinds/wordpress.nix names it for that.
   # `content.url` should be an HTTPS url, NOT the ssh `repoUrl`. This fetch runs
-  # at eval time on every node, and what the nodes hold for GitHub is a netrc —
-  # an ssh url here makes the whole flake fail to evaluate, for every app.
+  # at eval time on every node, and what the nodes hold for GitHub is tokens for
+  # https — an ssh url here makes the whole flake fail to evaluate, for every app.
   contentTree =
     if params ? content then
       builtins.fetchGit {

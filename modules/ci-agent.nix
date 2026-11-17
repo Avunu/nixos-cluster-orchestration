@@ -61,6 +61,10 @@ let
     # What a built preview is pushed with, when the site has a binary cache
     # (modules/kinds/attic.nix).
     cachePush = config.cluster.cache.pushCommand or null;
+    # Started, and waited for, before a preview is built: the build fetches the site
+    # and the pull request's commit with this node's GitHub tokens
+    # (modules/github-access.nix), which last an hour.
+    tokenUnit = "cluster-github-token.service";
     apps = lib.mapAttrs (name: a: {
       inherit (a.preview) repo input healthPath;
       # The app's JuiceFS volume, where a slot's copy of its files is made: mounted
@@ -118,6 +122,14 @@ in
             message = "clusterApps.${n}: preview.slots needs cluster.state (modules/app-state.nix): a preview's database is a clone of the app's dataset.";
           }
         ]) previewed
+      );
+    }
+
+    {
+      # A preview is built from the pull request's commit of `preview.repo`: the
+      # Worker gives the nodes read access to it (lib/github-repos.nix).
+      cluster.github.repositories = lib.concatLists (
+        lib.mapAttrsToList (_: a: lib.optional (a.preview.repo != null) a.preview.repo) previewed
       );
     }
 

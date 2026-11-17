@@ -143,6 +143,9 @@
         # Deploys the moment the site's branch moves, and a preview per pull request:
         # the node's half of workers/cluster-ci.
         ciAgent = ./modules/ci-agent.nix;
+        # Read access to the site's GitHub repositories: short-lived tokens from that
+        # Worker, for Nix and for git.
+        githubAccess = ./modules/github-access.nix;
       };
       nixosModules = clusterModuleSet;
 
@@ -443,6 +446,29 @@
               ''
                 cp -r ${./workers/cluster-ci} w && cd w
                 node --test test/*.test.js
+                touch $out
+              ''
+          );
+
+          # A node's read access to GitHub (modules/github-access.py), as a process,
+          # against a stand-in Worker: what it writes and with which modes, what a
+          # failed refresh keeps, and what git's credential helper answers, through
+          # git itself.
+          checks.github-access = detach (
+            _:
+            pkgs.runCommand "github-access-tests"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.git
+                  # The nix a node runs (nix.package's default), for the one case that
+                  # asks it to read the fragment.
+                  pkgs.nix
+                ];
+                REQUIRE_NIX = "1";
+              }
+              ''
+                python3 ${./tests/github-access.py} ${./modules/github-access.py}
                 touch $out
               ''
           );

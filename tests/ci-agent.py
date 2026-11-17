@@ -145,7 +145,7 @@ class AgentTest(unittest.TestCase):
         self.cfg = {
             "node": "node1", "host": "node1", "url": f"{base}/agent/sync", "flake": "github:acme/cluster",
             "stateMount": "/state", "cloneRoot": "/state-preview",
-            "probeBase": base, "probeSeconds": 1,
+            "probeBase": base, "probeSeconds": 1, "tokenUnit": "cluster-github-token.service",
             "apps": {"shop": {
                 "repo": "acme/shop", "input": "shop-src", "inputUrl": "github:acme/shop/{rev}", "healthPath": "/web/health",
                 "volume": {"mount": str(self.tmp / "jfs/shop"), "unit": "juicefs-mount-shop.service"},
@@ -222,6 +222,8 @@ class AgentTest(unittest.TestCase):
             ran,
         )
         order = [
+            # This node's GitHub tokens last an hour: asked for again before the fetch.
+            "systemctl start cluster-github-token.service",
             "nix build",
             "systemctl stop container@shop-pv1.service",
             "zfs create -o mountpoint=none -o com.sun:auto-snapshot=false rpool/preview",
@@ -255,6 +257,10 @@ class AgentTest(unittest.TestCase):
         self.state("shop/feat-x", "live", SHA_B)
         ran = self.ran(clear=True)
         self.assertTrue(any(f"github:acme/shop/{SHA_B}" in line for line in ran))
+        self.assertLess(
+            ran.index("systemctl start cluster-github-token.service"),
+            next(i for i, line in enumerate(ran) if line.startswith("nix build")),
+        )
         self.assertIn("systemctl restart container@shop-pv1.service", ran)
         self.assertFalse([line for line in ran if line.startswith(("zfs clone", "zfs destroy", "juicefs"))], ran)
 

@@ -284,6 +284,15 @@ class Agent:
         attr = f"nixosConfigurations.{CFG['host']}.config.containers.{name}.config.system.build.toplevel"
         argv = ["nix", "build", "--refresh", "--no-link", "--print-out-paths", "--override-input", app["input"], url,
                 f"{CFG['flake']}#{attr}"]  # fmt: skip
+        # The site and the pull request's commit are fetched with this node's GitHub
+        # tokens, which last an hour (modules/github-access.nix): asked for again now.
+        # A Worker that does not answer leaves the ones held, and the build says so
+        # itself if they do not do.
+        if CFG.get("tokenUnit"):
+            try:
+                run("systemctl", "start", CFG["tokenUnit"], check=False, timeout=360)
+            except Failed as e:
+                log(f"{name}: {e}")
         with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
             proc = subprocess.Popen(argv, stdout=out, stderr=err, text=True)
             # A push while this builds makes the result worthless: stop, and build that.

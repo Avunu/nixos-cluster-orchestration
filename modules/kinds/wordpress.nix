@@ -25,6 +25,7 @@
   lib,
   pkgs,
   config,
+  clusterLib,
   ...
 }:
 let
@@ -90,6 +91,23 @@ in
   };
 
   config = {
+    # The public face's content is fetched at evaluation, on every node, from the
+    # site's content repository (lib/mk-wordpress-site.nix). No flake.lock names it, so
+    # it is named here for the tokens the nodes are given (lib/github-repos.nix). A
+    # repository that is not at github.com is not GitHub's to give a token for.
+    cluster.github.repositories = lib.unique (
+      lib.concatLists (
+        lib.mapAttrsToList (
+          _: a:
+          let
+            w = a.wordpress;
+            repo = clusterLib.githubRepos.repoOf (w.content.url or w.repoUrl or "");
+          in
+          lib.optional (w ? content && repo != null) repo
+        ) planes
+      )
+    );
+
     # One set per SITE, from the admin plane only -- the two planes would
     # otherwise define the same generators twice.
     cluster.secrets.generators = lib.mkMerge (
