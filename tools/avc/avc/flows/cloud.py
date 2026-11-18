@@ -51,6 +51,21 @@ def load(ctx: Ctx) -> dict[str, Any]:
     return cloud
 
 
+def issued(ctx: Ctx) -> set[str]:
+    """The generators whose values `avc cloud apply` writes: the S3 key pairs of the
+    buckets it makes. Nobody has those to type before the first apply, so `avc secrets
+    provision` leaves them to it. Empty when the topology names no provider."""
+    expr = "c: if c.enabled or false then builtins.attrValues c.writeback.vars else [ ]"
+    try:
+        raw = proc.out(["nix", "eval", "--json", f"{ctx.root}#cloud", "--apply", expr], cwd=ctx.root)
+    except AvcError as e:
+        # A site with no `cloud` output, or one that does not evaluate: then every value
+        # is asked for, which is what happened before this was read at all.
+        ui.warn(f"the flake's `cloud` output could not be read, so nothing is left to `avc cloud apply`: {e}")
+        return set()
+    return {var_id.split("/")[0] for var_id in json.loads(raw)}
+
+
 def encryption(passphrase: str) -> str:
     """OpenTofu's state and plan encryption, as it reads it from TF_ENCRYPTION. Enforced:
     with the passphrase missing or wrong it stops, and never writes a state in the clear."""

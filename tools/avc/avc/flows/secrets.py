@@ -242,6 +242,12 @@ def inventory(ctx: Ctx) -> None:
                 ui.say(f"orphaned: {d.relative_to(ctx.root)} (no generator declares it any more)")
 
 
+def cloud_issued(ctx: Ctx) -> set[str]:
+    from avc.flows import cloud
+
+    return cloud.issued(ctx)
+
+
 def _needing(ctx: Ctx, machine: str, st: secretstore.Summary) -> set[str]:
     """The generators a provision would run on `machine`: those with a file missing or
     made from other inputs, and those that read their files."""
@@ -259,6 +265,12 @@ def provision(ctx: Ctx) -> None:
     # git, and a library change to one of these generators has its own procedure.
     # Nothing else is generated for that node either, so that what is wrong with it is
     # looked at before anything about it changes.
+    # A key pair `avc cloud apply` issues is not one to ask for: before the first apply
+    # nobody has it. Only while it is missing; one that is stored is treated as any other.
+    absent = {v.split("/")[0] for st in statuses.values() for v in st.missing}
+    left = sorted(absent & cloud_issued(ctx)) if absent else []
+    for m in needing:
+        needing[m] -= set(left)
     held = {m: sorted(g for g in needing[m] if not_on_installed(g)) for m in statuses if m in ctx.installed}
     held = {m: g for m, g in held.items() if g}
     # A shared one is every node's: an installed node holding it keeps the others from
@@ -266,11 +278,20 @@ def provision(ctx: Ctx) -> None:
     shared = {n for n, s in _scoped(ctx).items() if s.gen.share}
     held_shared = {g for names in held.values() for g in names if g in shared}
     todo = [m for m in statuses if needing[m] - held_shared and m not in held]
+    later = f"{', '.join(left)}: issued by the provider, and written by `avc cloud apply`"
     if not todo and not held and not any(st.unfixed for st in statuses.values()):
-        ui.ok("every secret is present and current, on every machine")
+        if left:
+            ui.info(later)
+            ui.ok("every other secret is present and current, on every machine")
+        else:
+            ui.ok("every secret is present and current, on every machine")
         return
+    if left:
+        ui.info(later)
     for m, st in statuses.items():
         for v in st.missing:
+            if v.split("/")[0] in left:
+                continue
             ui.info(f"{m}: missing {v}")
         for g in st.outdated:
             ui.info(f"{m}: outdated {g}")
