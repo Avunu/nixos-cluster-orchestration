@@ -27,6 +27,7 @@ def fleet(ctx, index, monkeypatch):
     boot = [PER_MACHINE, INITRD_SSH, EMERGENCY, LUKS]
     gens = {"node1": [SHARED, *boot], "node2": [SHARED, *boot], "node3": [SHARED]}
     monkeypatch.setattr(secretstore, "generators", lambda root, machine: gens[machine])
+    monkeypatch.setattr(secrets, "cloud_issued", lambda ctx: set())
     return ctx
 
 
@@ -120,6 +121,36 @@ def test_provision_generates_on_each_machine_that_needs_it(fleet, generated, mon
     with ui.scripted([True]):
         actions.find("secrets", "provision").run(fleet, {})
     assert generated == [([("node2", "initrd-ssh")], False)]
+
+
+def test_provision_leaves_a_key_pair_the_provider_issues_to_cloud_apply(fleet, generated, monkeypatch):
+    # With topology.cloud, nobody has ovh-s3 to type before the first `avc cloud apply`.
+    statuses = {
+        "node1": Summary(["ovh-s3/access-key", "ovh-s3/secret-key", "backup-target/access-key"], [], []),
+        "node2": Summary([], [], []),
+        "node3": Summary([], [], []),
+    }
+    monkeypatch.setattr(secretstore, "status", lambda root, m: statuses[m])
+    monkeypatch.setattr(secrets, "cloud_issued", lambda ctx: {"ovh-s3", "backup-state-target"})
+    with ui.scripted([True]):
+        actions.find("secrets", "provision").run(fleet, {})
+    assert generated == [([("node1", "backup-target")], False)]
+
+
+def test_provision_with_only_issued_pairs_missing_asks_for_nothing(fleet, generated, monkeypatch):
+    statuses = {m: Summary(["ovh-s3/access-key"] if m == "node1" else [], [], []) for m in ("node1", "node2", "node3")}
+    monkeypatch.setattr(secretstore, "status", lambda root, m: statuses[m])
+    monkeypatch.setattr(secrets, "cloud_issued", lambda ctx: {"ovh-s3"})
+    actions.find("secrets", "provision").run(fleet, {})
+    assert generated == []
+
+
+def test_provision_asks_for_the_pair_where_no_provider_is_named(fleet, generated, monkeypatch):
+    statuses = {m: Summary(["ovh-s3/access-key"] if m == "node1" else [], [], []) for m in ("node1", "node2", "node3")}
+    monkeypatch.setattr(secretstore, "status", lambda root, m: statuses[m])
+    with ui.scripted([True]):
+        actions.find("secrets", "provision").run(fleet, {})
+    assert generated == [([("node1", "ovh-s3")], False)]
 
 
 @pytest.mark.parametrize(

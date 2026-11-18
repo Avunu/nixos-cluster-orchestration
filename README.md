@@ -1135,7 +1135,7 @@ No user may delete an object version, so on the versioned bucket a node that is 
 
 **The state** is `cloud/terraform.tfstate` in your repository, committed with each apply. It holds every key the providers issued, so OpenTofu encrypts it (and every saved plan) with `cloud-state/passphrase`, enforced: without the passphrase it refuses to read the state, and it never writes one in the clear. Put the passphrase in the [offline kit](#the-offline-kit). Two operators applying at once would each commit a state; the pull request of the second conflicts, which is the lock.
 
-To turn it on: `cloud` in the topology; `avc secrets provision` for `cloud-state`, and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
+To turn it on: `cloud` in the topology; `avc secrets provision` for `cloud-state` (it leaves the key pairs `avc cloud apply` issues, such as `ovh-s3`, to that command while they are missing), and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
 
 Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket (the site provisioner's), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
 
