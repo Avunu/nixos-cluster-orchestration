@@ -1,0 +1,91 @@
+# Dependabot keeps this repository's dependencies current: one entry per package ecosystem
+# and directory, one pull request per entry each week, and a seven-day cooldown before a
+# new release is proposed. Nothing here merges automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # The workflows the cluster template ships (templates/cluster/.github/workflows).
+  - package-ecosystem: github-actions
+    directory: /templates/cluster
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      template-github-actions:
+        patterns: ["*"]
+
+  # flake.nix and flake.lock at the root.
+  - package-ecosystem: nix
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      nix:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /workers/cluster-ci
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cluster-ci-npm:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /workers/cluster-watchdog
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cluster-watchdog-npm:
+        patterns: ["*"]
+
+  # tools/avc has a pyproject.toml and no uv.lock, so pip covers its dependencies.
+  - package-ecosystem: pip
+    directory: /tools/avc
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      avc-pip:
+        patterns: ["*"]
