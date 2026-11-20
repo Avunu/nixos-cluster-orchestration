@@ -36,7 +36,7 @@ jobs:
     outputs:
       checks: ${{ steps.list.outputs.checks }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
       - name: Runner preflight
         run: tools/ci/preflight.sh
       # Assign, then echo: a failing $(...) inside echo's argument is lost under `bash -e`,
@@ -58,7 +58,7 @@ jobs:
       matrix:
         check: ${{ fromJSON(needs.list.outputs.checks) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
       # Each job may land on a different runner; each one checks its own.
       - name: Runner preflight
         run: tools/ci/preflight.sh
@@ -72,7 +72,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
       - name: Runner preflight
         run: tools/ci/preflight.sh
       - name: Build the packages and the dev shell

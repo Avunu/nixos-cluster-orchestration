@@ -1,0 +1,33 @@
+# Checks the action lock: every `uses:` in .github/workflows must still match
+# .github/workflows/actions.lock, each action pinned to the commit its release resolves to.
+# It is its own workflow, not a job inside ci.yml, so a failure here cannot block a release
+# gate that calls another workflow.
+name: actions-lock
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  lockfile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install gh-actions-lock
+        run: |
+          if ! gh extension list | grep -q 'github/gh-actions-lock'; then
+            gh extension install github/gh-actions-lock --pin v0.5.1
+          fi
+      - name: Verify the lock
+        run: gh actions-lock --verify
