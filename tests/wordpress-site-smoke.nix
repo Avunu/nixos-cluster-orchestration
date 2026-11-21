@@ -6,13 +6,14 @@
 #     site answers through its socket, the way the tunnel reaches it
 #   - installed, it serves its home page, the REST API and the login page; the
 #     classic /wp-admin path redirects into Bedrock's /wp; nothing under uploads runs
-#     as PHP; the code tree cannot be written, not even by PHP
+#     as PHP; the code tree cannot be written, not even by PHP, and a plugin cannot
+#     be installed from a file
 #   - its journal has no permission error from FrankenPHP, PHP or wp-cli
 #   - backed up, damaged and restored with `cluster-restore --db-only`, the database
 #     is the one backed up
 #   - a preview slot, started by hand (the pipeline's agent starts them on a real
-#     site): staging, no cron, no S3 key, mail short-circuited, and its home taken from
-#     whatever hostname the request named
+#     site): staging, no cron, no S3 key, mail short-circuited, and its home and its
+#     content, plugin and theme URLs taken from whatever hostname the request named
 #
 # What it needs from wordpress-nix: v3's lib.mkBedrockSite and NixOS module. The site's
 # vendor tree is a fixed-output derivation fetched from Composer's registries, so a
@@ -63,6 +64,14 @@ let
     src = ./fixtures/bedrock-site;
   };
 
+  # A plugin to install from a file: the VM has no route to wordpress.org, so an install
+  # by slug would fail on the download, read-only tree or not.
+  helloZip = pkgs.runCommand "hello-plugin.zip" { nativeBuildInputs = [ pkgs.zip ]; } ''
+    mkdir hello
+    printf '<?php\n/* Plugin Name: Hello */\n' > hello/hello.php
+    zip -qr $out hello
+  '';
+
   domain = "demo-site.example.org";
   previewHost = "pr-1-demo-site.preview.example.net";
   wordpress = {
@@ -90,6 +99,7 @@ let
             { pkgs, ... }:
             {
               environment.systemPackages = [ pkgs.curl ];
+              environment.etc."wordpress-smoke/hello.zip".source = helloZip;
             };
         };
         # A preview slot, as modules/apps.nix makes one from preview.slots = 1 (which
@@ -181,6 +191,8 @@ pkgs.testers.runNixOSTest {
         assert get("demo-site", "/wp-admin/", fmt="%{redirect_url}").endswith("/wp/wp-admin/")
         home = json.loads(body("demo-site", "/wp-json/"))["home"]
         assert home == f"https://{DOMAIN}", home
+        assets = wp("demo-site", "eval 'echo parse_url(content_url(), PHP_URL_HOST);'")
+        assert assets == DOMAIN, assets
 
     with subtest("nothing under uploads runs as PHP; private prefixes are refused"):
         guest("demo-site", "install -D -o wordpress -g wordpress /dev/null /var/lib/wordpress/uploads/2024/01/x.php")
@@ -192,7 +204,9 @@ pkgs.testers.runNixOSTest {
     with subtest("the code tree is read-only, to PHP too"):
         said = wp("demo-site", "eval 'echo @file_put_contents(ABSPATH . \"probe.txt\", \"x\") === false ? \"ro\" : \"rw\";'")
         assert said == "ro", said
-        node1.fail("nixos-container run demo-site -- runuser -u wordpress -- wp plugin install hello-dolly")
+        # From a local file, so nothing but the tree can refuse it.
+        node1.fail("nixos-container run demo-site -- runuser -u wordpress -- wp plugin install /etc/wordpress-smoke/hello.zip")
+        node1.fail("nixos-container run demo-site -- runuser -u wordpress -- wp plugin is-installed hello")
 
     with subtest("no permission errors in the site's journal"):
         log = guest("demo-site", "journalctl -o cat --no-pager -u frankenphp -u wordpress-migrate -u wordpress-cron")
@@ -219,6 +233,11 @@ pkgs.testers.runNixOSTest {
         assert get("demo-site-pv1", "/wp-json/", host=PREVIEW) == "200"
         home = json.loads(body("demo-site-pv1", "/wp-json/", host=PREVIEW))["home"]
         assert home == f"https://{PREVIEW}", home
+        # Its theme's and plugins' assets are its own, not production's: Bedrock makes
+        # WP_CONTENT_URL from WP_HOME, which is production's on a slot too.
+        for fn in ("content_url()", "plugins_url()", "get_theme_root_uri()"):
+            host = wp("demo-site-pv1", f"--url=https://{PREVIEW} eval 'echo parse_url({fn}, PHP_URL_HOST);'")
+            assert host == PREVIEW, f"{fn}: {host}"
         # Production is untouched by all of it.
         assert get("demo-site", "/wp-json/") == "200"
   '';
