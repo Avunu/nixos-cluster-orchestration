@@ -1,0 +1,3 @@
+# Flake inputs .github/workflows/flake-update.yml leaves alone: one name per line, with
+# a comment saying why. flake-update.yml proposes a line here when an input fails the
+# merge gate on its own; remove it once the input's branch is fixed.

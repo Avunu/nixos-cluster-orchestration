@@ -5,16 +5,25 @@
 # The `cluster` input is pinned by revision in flake.nix, so this moves only what
 # follows a branch (your project flakes). Bump the library by hand, alone.
 #
-# Run weekly for everything, and by the cluster-ci Worker for one input the moment the
-# branch it follows moves (the library's README, "Previews and continuous deployment"):
-# the Worker starts this workflow with that input's name, the merge gate passes on the
-# result, and the nodes are told of the merge. Updating a lock takes Nix, which is why
+# Run weekly, and by the cluster-ci Worker the moment a project's branch moves (the
+# library's README, "Previews and continuous deployment"). Every run updates EVERY input
+# that follows a branch, whichever one the Worker named: GitHub keeps one pending run
+# per concurrency group and drops the rest, so a run that moved only the input it was
+# started for would lose the others of a burst. Updating a lock takes Nix, which is why
 # the Worker asks this workflow and does not write the lock itself.
 #
+# One broken input must not hold up the others. `.github/flake-update-hold` lists inputs
+# this leaves alone, one per line with a comment saying why. And when merge-gate fails
+# on flake-auto-update, `split` below opens one pull request per input that moved
+# (flake-update/<input>), so
+# the good ones merge on their own gate; the bad one, failing alone, gets an issue
+# ("flake input <name> fails the merge gate") and a pull request adding it to the hold
+# file, for a person to merge. The steps are .github/flake-update.sh.
+#
 # Needs a secret FLAKE_UPDATE_TOKEN: a fine-grained token (or a GitHub App's) with
-# contents and pull-requests write on this repository. Not GITHUB_TOKEN: a pull request
-# it opens starts no workflows, so merge-gate would never report, and nothing would
-# merge. Turn on "Allow auto-merge" in the repository's settings.
+# contents, pull-requests and issues write on this repository. Not GITHUB_TOKEN: a pull
+# request it opens starts no workflows, so merge-gate would never report, and nothing
+# would merge. Turn on "Allow auto-merge" in the repository's settings.
 name: flake-update
 
 on:
@@ -23,20 +32,24 @@ on:
   workflow_dispatch:
     inputs:
       inputs:
-        description: "Flake inputs to update, separated by spaces. Empty: all that follow a branch."
+        description: "The input whose branch moved (logged only: every run updates every input not held)."
         required: false
         default: ""
+  workflow_run:
+    workflows: [merge-gate]
+    types: [completed]
 
 permissions:
   contents: read
 
-# One at a time: two runs would each force-push the one branch.
+# One at a time: two runs would each force-push the same branches.
 concurrency:
   group: flake-update
   cancel-in-progress: false
 
 jobs:
   update:
+    if: github.event_name != 'workflow_run'
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 30
     steps:
@@ -53,21 +66,36 @@ jobs:
           case "$INPUTS" in
             *[!A-Za-z0-9_\ -]*) echo "not flake input names: $INPUTS" >&2; exit 1 ;;
           esac
+          [ -z "$INPUTS" ] || echo "started for: $INPUTS"
           git config user.name "flake-update"
           git config user.email "flake-update@example.invalid"   # not a mailbox
-          git switch -C flake-auto-update
-          # Unquoted on purpose: one argument per name, and none at all when empty.
-          # shellcheck disable=SC2086
-          nix flake update $INPUTS
-          if git diff --quiet -- flake.lock; then
-            echo "flake.lock is current"
-            exit 0
-          fi
-          git commit -m "chore: update flake lock" -- flake.lock
-          git push --force origin flake-auto-update
-          gh() { nix run --inputs-from . nixpkgs#gh -- "$@"; }
-          gh pr view flake-auto-update >/dev/null 2>&1 \
-            || gh pr create --base main --head flake-auto-update \
-              --title "chore: update flake lock" \
-              --body "Merged by auto-merge once merge-gate passes. Nothing merges on a red run."
-          gh pr merge flake-auto-update --auto --squash
+          nix shell --inputs-from . nixpkgs#gh nixpkgs#jq -c bash .github/flake-update.sh update
+
+  # merge-gate failed on an update branch: split it, or blame the one input.
+  split:
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'failure'
+      && (github.event.workflow_run.head_branch == 'flake-auto-update'
+          || startsWith(github.event.workflow_run.head_branch, 'flake-update/'))
+      && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+      - name: One pull request per input, or an issue and a hold for the one
+        env:
+          GH_TOKEN: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+          NIX_CONFIG: ${{ secrets.NIX_ACCESS_TOKENS }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          case "$BRANCH" in
+            *[!A-Za-z0-9_/-]*) echo "not an update branch: $BRANCH" >&2; exit 1 ;;
+          esac
+          git config user.name "flake-update"
+          git config user.email "flake-update@example.invalid"   # not a mailbox
+          nix shell --inputs-from . nixpkgs#gh nixpkgs#jq -c bash .github/flake-update.sh split "$BRANCH" "$RUN_URL"
