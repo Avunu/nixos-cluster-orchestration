@@ -21,7 +21,10 @@
 #   Cloudflare   per app with a hostname: its tunnel (locally configured, as the
 #                container expects), a proxied CNAME per hostname in a zone the
 #                topology lists, and for FreeIPA the private route to its address. The
-#                audit trail's R2 bucket, locked, when the topology names one.
+#                audit trail's R2 bucket, locked, when the topology names one. Not for
+#                an app whose tunnel.accountId is another account: that tunnel and its
+#                records are made where the zone is (a WordPress site's, by
+#                `wordpress-nix edge provision`).
 #
 # Not here: the Workers' own code and secrets (wrangler deploys those), API tokens (the
 # permission groups are the account's to name), Access policies (who may sign in is not
@@ -204,8 +207,17 @@ let
     else
       lib.foldl' (a: z: if lib.stringLength z > lib.stringLength a then z else a) (lib.head fits) fits;
 
-  tunneled = lib.optionalAttrs (cf != null) (
+  # A tunnel in another account (tunnel.accountId) is made and kept outside OpenTofu,
+  # with its DNS: a client zone in its own account, whose CNAME resolves only to a
+  # tunnel in that account. Nothing here is made for it, and its hostnames are
+  # someone else's (modules/app-container.nix keeps them out of `zones`).
+  external = a: a.tunnel.accountId != null && a.tunnel.accountId != cf.accountId;
+  withTunnel = lib.optionalAttrs (cf != null) (
     lib.filterAttrs (_: a: a.tunnel.ingress != { } || a.tunnel.id != "") apps
+  );
+  tunneled = lib.filterAttrs (_: a: !external a) withTunnel;
+  externalHosts = lib.concatLists (
+    lib.mapAttrsToList (_: a: lib.attrNames a.tunnel.ingress) (lib.filterAttrs (_: external) withTunnel)
   );
   hostnames = lib.concatLists (
     lib.mapAttrsToList (
@@ -371,8 +383,9 @@ in
         else
           "${a.tunnel.credentials.generator}/${a.tunnel.credentials.file}";
     }) tunneled;
-    # Hostnames in no zone the topology lists: their records are someone else's to make.
-    unmanagedHosts = map (h: h.host) (lib.filter (h: h.zone == null) hostnames);
+    # Hostnames in no zone the topology lists, and those of a tunnel in another
+    # account: their records are someone else's to make.
+    unmanagedHosts = map (h: h.host) (lib.filter (h: h.zone == null) hostnames) ++ externalHosts;
     # A machine to name when reading and writing vars: any holds the shared ones.
     machine = reference;
   };

@@ -376,6 +376,51 @@ let
         ) bad.config.assertions;
     }
 
+    # ── a tunnel in another Cloudflare account (tunnel.accountId) ───────────
+    {
+      # Its DNS is made where the tunnel was made, so `avc cloud` must not make a
+      # record for any of its hostnames: none may be in the cluster's zones.
+      name = "a tunnel in another account may not serve a hostname in the cluster's zones";
+      ok =
+        let
+          withAccount =
+            accountId: hosts:
+            (sys.extendModules {
+              modules = [
+                {
+                  clusterApps.client = {
+                    module = stubApp;
+                    tunnel = {
+                      id = "00000000-0000-4000-8000-000000000011";
+                      inherit accountId;
+                      credentials = {
+                        generator = "probe";
+                        file = "cloudflared";
+                      };
+                      ingress = lib.genAttrs hosts (_: "unix:/run/probe/app.sock");
+                    };
+                  };
+                }
+              ];
+            }).config.assertions;
+          failing = as: lib.filter (a: !a.assertion && lib.hasInfix "tunnel.accountId" a.message) as;
+          other = "11111111111111111111111111111111";
+          clash = failing (
+            withAccount other [
+              "client.example.org"
+              "www.example.com"
+            ]
+          );
+        in
+        lib.length clash == 1
+        && lib.hasInfix "www.example.com" (lib.head clash).message
+        && !(lib.hasInfix "client.example.org" (lib.head clash).message)
+        # Outside the zones: fine. In the cluster's own account, or none named: fine.
+        && failing (withAccount other [ "client.example.org" ]) == [ ]
+        && failing (withAccount topology.cloud.cloudflare.accountId [ "www.example.com" ]) == [ ]
+        && failing (withAccount null [ "www.example.com" ]) == [ ];
+    }
+
     # ── one app's failure is not the node's failure ─────────────────────────
     {
       # Upstream's ExecReload propagates the guest switch's exit status, which

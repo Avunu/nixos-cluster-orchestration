@@ -579,6 +579,17 @@
               ''
           );
 
+          # tunnel.accountId: what `avc cloud` makes for a tunnel in the cluster's Cloudflare
+          # account, and what it leaves to whoever made one in another (tests/cloud-accounts.nix).
+          checks.cloud-accounts = detach (
+            _:
+            import ./tests/cloud-accounts.nix {
+              inherit pkgs;
+              lib = nixpkgs.lib;
+              clusterLib = import ./lib { inherit (nixpkgs) lib; };
+            }
+          );
+
           # An app's local state following it between three nodes with real ZFS: a
           # move that loses nothing, a dead holder, its return, and what is refused.
           checks.app-state = detach (
