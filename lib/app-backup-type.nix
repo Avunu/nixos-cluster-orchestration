@@ -68,6 +68,26 @@ types.submodule {
         fails the backup.
       '';
     };
+    hostPostCommand = mkOption {
+      type = types.nullOr types.lines;
+      default = null;
+      example = ''
+        gzip -c "$BACKUP_STAGING/wordpress.sql" > /var/lib/exports/"$APP".sql.gz
+      '';
+      description = ''
+        Shell run ON THE HOST, as root, after the app's snapshot was written:
+        on the node that backed the app up, which is the one running it. For
+        a copy that belongs beside the backup and must not run in the
+        container -- one made with a key the container never sees, which a
+        host-side secret (cluster.secrets.generators.<g>.files.<f>.path)
+        gives it.
+
+        $APP is the app; $BACKUP_STAGING is the directory the run's dumps
+        are in (<database>.sql or .dump, one per database), removed after
+        this returns. A failure marks the run partial (BackupPartial) and
+        changes nothing in the snapshot.
+      '';
+    };
     verifyCommand = mkOption {
       type = types.nullOr types.lines;
       default = null;

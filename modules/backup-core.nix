@@ -29,6 +29,10 @@
 # the run (atomic, so crash-consistent with the app still up), after an
 # optional backup.preCommand has had the app export itself into them.
 #
+# After the snapshot, an optional backup.hostPostCommand runs on the host, with the
+# run's dumps still staged: a copy of the app's own that belongs beside the backup
+# (a WordPress site's media mirror and its dev-restore dump, modules/kinds/wordpress.nix).
+#
 # A repository per app, not per host: an app's backups are found by its name
 # from any node, and dropping a client is dropping one prefix. The prefix is
 # `apps/<app>` here; modules/backup.nix makes it a salted hash of the name
@@ -260,6 +264,14 @@ let
           pkgs.writeShellScript "cluster-backup-pre-${n}" ''
             set -euo pipefail
             ${app.backup.preCommand}
+          ''
+        )
+      }
+      POST_SCRIPT=${
+        lib.optionalString (app.backup.hostPostCommand != null) (
+          pkgs.writeShellScript "cluster-backup-post-${n}" ''
+            set -euo pipefail
+            ${app.backup.hostPostCommand}
           ''
         )
       }
@@ -519,6 +531,17 @@ let
       --keep-weekly ${toString bcfg.retention.weekly} \
       --keep-monthly ${toString bcfg.retention.monthly} >/dev/null \
       || echo "$APP: warning: restic forget failed; retention not applied this run" >&2
+
+    # The app's own copy beside the backup (backup.hostPostCommand), with the dumps
+    # still in the staging directory. The snapshot is written whatever it does.
+    if [ -n "$POST_SCRIPT" ]; then
+      if APP="$APP" BACKUP_STAGING="$STAGING" "$POST_SCRIPT"; then
+        echo "$APP: hostPostCommand done"
+      else
+        echo "$APP: hostPostCommand FAILED; the snapshot was still written" >&2
+        st=2
+      fi
+    fi
 
     rm -rf "$STAGING"
     now=$(date +%s)

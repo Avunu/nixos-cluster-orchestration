@@ -21,6 +21,8 @@
 #     links intact, the preCommand's export in it -- with the container up
 #     (its appUnits stopped around the copy) and with it down; a snapshot a
 #     dead run left behind does not break the next one;
+#   - a hostPostCommand runs on the host with the run's dumps staged, and its
+#     failure marks the run partial without losing the snapshot;
 #   - deploy holds are released afterwards.
 #
 # Run: nix build .#checks.x86_64-linux.backup-roundtrip -L   (needs KVM)
@@ -224,6 +226,13 @@ pkgs.testers.runNixOSTest {
         myapp = {
           localState."/var/lib/mysql" = "/var/lib/nixos-containers/myapp/var/lib/mysql";
           juicefsPaths."/srv" = "clients/myapp/files";
+          # A copy beside the backup, on the host, from the run's own dump (as a
+          # WordPress site's dev-restore dump is). It fails while the flag exists.
+          backup.hostPostCommand = ''
+            test ! -e /run/hostpost-fail
+            mkdir -p /var/lib/hostpost
+            ${pkgs.gzip}/bin/gzip -c "$BACKUP_STAGING/myapp.sql" > "/var/lib/hostpost/$APP.sql.gz"
+          '';
         };
         filesonly = {
           juicefsPaths."/srv" = "clients/filesonly/files";
@@ -318,6 +327,21 @@ pkgs.testers.runNixOSTest {
         machine.fail("zfs list -H -t snapshot -o name | grep -q @cluster-backup-")
         # Deploy holds released, staging emptied.
         machine.succeed("test -z \"$(ls -A /run/cluster-upgrade.hold.d 2>/dev/null)\"")
+        machine.succeed("test -z \"$(ls -A /var/lib/cluster-backup/staging 2>/dev/null)\"")
+
+    with subtest("hostPostCommand runs on the host after the snapshot, with the dumps staged"):
+        out = machine.succeed("${pkgs.gzip}/bin/zcat /var/lib/hostpost/myapp.sql.gz")
+        assert "CREATE TABLE `t`" in out, out
+        # Only where it is declared.
+        machine.succeed("test \"$(ls /var/lib/hostpost)\" = myapp.sql.gz")
+        machine.succeed("touch /run/hostpost-fail")
+        # The snapshot is written; the run is partial, and says why.
+        machine.succeed("systemctl start cluster-backup-myapp.service")
+        assert metric("cluster_backup_last_status", "myapp") == "2"
+        machine.succeed("journalctl -u cluster-backup-myapp -o cat | grep -q 'hostPostCommand FAILED'")
+        machine.succeed("rm /run/hostpost-fail")
+        machine.succeed("systemctl start cluster-backup-myapp.service")
+        assert metric("cluster_backup_last_status", "myapp") == "1"
         machine.succeed("test -z \"$(ls -A /var/lib/cluster-backup/staging 2>/dev/null)\"")
 
     with subtest("damage"):
