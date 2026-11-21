@@ -18,7 +18,7 @@ jobs:
     outputs:
       mutants: ${{ steps.list.outputs.mutants }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
       - name: Runner preflight
         run: tools/ci/preflight.sh
       # Assign, then echo, so that list.sh's refusal fails this job (ci.yml says why).
@@ -39,7 +39,7 @@ jobs:
       matrix:
         mutant: ${{ fromJSON(needs.list.outputs.mutants) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
       - name: Runner preflight
         run: tools/ci/preflight.sh
       - name: Build
