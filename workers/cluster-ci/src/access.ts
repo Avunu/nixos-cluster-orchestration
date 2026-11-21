@@ -7,8 +7,8 @@
 //
 //   the site's repository itself
 //   flake.lock           every node of it that is a github.com repository
-//   github-repos.json    what the site fetches outside the lock (a WordPress site's
-//                        content, a preview's repository, a private submodule). The
+//   github-repos.json    what the site fetches outside the lock (a preview's
+//                        repository, a private submodule). The
 //                        library renders it from the site's configuration and the
 //                        site's merge gate fails when the committed file differs
 //                        (lib/github-repos.nix), so it changes only by a merge.

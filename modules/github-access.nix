@@ -94,8 +94,7 @@ in
       example = [ "OWNER/private-addons" ];
       description = ''
         GitHub repositories ("OWNER/name") this site fetches that its flake.lock does not
-        name. The kinds add their own (a WordPress site's content, an app's
-        `preview.repo`); add a project's private submodules here, in a module of the
+        name. The kinds add their own (an app's `preview.repo`); add a project's private submodules here, in a module of the
         site's. The site's `github-repos.json` is written from this (`avc ci repos`) and
         held to it by the merge gate (lib/github-repos.nix), and the cluster-ci Worker
         gives the nodes read access to these, the site's own repository and its lock's

@@ -374,7 +374,7 @@ let
         # IPv4 only, and only for the private container subnet: IPv6 egress is
         # bridged and unNATted, which is the point of giving containers a GUA.
         # IPv4 stays because it is still needed for v4-only destinations —
-        # wordpress.org publishes no AAAA, and this plane owns plugin installs.
+        # github.com and wordpress.org publish no AAAA.
         ip saddr ${node.appSubnet} oifname "br-wan" masquerade
       }
     }

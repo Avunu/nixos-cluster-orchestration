@@ -203,6 +203,16 @@ let
         default = "http_status:404";
         description = "Catch-all for hostnames not matched above.";
       };
+      probePath = mkOption {
+        type = types.str;
+        default = "/";
+        example = "/wp-json/";
+        description = ''
+          What alerting's probe asks of each hostname in `ingress`
+          (modules/alerting.nix): a path the app itself answers, past any
+          page cache, so a probe that passes means the app is up.
+        '';
+      };
       socketGroups = mkOption {
         type = types.listOf types.str;
         default = [ ];

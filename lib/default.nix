@@ -12,4 +12,5 @@ net
   nomad = import ./nomad.nix;
   nomadPki = import ./nomad-pki.nix { inherit lib; };
   githubRepos = import ./github-repos.nix { inherit lib; };
+  wordpress = import ./wordpress.nix { inherit lib; };
 }

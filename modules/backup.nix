@@ -24,8 +24,9 @@
 #     (modules/storage-juicefs-format.nix restores the newest one on a rebuilt
 #     node). Restoring a stale copy against a live bucket would orphan chunks.
 #   - Nomad and etcd state: declarative (re-registered from this flake) or empty.
-#   - Cloudflare D1/R2 (WordPress): Cloudflare's own Time Travel covers D1 for
-#     30 days; an export step belongs here once a site is live.
+#   - A WordPress site's R2 media bucket, by this backup: the site's own
+#     backup.hostPostCommand copies it nightly into the cluster's media mirror
+#     (modules/kinds/wordpress.nix, lib/wordpress.nix).
 #
 # ── repository paths ────────────────────────────────────────────────────────
 # Each app's repository is `apps/<sha256 of topology.backup.repoSalt + app>` on the

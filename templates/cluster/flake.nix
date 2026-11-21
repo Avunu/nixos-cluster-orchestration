@@ -82,7 +82,7 @@
         inherit (cluster.checks.x86_64-linux) boot-install boot-fallback;
 
         # github-repos.json names what this site fetches from GitHub outside flake.lock
-        # (a WordPress site's content, a preview's repository). The cluster-ci Worker
+        # (a preview's repository, a private submodule). The cluster-ci Worker
         # gives the nodes read access to what that file names, so it is held to the
         # configuration here: `avc ci repos` writes it.
         inherit (site.checks.x86_64-linux) github-repos;

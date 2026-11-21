@@ -6,8 +6,8 @@
 #   gprobe        network.hostAccess = [ Loki, Prometheus ], held to node1 by the test (a
 #                 metrics node). Its identity is nspawn's veth vb-gprobe.
 #   a-long-named-wordpress-site
-#                 27 characters, network.peerAccess to dbprobe on 3306: the shape of a
-#                 WordPress plane and its database (D23). Runs on both nodes.
+#                 27 characters, network.peerAccess to dbprobe on 3306: the shape of an
+#                 app and a database it shares with others (D23). Runs on both nodes.
 #   dbprobe       the target: serves 3306 (declared) and 3307 (not), on node1.
 #   plain         declares nothing. Serves 3306 and 8080, on both nodes.
 #
@@ -20,7 +20,8 @@
 #   name-too-long-assertion       (evaluation) hostAccess on a 13+ character name is
 #                                 refused; 12 is accepted. With the other refusals:
 #                                 hostAccess off a metrics node, and the real kinds'
-#                                 own declarations (grafana, wordpress)
+#                                 own declarations (grafana's hostAccess, and none
+#                                 for wordpress, whose database is its own)
 #   dhcp-dns-egress-work          after a restart: a DHCP lease from the gateway, DNS
 #                                 from its stub, IPv4 egress through the NAT and IPv6
 #                                 egress from the container's own GUA
@@ -326,14 +327,11 @@ let
         "http://${net.meshIp testTopology n1}:${toString net.lokiPort}"
         "http://${net.meshIp testTopology n1}:${toString net.prometheusPort}"
       ];
-      sitePeers = map (n: c1.clusterApps.${n}.network.peerAccess) [
-        "demo-site"
-        "demo-site-admin"
-      ];
-      wpdbPort = c1.clusterApps.demo-wpdb.wpdb.port;
+      # One container with its own MariaDB: nothing to reach, so nspawn's own veth.
+      sitePeers = c1.clusterApps.demo-site.network.peerAccess;
       siteVeth = c1.containers.demo-site.extraFlags;
       siteBridge = c1.containers.demo-site.hostBridge;
-      wantVeth = "--network-veth-extra=${net.appPeerPort "demo-site"}:eth0";
+      peerVeth = "--network-veth-extra=${net.appPeerPort "demo-site"}:eth0";
     };
   };
 
@@ -523,8 +521,8 @@ pkgs.testers.runNixOSTest {
             control("real-kinds-declare-their-flows",
                     k["grafanaHostAccess"] == [LOKI, PROM] and k["grafanaHome"] == []
                     and sorted(k["grafanaUrls"]) == sorted(k["meshUrls"])
-                    and k["sitePeers"] == [[{"app": "demo-wpdb", "port": k["wpdbPort"]}]] * 2
-                    and k["siteBridge"] is None and k["wantVeth"] in k["siteVeth"],
+                    and k["sitePeers"] == []
+                    and k["siteBridge"] == "br-app" and k["peerVeth"] not in k["siteVeth"],
                     f"{k}")
 
         wan.start()

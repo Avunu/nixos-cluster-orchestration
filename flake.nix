@@ -120,9 +120,6 @@
         attic = ./modules/kinds/attic.nix;
         odoo = ./modules/kinds/odoo.nix;
         frappe = ./modules/kinds/frappe.nix;
-        # wpdb declares `wordpressDatabases`, which the wordpress kind fills
-        # in, so it is listed first.
-        wpdb = ./modules/kinds/wpdb.nix;
         wordpress = ./modules/kinds/wordpress.nix;
         nomadBootstrap = ./modules/nomad-bootstrap.nix;
         # Job registration, on every Nomad server.
@@ -412,6 +409,18 @@
             }
           );
 
+          # The wordpress kind's wiring on the fixture node1: the module, the secrets and
+          # where they are, the tunnel, the host's nightly copies, a preview slot.
+          checks.wordpress = detach (
+            _:
+            import ./tests/wordpress.nix {
+              inherit pkgs;
+              lib = nixpkgs.lib;
+              topology = fixtureTopology;
+              nodeSystem = self.nixosConfigurations.node1;
+            }
+          );
+
           # Every alert rule fires when it should and stays quiet when it should not.
           checks.alert-rules = detach (
             _:
@@ -573,7 +582,14 @@
                 want '.resource.cloudflare_dns_record | to_entries | all(.value.type == "CNAME" and .value.proxied)' "proxied CNAMEs"
                 want '.resource.cloudflare_zero_trust_tunnel_cloudflared_route."demo_idm".network | endswith("/32")' "FreeIPA's private route"
                 want '.resource.cloudflare_r2_bucket_lock.audit.rules[0].condition.max_age_seconds == 31536000' "the audit bucket's lock"
-                jq -e '.vars."s3_juicefs_secret_key" == "ovh-s3/secret-key" and .vars."s3_state_backup_access_key" == "backup-state-target/access-key" and (.tunnels."demo-odoo".known)' "$writebackPath" >/dev/null \
+                want '.resource.cloudflare_zero_trust_tunnel_cloudflared | has("demo_site") | not' "no tunnel for an app whose tunnel is in another account"
+                want '[.import[].to] | index("cloudflare_zero_trust_tunnel_cloudflared.demo_site") | not' "no import of a tunnel in another account"
+                want '.resource.ovh_cloud_project_storage.wordpress_media.versioning.status == "enabled"' "a versioned WordPress media mirror"
+                want '.resource.ovh_cloud_project_user_s3_policy.wordpress_media.policy | fromjson | .Statement[0].Action | index("s3:DeleteObjectVersion") | not' "a mirror user that cannot delete a version"
+                want '.resource.ovh_cloud_project_storage.wordpress_dev_restore.name == "fixture-juicefs-wordpress-dev-restore"' "the WordPress dev-restore bucket"
+                jq -e '.vars."s3_juicefs_secret_key" == "ovh-s3/secret-key" and .vars."s3_state_backup_access_key" == "backup-state-target/access-key" and (.tunnels."demo-odoo".known)
+                  and .vars."s3_wordpress_media_access_key" == "wordpress-media-mirror/access-key"
+                  and (.tunnels | has("demo-site") | not) and (.unmanagedHosts | index("demo-site.example.org"))' "$writebackPath" >/dev/null \
                   || { echo "the write-back map is wrong: $(cat "$writebackPath")" >&2; exit 1; }
                 touch $out
               ''

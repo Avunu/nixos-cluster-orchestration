@@ -12,8 +12,9 @@
 #
 # What it makes, where `topology.cloud` names the provider:
 #
-#   OVH          per bucket (JuiceFS's, the binary cache's when an app is one, and the
-#                state backup's when it is on the same endpoint): the bucket, a user of its own, that user's S3 key pair, and a
+#   OVH          per bucket (JuiceFS's, the binary cache's when an app is one, the
+#                WordPress media mirror and dev-restore buckets when a site wants them,
+#                and the state backup's when it is on the same endpoint): the bucket, a user of its own, that user's S3 key pair, and a
 #                policy that reaches this bucket and no other. No user may delete an
 #                object VERSION, and the state backup's bucket is versioned, with
 #                versions past `noncurrentDays` expired: a node taken over can hide what
@@ -62,6 +63,7 @@ let
   # ── OVH object storage ─────────────────────────────────────────────────────
   os = topology.objectStorage;
   state = topology.backup.state or null;
+  wp = clusterLib.wordpress;
   buckets = lib.optionalAttrs (ovh != null) (
     {
       juicefs = {
@@ -121,6 +123,31 @@ let
         };
       }
     ) apps
+    # A WordPress site's nightly copies (modules/kinds/wordpress.nix, lib/wordpress.nix):
+    # the sites' media, versioned, so what a site deletes in R2 is kept here; and their
+    # dumps for a developer's restore.
+    // lib.optionalAttrs (wp.mirroredApps apps != { }) {
+      wordpress_media = {
+        name = wp.mediaMirrorBucket os;
+        versioned = true;
+        vars = {
+          access = "${wp.mediaMirrorGenerator}/access-key";
+          secret = "${wp.mediaMirrorGenerator}/secret-key";
+        };
+        description = "${clusterName}: the WordPress sites' media mirror";
+      };
+    }
+    // lib.optionalAttrs (wp.devRestoreApps apps != { }) {
+      wordpress_dev_restore = {
+        name = wp.devRestoreBucket os;
+        versioned = false;
+        vars = {
+          access = "${wp.devRestoreGenerator}/access-key";
+          secret = "${wp.devRestoreGenerator}/secret-key";
+        };
+        description = "${clusterName}: the WordPress sites' dumps for dev restores";
+      };
+    }
   );
 
   # What a user may do, in its one bucket. Everything restic and JuiceFS need, deleting
