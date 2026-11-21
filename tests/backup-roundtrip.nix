@@ -21,8 +21,9 @@
 #     links intact, the preCommand's export in it -- with the container up
 #     (its appUnits stopped around the copy) and with it down; a snapshot a
 #     dead run left behind does not break the next one;
-#   - a hostPostCommand runs on the host with the run's dumps staged, and its
-#     failure marks the run partial without losing the snapshot;
+#   - a hostPostCommand runs on the host with the run's dumps staged and deploys
+#     no longer held, and its failure marks the run partial without losing the
+#     snapshot;
 #   - deploy holds are released afterwards.
 #
 # Run: nix build .#checks.x86_64-linux.backup-roundtrip -L   (needs KVM)
@@ -227,8 +228,10 @@ pkgs.testers.runNixOSTest {
           localState."/var/lib/mysql" = "/var/lib/nixos-containers/myapp/var/lib/mysql";
           juicefsPaths."/srv" = "clients/myapp/files";
           # A copy beside the backup, on the host, from the run's own dump (as a
-          # WordPress site's dev-restore dump is). It fails while the flag exists.
+          # WordPress site's dev-restore dump is). It fails while the flag exists, and
+          # notes the deploy holds it ran under.
           backup.hostPostCommand = ''
+            ls -A /run/cluster-upgrade.hold.d > /run/hostpost-holds 2>/dev/null || true
             test ! -e /run/hostpost-fail
             mkdir -p /var/lib/hostpost
             ${pkgs.gzip}/bin/gzip -c "$BACKUP_STAGING/myapp.sql" > "/var/lib/hostpost/$APP.sql.gz"
@@ -334,6 +337,8 @@ pkgs.testers.runNixOSTest {
         assert "CREATE TABLE `t`" in out, out
         # Only where it is declared.
         machine.succeed("test \"$(ls /var/lib/hostpost)\" = myapp.sql.gz")
+        # Not under the backup's deploy hold: a long copy holds up no deploy.
+        machine.succeed("test -e /run/hostpost-holds && test ! -s /run/hostpost-holds")
         machine.succeed("touch /run/hostpost-fail")
         # The snapshot is written; the run is partial, and says why.
         machine.succeed("systemctl start cluster-backup-myapp.service")
