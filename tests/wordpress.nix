@@ -174,7 +174,52 @@ let
         && lib.hasInfix gens.${wordpressLib.mediaMirrorGenerator}.files.secret-key.path post
         && lib.hasInfix "${wordpressLib.devRestoreBucket os}/wordpress/demo-site" post
         && lib.hasInfix ''"$BACKUP_STAGING/$db.sql"'' post
-        && lib.hasInfix "delete --min-age 30d" post;
+        && lib.hasInfix "delete --min-age 30d" post
+        # The keys open objects in one bucket and cannot create one: rclone must not try.
+        && lib.hasInfix "RCLONE_CONFIG_MIRROR_NO_CHECK_BUCKET=true" post
+        && lib.hasInfix "RCLONE_CONFIG_DEVRESTORE_NO_CHECK_BUCKET=true" post
+        && lib.hasInfix "RCLONE_CONFIG_MEDIA_NO_CHECK_BUCKET=true" post;
+    }
+    {
+      # A cutover's staging verification sets only WP_HOME: wp-login and wp-admin must
+      # follow it, not stay on the domain that still points at the old host.
+      name = "WP_SITEURL follows a site's own WP_HOME, and a site's own WP_SITEURL wins";
+      ok =
+        let
+          with' =
+            settings:
+            (nodeSystem.extendModules {
+              modules = [ { clusterApps.demo-site.wordpress = { inherit settings; }; } ];
+            }).config.containers.demo-site.config.services.wordpress-nix.settings;
+          staging = with' { WP_HOME = "https://staging.demo-site.example.org"; };
+          both = with' {
+            WP_HOME = "https://staging.demo-site.example.org";
+            WP_SITEURL = "https://core.example.org/wp";
+          };
+        in
+        staging.WP_HOME == "https://staging.demo-site.example.org"
+        && staging.WP_SITEURL == "https://staging.demo-site.example.org/wp"
+        && both.WP_SITEURL == "https://core.example.org/wp";
+    }
+    {
+      # Both are <prefix>-<name>: one bucket, two owners.
+      name = "a JuiceFS volume named like a fleet bucket is refused";
+      ok =
+        let
+          clash =
+            v:
+            (nodeSystem.extendModules {
+              modules = [ { clusterApps.demo-site.juicefsVolume = lib.mkForce v; } ];
+            }).config.assertions;
+          refused =
+            v: lib.any (a: !a.assertion && lib.hasInfix "JuiceFS volume named ${v}" a.message) (clash v);
+        in
+        refused wordpressLib.mediaMirrorName
+        && refused wordpressLib.devRestoreName
+        &&
+          wordpressLib.mediaMirrorBucket os
+          == "${os.appBucketPrefix or os.juicefsBucket}-${wordpressLib.mediaMirrorName}"
+        && !(lib.any (a: !a.assertion && lib.hasInfix "JuiceFS volume named" a.message) c.assertions);
     }
     {
       name = "with neither copy wanted, the backup runs no host command and declares no key";
@@ -200,14 +245,16 @@ let
     {
       # A slot's database is production's, a moment ago: no key to the bucket (read
       # only), no cron, no mail (WP_ENV=staging), and its home from the request.
-      name = "a preview slot: production's salts, no S3 key, staging, cron off, home from the request";
+      name = "a preview slot: production's salts, no S3 key, staging, cron off, home from the request over a home Bedrock accepts";
       ok =
         slotWp.environmentFiles == [ "/run/secrets/env" ]
         && slot.secrets.env.generator == "demo-site"
         && !(slot.secrets ? cloud-files)
         && slotWp.settings.WP_ENV == "staging"
         && slotWp.settings.WORDPRESS_NIX_HOME_FROM_REQUEST == "true"
-        && !(slotWp.settings ? WP_HOME)
+        # Bedrock requires both; the request's host replaces them at run time.
+        && slotWp.settings.WP_HOME == "https://demo-site.example.org"
+        && slotWp.settings.WP_SITEURL == "https://demo-site.example.org/wp"
         && slotWp.settings.S3_BUCKET == "wp-demo-site-media"
         && !slotWp.cron.enable
         && slot.localState == { "/var/lib/mysql" = "/state-preview/demo-site-pv1/clients/demo-site/mysql"; }

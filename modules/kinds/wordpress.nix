@@ -24,6 +24,12 @@
 #
 # The site is not created here: `wordpress-nix site import` loads the converted
 # database after the first start. Deploys then migrate it (`wp core update-db`).
+#
+# What this asks of wordpress-nix (v3): services.wordpress-nix's package, profile,
+# socketPath, database.createLocally, environmentFiles, settings (written to the
+# Bedrock .env as they are), cron.enable, migrate.enable and logging.site; and, with
+# WORDPRESS_NIX_HOME_FROM_REQUEST outside production, a home, site URL and content,
+# plugin and theme URLs taken from the request's host (checks.wordpress-site-smoke).
 {
   inputs,
   lib,
@@ -213,21 +219,19 @@ in
           # DISABLE_WP_CRON, WP_TEMP_DIR -- is wordpress-nix's own.
           kindSettings = {
             WP_ENV = if isPreview then "staging" else "production";
+            # On a slot too: Bedrock's config/application.php refuses to start without
+            # WP_HOME and WP_SITEURL.
+            WP_HOME = home;
             WORDPRESS_NIX_APPLICATION_PASSWORDS = lib.boolToString w.applicationPasswords;
             WORDPRESS_NIX_ACCESS_ADMIN_PATHS = lib.boolToString w.access.adminPaths;
           }
           # A slot answers under whatever hostname its preview was given, which is
           # known only when the preview is made: WordPress takes its home from the
-          # request there, and only there (staging).
-          // (
-            if isPreview then
-              { WORDPRESS_NIX_HOME_FROM_REQUEST = "true"; }
-            else
-              {
-                WP_HOME = home;
-                WP_SITEURL = "${home}/wp";
-              }
-          )
+          # request there, and only there (staging). wordpress-nix's
+          # platform-environment.php then takes the home, the site URL and the content,
+          # plugin and theme URLs from the request's host, so a preview's assets are its
+          # own, not production's (Bedrock makes WP_CONTENT_URL from WP_HOME).
+          // lib.optionalAttrs isPreview { WORDPRESS_NIX_HOME_FROM_REQUEST = "true"; }
           # Where attachments are. A slot gets these and no key: wp-cloud-files'
           # read-only mode, so a preview serves production's media and cannot change it.
           // lib.optionalAttrs (w.media != null) {
@@ -235,6 +239,14 @@ in
             S3_ENDPOINT = w.media.endpoint;
             S3_PUBLIC_URL = w.media.publicUrl;
           };
+          # The site's over the kind's. Core's URL follows the home actually used, so a
+          # site that sets only WP_HOME (staging.<domain> before a cutover) has its
+          # wp-login and wp-admin there too, not on the domain still pointing elsewhere.
+          settings =
+            let
+              s = kindSettings // w.settings;
+            in
+            s // { WP_SITEURL = s.WP_SITEURL or "${s.WP_HOME}/wp"; };
 
           # ── the host's nightly copies (backup.hostPostCommand) ───────────────
           # On the node that backed the site up, after its snapshot: the media bucket
@@ -242,8 +254,11 @@ in
           # configured from the environment, and the keys are the host's: no container
           # holds them.
           rclone = "${pkgs.rclone}/bin/rclone";
+          # no_check_bucket: the keys reach objects in one bucket and cannot create
+          # one (lib/cloud.nix policyFor), and rclone would otherwise try before a write.
           s3Remote = remote: provider: endpoint: region: keyGen: ''
             export RCLONE_CONFIG_${remote}_TYPE=s3 RCLONE_CONFIG_${remote}_PROVIDER=${provider}
+            export RCLONE_CONFIG_${remote}_NO_CHECK_BUCKET=true
             export RCLONE_CONFIG_${remote}_ENDPOINT=${lib.escapeShellArg endpoint} RCLONE_CONFIG_${remote}_REGION=${lib.escapeShellArg region}
             RCLONE_CONFIG_${remote}_ACCESS_KEY_ID=$(cat ${secretPath keyGen "access-key"})
             RCLONE_CONFIG_${remote}_SECRET_ACCESS_KEY=$(cat ${secretPath keyGen "secret-key"})
@@ -291,7 +306,7 @@ in
                 # database is production's, a moment ago: with no key it cannot change
                 # production's bucket, and its mail and cron stay off (WP_ENV=staging).
                 environmentFiles = [ "/run/secrets/env" ] ++ lib.optional (!isPreview) "/run/secrets/cloud-files";
-                settings = kindSettings // w.settings;
+                inherit settings;
                 cron.enable = !isPreview;
                 migrate.enable = true;
                 logging.site = pv.base;
@@ -409,15 +424,28 @@ in
         }
       ) apps;
 
-      assertions = lib.mapAttrsToList (n: a: {
-        # The ingress is keyed by hostname: two would silently be one.
-        assertion = lib.allUnique (
-          [ a.wordpress.domain ]
-          ++ a.wordpress.extraDomains
-          ++ lib.optional (a.wordpress.stagingDomain != null) a.wordpress.stagingDomain
-        );
-        message = "clusterApps.${n}: wordpress.domain, extraDomains and stagingDomain name one hostname twice.";
-      }) apps;
+      assertions =
+        lib.mapAttrsToList (n: a: {
+          # The ingress is keyed by hostname: two would silently be one.
+          assertion = lib.allUnique (
+            [ a.wordpress.domain ]
+            ++ a.wordpress.extraDomains
+            ++ lib.optional (a.wordpress.stagingDomain != null) a.wordpress.stagingDomain
+          );
+          message = "clusterApps.${n}: wordpress.domain, extraDomains and stagingDomain name one hostname twice.";
+        }) apps
+        # The fleet's buckets are <prefix>-<name>, and so is a JuiceFS volume's
+        # (lib/juicefs.nix appBucket): a volume of that name would be the same bucket.
+        ++ map (
+          b:
+          let
+            volumes = clusterLib.juicefs.volumeApps config.clusterApps;
+          in
+          {
+            assertion = !(lib.elem b volumes);
+            message = "A JuiceFS volume named ${b} would have the bucket of the WordPress sites' ${b} (lib/wordpress.nix): rename its app, or set its juicefsVolume.";
+          }
+        ) (wp.fleetBucketNames apps);
     }
     {
       # The mirror's and the dev-restore bucket's pairs, one each for the fleet, named as

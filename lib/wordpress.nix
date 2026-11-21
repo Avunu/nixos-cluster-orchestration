@@ -17,22 +17,33 @@
 { lib }:
 let
   prefix = os: os.appBucketPrefix or os.juicefsBucket;
+  self = {
+    # Under the prefix the apps' JuiceFS buckets have (`<prefix>-<volume>`), so no volume
+    # may take these names: the kind asserts it.
+    mediaMirrorName = "wordpress-media";
+    devRestoreName = "wordpress-dev-restore";
+    mediaMirrorBucket = os: "${prefix os}-${self.mediaMirrorName}";
+    devRestoreBucket = os: "${prefix os}-${self.devRestoreName}";
+
+    # Prompted (`avc cloud apply` writes them where the topology has `cloud.ovh`), on
+    # every node: the backup runs on whichever node runs the site. Never in a container.
+    mediaMirrorGenerator = "wordpress-media-mirror";
+    devRestoreGenerator = "wordpress-dev-restore";
+
+    # The apps of the wordpress kind that want each copy.
+    mirroredApps =
+      apps:
+      lib.filterAttrs (
+        _: a: (a.wordpress or null) != null && a.wordpress.media != null && a.wordpress.media.backup
+      ) apps;
+    devRestoreApps =
+      apps: lib.filterAttrs (_: a: (a.wordpress or null) != null && a.wordpress.devRestore) apps;
+
+    # The names of the fleet buckets these apps make, after the prefix.
+    fleetBucketNames =
+      apps:
+      lib.optional (self.mirroredApps apps != { }) self.mediaMirrorName
+      ++ lib.optional (self.devRestoreApps apps != { }) self.devRestoreName;
+  };
 in
-{
-  mediaMirrorBucket = os: "${prefix os}-wordpress-media";
-  devRestoreBucket = os: "${prefix os}-wordpress-dev-restore";
-
-  # Prompted (`avc cloud apply` writes them where the topology has `cloud.ovh`), on
-  # every node: the backup runs on whichever node runs the site. Never in a container.
-  mediaMirrorGenerator = "wordpress-media-mirror";
-  devRestoreGenerator = "wordpress-dev-restore";
-
-  # The apps of the wordpress kind that want each copy.
-  mirroredApps =
-    apps:
-    lib.filterAttrs (
-      _: a: (a.wordpress or null) != null && a.wordpress.media != null && a.wordpress.media.backup
-    ) apps;
-  devRestoreApps =
-    apps: lib.filterAttrs (_: a: (a.wordpress or null) != null && a.wordpress.devRestore) apps;
-}
+self
