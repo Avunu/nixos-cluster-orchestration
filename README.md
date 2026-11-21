@@ -36,7 +36,7 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 
 ### Where an app runs
 
-Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and two things only narrow the choice. An app with files on JuiceFS needs a node whose mount is ready. And `wpdb` runs on the node whose app subnet its `address` is in, because an address does not move between subnets. `nomad.constraints` takes anything else in Nomad's own terms.
+Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and one thing only narrows the choice: an app with files on JuiceFS needs a node whose mount is ready. `nomad.constraints` takes anything else in Nomad's own terms.
 
 An app with local state (a database directory, FreeIPA's data) runs as one allocation, and its state goes where it goes:
 
@@ -585,7 +585,7 @@ Two limits. A new key protects what is written from then on: whoever copied the 
 
 Before a machine goes back to the provider or is retired, while it is still yours. Done in this order, nothing in [A node left your control](#a-node-left-your-control) is needed afterwards.
 
-1. Move its work away: `nomad node drain -enable -yes <node>`. Each app stops there and starts on another node with its state, losing nothing ([Where an app runs](#where-an-app-runs)); `cluster-state status` shows when none is left. `wpdb`, which its address ties to one node, needs a new `address` in another node's subnet first. Its role tags go to another node first.
+1. Move its work away: `nomad node drain -enable -yes <node>`. Each app stops there and starts on another node with its state, losing nothing ([Where an app runs](#where-an-app-runs)); `cluster-state status` shows when none is left. Its role tags go to another node first.
 2. **Wipe both LUKS headers**, on the running node, before any step that can fail or be interrupted:
 
    ```sh
@@ -1555,7 +1555,7 @@ These are accepted deliberately.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
 9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation.
 10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
-11. **State replication has run in VMs only.** `checks.app-state` proves the moves, the failover and the orphan with real ZFS on three VMs, with a stand-in for the container; no check yet has Nomad itself move a stateful app, and nothing has timed a large database's first replica or a failover on real disks. `wpdb` cannot move at all, and FreeIPA's move is the generic one, untried with a real FreeIPA.
+11. **State replication has run in VMs only.** `checks.app-state` proves the moves, the failover and the orphan with real ZFS on three VMs, with a stand-in for the container; no check yet has Nomad itself move a stateful app, and nothing has timed a large database's first replica or a failover on real disks. FreeIPA's move is the generic one, untried with a real FreeIPA.
 12. **`avc cloud` has met no provider.** Its configuration is validated against the providers' published schemas and its state encryption against OpenTofu itself, but no plan has been made against a real OVH or Cloudflare account. Unverified there: that OVH's policy language keeps `s3:DeleteObjectVersion` from a user that has `s3:DeleteObject`, the import ids, and the `ovh-us` endpoint's coverage of each resource. Read the first plan before applying it.
 
 ## License

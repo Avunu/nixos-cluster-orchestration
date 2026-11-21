@@ -281,8 +281,8 @@ let
           defaultText = lib.literalExpression "the app's name";
           description = ''
             The JuiceFS volume `juicefsPaths` are in: the app's own, by default. Two
-            apps that name the same one share its files (a WordPress site's admin and
-            public faces); the volume, its bucket and its keys carry this name.
+            apps that name the same one share its files; the volume, its bucket and
+            its keys carry this name.
           '';
         };
         localState = mkOption {
