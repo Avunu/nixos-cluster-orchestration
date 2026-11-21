@@ -1493,7 +1493,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `freeipa` | FreeIPA's wiring, and Authelia's own `validate-config` over its generated config. |
 | `wordpress-site-smoke` | One stock Bedrock site, built by wordpress-nix and placed by Nomad on the fixture node1 in a VM: served through its socket (home, REST API, login, the `/wp-admin` redirect), no PHP under uploads, a code tree PHP cannot write, no permission error in its journal, a `--db-only` restore, and a preview slot in staging with no cron, no S3 key, no mail and its home from the request. The cluster template re-exports it for the merge gate. |
 | `wordpress` | The wordpress kind's wiring: one container with its own MariaDB, Bedrock's environment, the secrets and whose they are, the host-only backup keys, every hostname on a tunnel in the site's account, the probes, the profile's reservation, the nightly host copies, and a preview slot without the S3 key, cron or production's home. |
-| `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool). |
+| `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool); the log rules parse as Loki's ruler parses them (lokitool). |
 | `alerting` | An alert travels Prometheus, Alertmanager and the bridge to a stub of the Cloudflare API, in a VM. |
 | `cluster-watchdog` | The dead-man's logic, and the audit Worker's schemas, tokens and emails. |
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |

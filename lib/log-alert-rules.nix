@@ -90,7 +90,7 @@ in
         # tree, mostly a plugin bump that does not run on this PHP or core.
         (rule {
           alert = "WordPressPhpFatal";
-          expr = ''sum by (app, site) (count_over_time({app!="platform"} |= "PHP Fatal error" [5m])) > 0'';
+          expr = ''sum by (app, site) (count_over_time({app=~".+", app!="platform"} |= "PHP Fatal error" [5m])) > 0'';
           severity = "warning";
           summary = "{{ $labels.app }} ({{ $labels.site }}): PHP fatal errors";
           description = explore;
@@ -99,7 +99,7 @@ in
         # row. Scheduled posts, mail queues and Action Scheduler stop with it.
         (rule {
           alert = "WordPressCronFailing";
-          expr = ''sum by (app) (count_over_time({app!="platform"} |= "wordpress-cron.service: Failed with result" [4m])) >= 3'';
+          expr = ''sum by (app) (count_over_time({app=~".+", app!="platform"} |= "wordpress-cron.service: Failed with result" [4m])) >= 3'';
           severity = "warning";
           summary = "{{ $labels.app }}: WordPress cron has failed three times in a row";
           description = explore;
@@ -108,7 +108,7 @@ in
         # container's uploads only, and is not where the site's URLs say.
         (rule {
           alert = "WordPressOffloadFailed";
-          expr = ''sum by (app, site) (count_over_time({app!="platform"} |~ "(?i)offload failed" [15m])) > 0'';
+          expr = ''sum by (app, site) (count_over_time({app=~".+", app!="platform"} |~ "(?i)offload failed" [15m])) > 0'';
           severity = "warning";
           summary = "{{ $labels.app }} ({{ $labels.site }}): media offload to the bucket failed";
           description = explore;
