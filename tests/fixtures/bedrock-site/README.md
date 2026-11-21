@@ -13,5 +13,6 @@ way a site does, after changing `composer.lock` or moving to a wordpress-nix who
 vendor recipe changed: build the check, and copy the `got:` hash Nix reports into
 `nix/vendor-hash` (wordpress-nix's `relock` does the same for a site).
 
-The hash committed with this fixture is Nix's placeholder (`lib.fakeHash`) until that
-first build: wordpress-nix v3 did not exist when the fixture was made.
+The committed hash was computed with wordpress-nix's `feat/v3-bedrock` branch at
+56c35ae, before its v3.0.0 release: rebuild and refresh it if the release's vendor
+recipe differs.
