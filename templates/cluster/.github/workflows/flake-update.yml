@@ -18,7 +18,17 @@
 # (flake-update/<input>), so
 # the good ones merge on their own gate; the bad one, failing alone, gets an issue
 # ("flake input <name> fails the merge gate") and a pull request adding it to the hold
-# file, for a person to merge. The steps are .github/flake-update.sh.
+# file, for a person to merge. Branch protection wants a branch up to date with `main`
+# and auto-merge does not update one, so `refresh` makes each open flake-update/<input>
+# again on `main` whenever `main` moves; without it only the first of them would merge.
+# The steps are .github/flake-update.sh.
+#
+# Concurrency is per job, never for the workflow: every merge-gate run anywhere in the
+# repository starts this workflow (workflow_run), and a workflow-level group would let
+# such a run, whose jobs all skip, cancel a pending update or split. A skipped job
+# takes no group. Each group is one at a time, because its runs force-push the same
+# branches; a newer pending run replaces an older one, which is what an update and a
+# refresh want, and splits are grouped by the branch that failed.
 #
 # Needs a secret FLAKE_UPDATE_TOKEN: a fine-grained token (or a GitHub App's) with
 # contents, pull-requests and issues write on this repository. Not GITHUB_TOKEN: a pull
@@ -38,18 +48,18 @@ on:
   workflow_run:
     workflows: [merge-gate]
     types: [completed]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
-# One at a time: two runs would each force-push the same branches.
-concurrency:
-  group: flake-update
-  cancel-in-progress: false
-
 jobs:
   update:
-    if: github.event_name != 'workflow_run'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: flake-update
+      cancel-in-progress: false
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 30
     steps:
@@ -79,6 +89,11 @@ jobs:
       && (github.event.workflow_run.head_branch == 'flake-auto-update'
           || startsWith(github.event.workflow_run.head_branch, 'flake-update/'))
       && github.event.workflow_run.head_repository.full_name == github.repository
+    # A group per failed branch, not one for all: a pending split replaced by another
+    # branch's, or by a refresh, would leave its input unblamed.
+    concurrency:
+      group: flake-update-split-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 60
     steps:
@@ -99,3 +114,25 @@ jobs:
           git config user.name "flake-update"
           git config user.email "flake-update@example.invalid"   # not a mailbox
           nix shell --inputs-from . nixpkgs#gh nixpkgs#jq -c bash .github/flake-update.sh split "$BRANCH" "$RUN_URL"
+
+  # main moved: each open flake-update/<input> pull request made again on it.
+  refresh:
+    if: github.event_name == 'push'
+    concurrency:
+      group: flake-update-refresh
+      cancel-in-progress: false
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+      - name: Each open per-input pull request, up to date with main
+        env:
+          GH_TOKEN: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+          NIX_CONFIG: ${{ secrets.NIX_ACCESS_TOKENS }}
+        run: |
+          git config user.name "flake-update"
+          git config user.email "flake-update@example.invalid"   # not a mailbox
+          nix shell --inputs-from . nixpkgs#gh nixpkgs#jq -c bash .github/flake-update.sh refresh

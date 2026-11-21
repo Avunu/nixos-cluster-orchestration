@@ -9,7 +9,13 @@
 #                                     request per input that moved there, each on
 #                                     flake-update/<input> (git cannot hold a branch
 #                                     under flake-auto-update/ beside that branch);
-#                                     when only one did, an issue and a proposed hold
+#                                     when only one did, or BRANCH is one of those, an
+#                                     issue and a proposed hold
+#   flake-update.sh refresh           main moved: each open flake-update/<input> pull
+#                                     request, made again on main. Branch protection
+#                                     wants a branch up to date, and auto-merge does
+#                                     not update one, so after the first of them merged
+#                                     the others would wait forever
 #
 # `.github/flake-update-hold` holds inputs out of the update: one name per line, each
 # with a comment saying why (`site-acme  # fails the merge gate: <url>`). Remove the
@@ -21,6 +27,7 @@ set -euo pipefail
 
 HOLD=.github/flake-update-hold
 BASE=${BASE:-main}
+CURRENT=0
 
 die() {
   echo "flake-update: $*" >&2
@@ -84,6 +91,24 @@ cmd_update() {
   gh pr merge flake-auto-update --auto --squash
 }
 
+# One input, on a branch of its own made from main: commit, push, pull request,
+# auto-merge. CURRENT=1 when main already has what the update would give. (Not a return
+# status: a function tested by `||` runs without `set -e`, and a failed push would pass.)
+input_pr() { # name, body
+  local name=$1 branch="flake-update/$1"
+  CURRENT=0
+  git switch -C "$branch" "origin/$BASE"
+  nix flake update "$name"
+  if git diff --quiet -- flake.lock; then
+    CURRENT=1
+    return 0
+  fi
+  git commit -m "chore: update flake input $name" -- flake.lock
+  git push --force origin "$branch"
+  open_pr "$branch" "chore: update flake input $name" "$2"
+  gh pr merge "$branch" --auto --squash
+}
+
 cmd_split() {
   local branch=$1 url=$2 name
   case "$branch" in
@@ -91,13 +116,29 @@ cmd_split() {
     *) die "not a flake-update branch: $branch" ;;
   esac
   git fetch origin "$BASE" "$branch"
-  local base_lock after_lock
+  # What the branch moved, against the commit it was made from, not against main now:
+  # by the time one input's pull request fails, its siblings' may have merged, and main
+  # would show their moves as this branch's too.
+  local fork base_lock after_lock
+  fork=$(git merge-base "origin/$BASE" "origin/$branch") || die "$branch has no common history with $BASE"
   base_lock=$(mktemp)
   after_lock=$(mktemp)
-  git show "origin/$BASE:flake.lock" >"$base_lock"
+  git show "$fork:flake.lock" >"$base_lock"
   git show "origin/$branch:flake.lock" >"$after_lock"
   mapfile -t inputs < <(moved "$base_lock" "$after_lock")
   rm -f "$base_lock" "$after_lock"
+
+  # A branch of one input is never split again, and its pull request is never closed
+  # here: that input is the one to blame.
+  if [[ "$branch" == flake-update/* ]]; then
+    name=${branch#flake-update/}
+    if printf '%s\n' "${inputs[@]}" | grep -qx "$name"; then
+      blame "$name" "$url"
+    else
+      echo "$name did not move on $branch: the gate failed for another reason; nothing to blame"
+    fi
+    return 0
+  fi
 
   case "${#inputs[@]}" in
     0)
@@ -110,19 +151,41 @@ cmd_split() {
       # One pull request per input, each from the deploy branch: the good ones merge
       # on their own gate, and the bad one comes back here alone.
       for name in "${inputs[@]}"; do
-        git switch -C "flake-update/$name" "origin/$BASE"
-        nix flake update "$name"
-        git diff --quiet -- flake.lock && continue
-        git commit -m "chore: update flake input $name" -- flake.lock
-        git push --force origin "flake-update/$name"
-        open_pr "flake-update/$name" "chore: update flake input $name" \
+        input_pr "$name" \
           "Split from $branch, which failed merge-gate ($url). Merged by auto-merge once merge-gate passes."
-        gh pr merge "flake-update/$name" --auto --squash
+        [ "$CURRENT" = 0 ] || echo "$name: $BASE already has it"
       done
       gh pr close "$branch" --comment "merge-gate failed ($url): split into one pull request per input (${inputs[*]})." \
         || true
       ;;
   esac
+}
+
+# Main moved: each open flake-update/<input> pull request, made again on it. Not one
+# whose input is held, or is proposed for a hold: that one waits for a person (a held
+# input's pull request is closed), and making it again would only fail the gate again.
+cmd_refresh() {
+  local name ref
+  local -A hold=()
+  git fetch origin "$BASE"
+  for name in $(held); do hold[$name]=1; done
+  for ref in $(gh pr list --state open --base "$BASE" --json headRefName \
+    --jq '.[].headRefName | select(startswith("flake-update/"))'); do
+    name=${ref#flake-update/}
+    case "$name" in
+      *[!A-Za-z0-9_-]* | "") echo "skipped: $ref is not one of ours" >&2; continue ;;
+    esac
+    if [ -n "${hold[$name]:-}" ]; then
+      gh pr close "$ref" --comment "\`$name\` is held ($HOLD): not updated until the hold is removed." || true
+      continue
+    fi
+    if [ "$(gh pr view "flake-update-hold/$name" --json state --jq .state 2>/dev/null)" = OPEN ]; then
+      echo "$name: a hold is proposed; left for a person"
+      continue
+    fi
+    input_pr "$name" "Made again on $BASE after it moved. Merged by auto-merge once merge-gate passes."
+    [ "$CURRENT" = 0 ] || gh pr close "$ref" --comment "$BASE already has this update." || true
+  done
 }
 
 # One input fails the gate alone: say so, once, and propose holding it.
@@ -158,9 +221,10 @@ EOF
 
 case "${1:-}" in
   update) cmd_update ;;
+  refresh) cmd_refresh ;;
   split)
     [ $# -eq 3 ] || die "usage: flake-update.sh split BRANCH RUN_URL"
     cmd_split "$2" "$3"
     ;;
-  *) die "usage: flake-update.sh update | split BRANCH RUN_URL" ;;
+  *) die "usage: flake-update.sh update | refresh | split BRANCH RUN_URL" ;;
 esac
