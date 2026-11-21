@@ -249,7 +249,8 @@ in
             RCLONE_CONFIG_${remote}_SECRET_ACCESS_KEY=$(cat ${secretPath keyGen "secret-key"})
             export RCLONE_CONFIG_${remote}_ACCESS_KEY_ID RCLONE_CONFIG_${remote}_SECRET_ACCESS_KEY
           '';
-          mirrorMedia = w.media != null && w.media.backup;
+          # Not on a preview slot, which is never backed up and has no keys of its own.
+          mirrorMedia = !isPreview && w.media != null && w.media.backup;
           hostPost =
             lib.optionalString mirrorMedia ''
               ${s3Remote "MEDIA" "Cloudflare" w.media.endpoint "auto" "${name}-media-ro"}
@@ -259,7 +260,7 @@ in
                 mirror:${lib.escapeShellArg "${wp.mediaMirrorBucket os}/${name}"}
               echo "$APP: media copied to the mirror"
             ''
-            + lib.optionalString w.devRestore ''
+            + lib.optionalString (!isPreview && w.devRestore) ''
               ${s3Remote "DEVRESTORE" "Other" os.endpoint os.region wp.devRestoreGenerator}
               dest=devrestore:${lib.escapeShellArg "${wp.devRestoreBucket os}/wordpress/${name}"}
               db=$(head -n 1 "$BACKUP_STAGING/databases")

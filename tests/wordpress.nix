@@ -214,6 +214,7 @@ let
         && slot.juicefsPaths == { "/var/lib/wordpress/uploads" = "previews/demo-site-pv1/uploads"; }
         && slot.preview.origin == "unix:/run/wordpress/wp.sock"
         && slot.preview.healthPath == "/wp-json/"
+        && slot.backup.hostPostCommand == null
         && !(ec.cluster.secrets.generators ? demo-site-pv1)
         && !(ec.cluster.secrets.generators ? demo-site-pv1-cloud-files);
     }
