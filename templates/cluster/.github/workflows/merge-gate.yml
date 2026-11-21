@@ -62,6 +62,29 @@ jobs:
           drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.boot-fallback.drvPath)
           nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
 
+  # One Bedrock site booted by the wordpress kind, at this lock's wordpress-nix.
+  wordpress-site-smoke:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checks.x86_64-linux.wordpress-site-smoke
+        run: |
+          test -w /dev/kvm
+          drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.wordpress-site-smoke.drvPath)
+          nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
+
+  # Every project input follows the library's payload flake, with no nixpkgs of its own.
+  project-inputs-follow:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build checks.x86_64-linux.project-inputs-follow
+        run: |
+          drv=$(nix --option eval-cores 1 eval --raw .#checks.x86_64-linux.project-inputs-follow.drvPath)
+          nix build --no-link --print-build-logs "$drv^*"
+
   # The boot tests prove the library's nixpkgs; the nodes build on this flake's. They are
   # the same store path only if one follows the other.
   nixpkgs-follows-library:
@@ -121,7 +144,7 @@ jobs:
           nix build --no-link --print-build-logs --max-jobs 1 "$drv^*"
 
   merge-gate:
-    needs: [boot-install, boot-fallback, nixpkgs-follows-library, github-repos, nodes, toplevel]
+    needs: [boot-install, boot-fallback, wordpress-site-smoke, project-inputs-follow, nixpkgs-follows-library, github-repos, nodes, toplevel]
     if: always()
     runs-on: ubuntu-latest
     steps:

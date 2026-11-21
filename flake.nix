@@ -2024,6 +2024,20 @@
             }
           );
 
+          # One Bedrock site (tests/fixtures/bedrock-site), built by wordpress-nix and booted
+          # by the wordpress kind on the fixture node1: served through its socket, read-only,
+          # backed up and restored, and a preview slot (tests/wordpress-site-smoke.nix). The
+          # cluster template re-exports it, so a site's merge gate runs it at its own lock.
+          checks.wordpress-site-smoke = detach (
+            _:
+            import ./tests/wordpress-site-smoke.nix {
+              inherit pkgs lib;
+              mkSite = mkFixtureCluster;
+              topology = fixtureTopology;
+              wordpressNix = inputs.wordpress-nix;
+            }
+          );
+
           # mkCluster as a consumer calls it, with a `self` that exports nothing,
           # and the template's own flake outputs.
           checks.mk-cluster = detach (

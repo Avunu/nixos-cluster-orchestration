@@ -109,11 +109,13 @@ let
         checks.x86_64-linux = {
           boot-install = "the library's boot-install";
           boot-fallback = "the library's boot-fallback";
+          wordpress-site-smoke = "the library's wordpress-site-smoke";
           boot-attack = "not re-exported";
         };
         inputs.nixpkgs.outPath = libraryNixpkgs;
         lib = {
           inherit mkOpsIndex;
+          inherit (import ../lib { inherit lib; }) projectInputs;
           # The template's `directory = ./.` is its flake's root in real use, and a
           # path below this flake's root here (see tests/fixtures/default.nix).
           mkCluster =
@@ -274,7 +276,7 @@ let
     }
     # .github/workflows/merge-gate.yml builds these at the site's own lock (WS17).
     {
-      name = "the template re-exports the library's boot-install and boot-fallback, and holds nixpkgs to the library's";
+      name = "the template re-exports the library's boot-install, boot-fallback and wordpress-site-smoke, and holds nixpkgs and its projects to the library's";
       ok =
         let
           checks = template.checks.x86_64-linux;
@@ -287,11 +289,109 @@ let
           "boot-install"
           "github-repos"
           "nixpkgs-follows-library"
+          "project-inputs-follow"
+          "wordpress-site-smoke"
         ]
         && checks.boot-install == "the library's boot-install"
         && checks.boot-fallback == "the library's boot-fallback"
+        && checks.wordpress-site-smoke == "the library's wordpress-site-smoke"
+        # The template has no lock: nothing to hold to anything.
+        && checks.project-inputs-follow.buildCommand == "touch $out"
         && checks.nixpkgs-follows-library.buildCommand == "touch $out"
         && lib.hasInfix "exit 1" diverged.buildCommand;
+    }
+    # A site's project inputs, read from its flake.lock (lib/project-inputs.nix).
+    {
+      name = "project-inputs-follow: a project must follow the library's payload flake and bring no nixpkgs of its own";
+      ok =
+        let
+          pi = (import ../lib { inherit lib; }).projectInputs;
+          node = inputs: {
+            inherit inputs;
+            locked.rev = "0";
+            original.ref = "main";
+          };
+          lockWith = nodes: {
+            root = "root";
+            version = 7;
+            nodes = {
+              root.inputs = {
+                cluster = "cluster";
+                nixpkgs = [
+                  "cluster"
+                  "nixpkgs"
+                ];
+                site-good = "site-good";
+              }
+              // lib.mapAttrs (n: _: n) nodes;
+              cluster = node {
+                nixpkgs = "nixpkgs";
+                wordpress-nix = "wordpress-nix";
+              };
+              nixpkgs = node { };
+              wordpress-nix = node {
+                nixpkgs = [
+                  "cluster"
+                  "nixpkgs"
+                ];
+              };
+              # As the template's comment writes it.
+              site-good = node {
+                wordpress-nix = [
+                  "cluster"
+                  "wordpress-nix"
+                ];
+              };
+            }
+            // nodes;
+          };
+          found = nodes: pi.problems (lockWith nodes);
+          own = found {
+            site-own = node { wordpress-nix = "wordpress-nix_2"; };
+            wordpress-nix_2 = node {
+              nixpkgs = [
+                "cluster"
+                "nixpkgs"
+              ];
+            };
+          };
+          ownNixpkgs = found {
+            erp = node {
+              frappe-nix = [
+                "cluster"
+                "frappe-nix"
+              ];
+              # Two levels down, through an input that is the project's own.
+              helper = "helper";
+            };
+            helper = node { nixpkgs = "nixpkgs_2"; };
+            nixpkgs_2 = node { };
+          };
+          # Not a project: it takes no payload flake, whatever else it brings.
+          tool = found {
+            tool = node { nixpkgs = "nixpkgs_3"; };
+            nixpkgs_3 = node { };
+          };
+          lockFile = pkgs.writeText "flake.lock" (
+            builtins.toJSON (lockWith {
+              site-own = node { wordpress-nix = "wordpress-nix"; };
+            })
+          );
+        in
+        found { } == [ ]
+        && lib.length own == 1
+        && lib.hasInfix "site-own: its wordpress-nix is its own" (lib.head own)
+        && lib.length ownNixpkgs == 1
+        && lib.hasInfix "erp: it brings a nixpkgs of its own (flake.lock node nixpkgs_2)" (
+          lib.head ownNixpkgs
+        )
+        && tool == [ ]
+        && lib.hasInfix "exit 1" (pi.check { inherit pkgs lockFile; }).buildCommand
+        &&
+          (pi.check {
+            inherit pkgs;
+            lockFile = ./fixtures/no-such-lock;
+          }).buildCommand == "touch $out";
     }
     # What the nodes may read at GitHub besides the lock's inputs (lib/github-repos.nix).
     {
