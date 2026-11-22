@@ -1931,11 +1931,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795219461,
-        "narHash": "sha256-SBHbo7The0NQmK4xqUy9Rfp765kavW0Bm90GTA2boVY=",
+        "lastModified": 1795312040,
+        "narHash": "sha256-zj68w+JnN5uX6f53DrnS2ZT95TQf4cdYGRiNqmwnsOE=",
         "owner": "Avunu",
         "repo": "python-devops-nix",
-        "rev": "cb0774e012eb9ea61400e8f5041a0c502547d921",
+        "rev": "7391ef964c14e16e6dc29d77bb905274bb4e5774",
         "type": "github"
       },
       "original": {
@@ -2278,11 +2278,11 @@
         "python-devops-nix": "python-devops-nix_3"
       },
       "locked": {
-        "lastModified": 1795312722,
-        "narHash": "sha256-J5SyTwTsz0E3UdnoRJdmzCndAmp0/99TkAJqDGENrpM=",
+        "lastModified": 1795324068,
+        "narHash": "sha256-WeVNG+eqMq+TXRXDplFGk4Q7o6Z9PFLNUoOCfX84w54=",
         "owner": "Avunu",
         "repo": "wordpress",
-        "rev": "3fa8c609c44f71552081ace23d175308059dde49",
+        "rev": "a0ec78d858c5542a5ec852a032a7472168b950bb",
         "type": "github"
       },
       "original": {
