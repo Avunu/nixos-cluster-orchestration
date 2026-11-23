@@ -2,8 +2,9 @@
 # tools/ci/preflight.sh — refuse to start on a runner that cannot run the VM tests, rather
 # than fail an hour in, or worse, let a check that needs KVM fall back to something slower.
 #
-# Needs: Nix with flakes, /dev/kvm usable by this user, and `kvm` and `nixos-test` among
-# Nix's system-features (the VM tests require both), at least 16 GB of RAM, and at least
+# Needs: Nix with flakes, `kvm` and `nixos-test` among Nix's system-features (the VM tests
+# require both; the nix-daemon runs them, so the runner's own user needs no /dev/kvm, and
+# a runner unit's systemd sandbox commonly hides it), at least 16 GB of RAM, and at least
 # 50 GB free on the filesystem that holds /nix/store. On a runner that is itself a VM,
 # nested virtualisation must be on. Every job that builds runs this, as each may land on a
 # different runner.
@@ -23,10 +24,6 @@ if ! command -v nix >/dev/null; then
   exit 1
 fi
 nix --version
-if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-  echo "preflight: /dev/kvm is missing or not read-write for $(id -un)" >&2
-  fail=1
-fi
 features=$(nix config show system-features 2>/dev/null || nix show-config 2>/dev/null | sed -n 's/^system-features = //p')
 for f in kvm nixos-test; do
   case " $features " in

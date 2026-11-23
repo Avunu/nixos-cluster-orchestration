@@ -55,6 +55,8 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      # The runners share one 64 GB host; a check's evaluation alone can take 9 GB.
+      max-parallel: 3
       matrix:
         check: ${{ fromJSON(needs.list.outputs.checks) }}
     steps:
