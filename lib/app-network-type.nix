@@ -49,7 +49,7 @@ types.submodule {
       default = [ ];
       example = [
         {
-          app = "wpdb";
+          app = "shared-db";
           port = 3306;
         }
       ];

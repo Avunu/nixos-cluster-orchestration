@@ -210,8 +210,7 @@ let
 
   # The app's own JuiceFS volume, mounted on this node for as long as the container
   # runs here (modules/storage-juicefs.nix). A preview slot's files are in the
-  # volume of the app it previews, and two apps can name one volume (a WordPress
-  # site's two faces).
+  # volume of the app it previews, and two apps can name one volume.
   jfsVolume = jfs.appVolume topology.objectStorage app.juicefsVolume;
   jfsUnit = "juicefs-mount${jfsVolume.suffix}.service";
 

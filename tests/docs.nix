@@ -54,6 +54,7 @@ let
       ../modules/backup.nix
       ../modules/alerting.nix
       ../modules/kinds/attic.nix
+      ../modules/kinds/wordpress.nix
     ];
     modules = ../modules;
     lib = ../lib;

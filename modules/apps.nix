@@ -3,8 +3,8 @@
 #
 #   apps/<name>.nix    the clusterApps.<name> entry itself, as a function of
 #                      { inputs, lib, pkgs, name }
-#   apps/<name>.json   the same, as data -- what tooling writes (a provisioning
-#                      tool can write WordPress sites with jq)
+#   apps/<name>.json   the same, as data -- what tooling writes (`avc cloud` a
+#                      tunnel's id, `wordpress-nix edge provision` a site's tunnel)
 #
 # The file name is the app name. A .nix and a .json of the same name are two
 # definitions of one app and merge, so a tool-written site can still be
@@ -14,14 +14,10 @@
 # its parameters, but not deployed (e.g. while its tunnel does not exist).
 #
 # What an app IS comes from its kind, a typed namespace on the entry --
-# `odoo`, `frappe`, `freeipa`, `wpdb`, `wordpress` (modules/kinds/) -- which
+# `odoo`, `frappe`, `freeipa`, `grafana`, `attic`, `wordpress` (modules/kinds/) -- which
 # fills in the container, paths, sockets, secrets, backups and ingress. A file
 # only carries what differs between apps; every generic clusterApps option
 # (modules/app-container.nix) stays available beside the kind.
-#
-# One kind is the exception to "one file, one app": a `wordpress` file becomes
-# TWO entries, `<name>` (the public face) and `<name>-admin` (the admin face).
-# See wordpressPlanes below.
 {
   inputs,
   lib,
@@ -34,47 +30,6 @@ let
   inherit (clusterSite) appsDir;
   entries = if appsDir != null && builtins.pathExists appsDir then builtins.readDir appsDir else { };
   files = ext: lib.filterAttrs (f: kind: kind == "regular" && lib.hasSuffix ext f) entries;
-
-  # A WordPress site is TWO containers from one file: the read-only public face
-  # on the site's real hostname, and the writable admin face on a private one. A
-  # kind cannot declare a sibling app -- it is a submodule of one entry -- so the
-  # split happens here, in the catalogue.
-  #
-  # `public` and `admin` are ordinary clusterApps fragments applied to the
-  # matching plane. Each plane's own tunnel id goes there, because the two faces
-  # cannot share a tunnel: Cloudflare steers to the closest connector without
-  # route awareness, so one tunnel serving both hostnames would cross them.
-  wordpressPlanes =
-    name: e:
-    let
-      base = removeAttrs e [
-        "enable"
-        "wordpress"
-        "public"
-        "admin"
-      ];
-      site = removeAttrs e.wordpress [
-        "role"
-        "slug"
-      ];
-      plane =
-        role: suffix:
-        lib.nameValuePair "${name}${suffix}" (
-          lib.recursiveUpdate (
-            base
-            // {
-              wordpress = site // {
-                inherit role;
-                slug = name;
-              };
-            }
-          ) (e.${role} or { })
-        );
-    in
-    lib.listToAttrs [
-      (plane "public" "")
-      (plane "admin" "-admin")
-    ];
 
   # `preview.slots = N` makes N more entries from the same file, `<name>-pv1` to
   # `<name>-pvN`: the containers a pull request's preview runs in
@@ -110,10 +65,7 @@ let
   entry =
     name: e:
     lib.optionalAttrs (e.enable or true) (
-      if e ? wordpress then
-        wordpressPlanes name e
-      else
-        { ${name} = removeAttrs e [ "enable" ]; } // previewSlots name e
+      { ${name} = removeAttrs e [ "enable" ]; } // previewSlots name e
     );
 
   fromNix = lib.mapAttrsToList (

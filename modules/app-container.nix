@@ -137,6 +137,24 @@ let
           `<id>.cfargotunnel.com`; a wildcard cannot work with per-site tunnels.
         '';
       };
+      accountId = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "0123456789abcdef0123456789abcdef";
+        description = ''
+          The Cloudflare account the tunnel is in. null = the cluster's own,
+          topology.cloud.cloudflare.accountId, where `avc cloud` makes the tunnel
+          and its DNS records (lib/cloud.nix).
+
+          Another account's tunnel is made and kept outside OpenTofu: a client
+          zone in its own account, whose CNAME to `<id>.cfargotunnel.com` resolves
+          only to a tunnel in that same account. `avc cloud` then makes no
+          tunnel, no import and no DNS record for this app, and none of its
+          hostnames may be in a zone of topology.cloud.cloudflare.zones, so every
+          record has one owner. `id` and the `<name>-cf/cloudflared` credentials
+          come from whatever made the tunnel (`wordpress-nix edge provision`).
+        '';
+      };
       credentials = mkOption {
         type = types.nullOr secretRefType;
         default = null;
@@ -184,6 +202,16 @@ let
         type = types.str;
         default = "http_status:404";
         description = "Catch-all for hostnames not matched above.";
+      };
+      probePath = mkOption {
+        type = types.str;
+        default = "/";
+        example = "/wp-json/";
+        description = ''
+          What alerting's probe asks of each hostname in `ingress`
+          (modules/alerting.nix): a path the app itself answers, past any
+          page cache, so a probe that passes means the app is up.
+        '';
       };
       socketGroups = mkOption {
         type = types.listOf types.str;
@@ -253,8 +281,8 @@ let
           defaultText = lib.literalExpression "the app's name";
           description = ''
             The JuiceFS volume `juicefsPaths` are in: the app's own, by default. Two
-            apps that name the same one share its files (a WordPress site's admin and
-            public faces); the volume, its bucket and its keys carry this name.
+            apps that name the same one share its files; the volume, its bucket and
+            its keys carry this name.
           '';
         };
         localState = mkOption {
@@ -467,6 +495,16 @@ let
   );
 
   net = clusterLib.net;
+
+  # Apps whose tunnel is in another Cloudflare account than the cluster's (tunnel.accountId),
+  # and the zones whose records `avc cloud` makes (lib/cloud.nix).
+  cf = (topology.cloud or { }).cloudflare or null;
+  cfZones = if cf == null then [ ] else lib.attrNames (cf.zones or { });
+  inZone = host: lib.any (z: host == z || lib.hasSuffix ".${z}" host) cfZones;
+  externalTunnelApps = lib.filterAttrs (
+    _: a: cf != null && a.tunnel.accountId != null && a.tunnel.accountId != cf.accountId
+  ) config.clusterApps;
+
   # Each app's `network`, which is all the host firewall reads.
   appNetworks = lib.mapAttrs (_: a: a.network) config.clusterApps;
   peerApps = net.peerAppNames appNetworks;
@@ -538,7 +576,25 @@ in
             + " (this one has ${toString (lib.stringLength n)}). The host firewall names the"
             + " container by its veth, vb-<name>, and nspawn shortens a longer one"
             + " unpredictably, so the rule would never match. Rename the app.";
-        }) hostAccessApps;
+        }) hostAccessApps
+        # tunnel.accountId: a tunnel in another account has its DNS made where it was
+        # made. A hostname in one of the cluster's zones would get a second owner, and
+        # the two would fight over the record.
+        ++ lib.mapAttrsToList (
+          n: a:
+          let
+            clash = lib.filter inZone (lib.attrNames a.tunnel.ingress);
+          in
+          {
+            assertion = clash == [ ];
+            message =
+              "clusterApps.${n}: tunnel.accountId names another Cloudflare account than"
+              + " topology.cloud.cloudflare.accountId, so this app's DNS is made outside `avc cloud`,"
+              + " yet ${lib.concatStringsSep ", " clash} is in a zone of topology.cloud.cloudflare.zones,"
+              + " whose records `avc cloud` makes. One owner per record: take the zone out of"
+              + " cloudflare.zones, or the tunnel into the cluster's account (tunnel.accountId = null).";
+          }
+        ) externalTunnelApps;
 
       # The host firewall (modules/overlay-network.nix) reads this, and nothing else
       # of the apps.

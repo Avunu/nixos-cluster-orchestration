@@ -18,6 +18,15 @@
     #   inputs.nixpkgs.follows = "nixpkgs";
     #   inputs.odoo-nix.follows = "cluster/odoo-nix";
     # };
+    #
+    # A WordPress site has no nixpkgs input of its own; it comes with wordpress-nix:
+    #
+    # site-acme = {
+    #   url = "git+https://github.com/OWNER/site-acme.git?ref=main";
+    #   inputs.wordpress-nix.follows = "cluster/wordpress-nix";
+    # };
+    #
+    # checks.project-inputs-follow below refuses a project that does not follow.
   };
 
   outputs =
@@ -81,8 +90,22 @@
       checks.x86_64-linux = {
         inherit (cluster.checks.x86_64-linux) boot-install boot-fallback;
 
+        # One Bedrock site booted by the wordpress kind, with THIS lock's wordpress-nix:
+        # the one every site here is built with, whatever the site's own lock says. A
+        # wordpress-nix release reaches the sites only once this passes. Drop it if this
+        # site runs no WordPress.
+        inherit (cluster.checks.x86_64-linux) wordpress-site-smoke;
+
+        # Every project input follows the library's payload flake and brings no
+        # nixpkgs of its own (the library's lib/project-inputs.nix): one PHP, one
+        # MariaDB, one nixpkgs on the nodes, and a module that matches its package.
+        project-inputs-follow = cluster.lib.projectInputs.check {
+          pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux;
+          lockFile = ./flake.lock;
+        };
+
         # github-repos.json names what this site fetches from GitHub outside flake.lock
-        # (a WordPress site's content, a preview's repository). The cluster-ci Worker
+        # (a preview's repository, a private submodule). The cluster-ci Worker
         # gives the nodes read access to what that file names, so it is held to the
         # configuration here: `avc ci repos` writes it.
         inherit (site.checks.x86_64-linux) github-repos;

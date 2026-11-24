@@ -1446,15 +1446,29 @@ let
       }
     )
   );
+  # Loki's own rules (lib/log-alert-rules.nix), as Loki's ruler reads them: parsed by
+  # Loki's own LogQL parser, which refuses what the ruler would only log and skip (a
+  # selector with no matcher that excludes the empty value).
+  logRulesFile = pkgs.writeText "log-rules.yaml" (
+    builtins.toJSON (import ../lib/log-alert-rules.nix { inherit lib; })
+  );
 in
-pkgs.runCommand "alert-rules-tests" { nativeBuildInputs = [ pkgs.prometheus.cli ]; } ''
-  ${lib.optionalString (uncovered != [ ]) ''
-    echo "alerts without both a firing and a quiet case: ${lib.concatStringsSep " " uncovered}" >&2
-    exit 1
-  ''}
-  echo "${toString (builtins.length alertNames)} alerts, each with a firing and a quiet case"
-  promtool check rules ${rulesFile}
-  promtool check rules ${annotatedRulesFile}
-  promtool test rules ${testFile}
-  touch $out
-''
+pkgs.runCommand "alert-rules-tests"
+  {
+    nativeBuildInputs = [
+      pkgs.prometheus.cli
+      pkgs.grafana-loki
+    ];
+  }
+  ''
+    ${lib.optionalString (uncovered != [ ]) ''
+      echo "alerts without both a firing and a quiet case: ${lib.concatStringsSep " " uncovered}" >&2
+      exit 1
+    ''}
+    echo "${toString (builtins.length alertNames)} alerts, each with a firing and a quiet case"
+    promtool check rules ${rulesFile}
+    promtool check rules ${annotatedRulesFile}
+    promtool test rules ${testFile}
+    lokitool rules check ${logRulesFile}
+    touch $out
+  ''

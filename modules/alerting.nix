@@ -90,7 +90,7 @@ in
         n: a:
         map (host: {
           app = n;
-          url = "https://${host}/";
+          url = "https://${host}${a.tunnel.probePath}";
         }) (lib.subtractLists a.tunnel.accessProtected (lib.attrNames (a.tunnel.ingress or { })))
       ) apps
     );

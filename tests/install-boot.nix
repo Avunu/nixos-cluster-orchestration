@@ -56,8 +56,8 @@ let
   # as a command, so the subtests below can call it with one ESP missing.
   espSyncHook = import ../lib/esp-sync-hook.nix { inherit pkgs; };
   espSyncCommand = pkgs.writeShellScriptBin "esp-sync-hook" espSyncHook;
-  # disko's own entry point builds its test library: tests.nix now also takes the whole
-  # `diskoLib`, which only lib/default.nix assembles.
+  # disko's lib, which hands its test harness (lib/tests.nix) the rest of itself: the
+  # harness needs diskoLib, so it is not called on its own.
   diskoLib =
     (import "${diskoSrc}/lib" {
       inherit lib;

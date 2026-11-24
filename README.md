@@ -36,7 +36,7 @@ nix flake init -t github:Avunu/nixos-cluster-orchestration
 
 ### Where an app runs
 
-Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and two things only narrow the choice. An app with files on JuiceFS needs a node whose mount is ready. And `wpdb` runs on the node whose app subnet its `address` is in, because an address does not move between subnets. `nomad.constraints` takes anything else in Nomad's own terms.
+Nomad decides, each time an app starts: the emptiest node that can run it (`scheduler_algorithm = "spread"`), by the `resources` its entry declares. Nothing in an entry names a node, and one thing only narrows the choice: an app with files on JuiceFS needs a node whose mount is ready. `nomad.constraints` takes anything else in Nomad's own terms.
 
 An app with local state (a database directory, FreeIPA's data) runs as one allocation, and its state goes where it goes:
 
@@ -95,7 +95,7 @@ Bridged frames do not traverse the host's IP hooks, so each container firewalls 
 ```nix
 # apps/<name>.nix
 network.hostAccess = [ 3100 ];                             # TCP ports on the mesh address of the node it runs on
-network.peerAccess = [ { app = "wpdb"; port = 3306; } ];   # another app, one TCP port
+network.peerAccess = [ { app = "shared-db"; port = 3306; } ];   # another app, one TCP port
 ```
 
 - `hostAccess` is for Loki and Prometheus, which every node runs: the app reaches them on the node Nomad put it on. Its name must be at most 12 characters, because its identity is nspawn's veth `vb-<name>` (asserted).
@@ -103,7 +103,7 @@ network.peerAccess = [ { app = "wpdb"; port = 3306; } ];   # another app, one TC
 - Identity is the bridge port a frame arrives on, never the address: a container holds `CAP_NET_ADMIN` and can take any address and MAC it likes.
 - A container's IPv4 egress excludes RFC 1918, CGNAT, link-local and every node's public address. An S3 endpoint on a private address would need a rule of its own.
 - ICMP between containers is not allowed.
-- The `grafana` kind declares its own `hostAccess`, and `wordpress` declares `peerAccess` to its `wpdb`.
+- The `grafana` kind declares its own `hostAccess`. The other kinds keep their database in their own container and declare nothing.
 
 Refused traffic is logged, rate-limited, with the prefixes `container-to-host-drop` and `container-forward-drop`.
 
@@ -585,7 +585,7 @@ Two limits. A new key protects what is written from then on: whoever copied the 
 
 Before a machine goes back to the provider or is retired, while it is still yours. Done in this order, nothing in [A node left your control](#a-node-left-your-control) is needed afterwards.
 
-1. Move its work away: `nomad node drain -enable -yes <node>`. Each app stops there and starts on another node with its state, losing nothing ([Where an app runs](#where-an-app-runs)); `cluster-state status` shows when none is left. `wpdb`, which its address ties to one node, needs a new `address` in another node's subnet first. Its role tags go to another node first.
+1. Move its work away: `nomad node drain -enable -yes <node>`. Each app stops there and starts on another node with its state, losing nothing ([Where an app runs](#where-an-app-runs)); `cluster-state status` shows when none is left. Its role tags go to another node first.
 2. **Wipe both LUKS headers**, on the running node, before any step that can fail or be interrupted:
 
    ```sh
@@ -744,7 +744,7 @@ The attribute key under `nodes` is the machine name everywhere: the directory it
 | `wanInterface`, `vrackInterface` | NIC names: the WAN port and the private VLAN trunk. |
 | `controlIp`, `storageIp` | Addresses on the control and storage VLANs. |
 | `appBridgeIp`, `appSubnet` | `br-app`'s address and the containers' subnet. |
-| `appDhcpPoolOffset`, `appDhcpPoolSize` | The containers' DHCP pool. Addresses below the offset are free for static use, such as `wpdb.address`. |
+| `appDhcpPoolOffset`, `appDhcpPoolSize` | The containers' DHCP pool. Addresses below the offset are free for static use, such as `attic.hostOctet`. |
 | `initrdNicModules` | Kernel modules for the WAN NIC in the initrd, such as `[ "igb" ]`, so the recovery key can be typed over SSH. Not detectable at evaluation; `lspci -k` on the node names them. Required unless opted out. |
 | `disks` | `{ a; b; }`, the two disk devices. Default `/dev/nvme0n1` and `/dev/nvme1n1`. Use `/dev/disk/by-id/...` on hardware whose enumeration swaps. |
 | `swapPerDiskGiB` | The swap partition on each disk, in GiB; the node's swap is twice this. Default 32. Fixed at install: a new value takes a reinstall. |
@@ -795,8 +795,7 @@ An app is one file in `appsDir`, named after the app. It is a function of `{ inp
 | `freeipa` | `hostname`, `domain`, `realm`, `privateIp4`, `image`, `authelia` | The upstream FreeIPA image under podman, a private address reachable only over WARP, optional Authelia as an OIDC provider, nightly upgrades. |
 | `grafana` | `hostname`, `loginName`, `adminGroup`, `editorGroup`, with `oidc.idp` | Grafana on whichever node Nomad picks, signed in through an identity provider's Authelia, reaching Loki and Prometheus through `network.hostAccess`. |
 | `attic` | `bucket`, `public`, `hostname`, `retentionDays`, `cache`, `hostOctet` | The cluster's binary cache ([The binary cache](#the-binary-cache)): an Attic server on whichever node Nomad picks, its NARs in a bucket of its own, its index in the app's dataset, and on every node the substituter, the push after each switch, and the proxy that finds it. One per cluster. |
-| `wpdb` | `address`, `port`, `clientHosts`, `bufferPoolSize` | The one MariaDB every WordPress site shares, with databases and grants per site. Runs on the node whose app subnet holds `address`. |
-| `wordpress` | The `wordpress` section, usually written by a tool as JSON | One file, two containers: `<name>` (read-only public face) and `<name>-admin` (writable admin face), each reaching `wpdb` through `network.peerAccess`. |
+| `wordpress` | `package`, `domain`, `extraDomains`, `stagingDomain`, `profile`, `settings`, `media`, `devRestore`, `access.adminPaths`, `applicationPasswords` | A Bedrock site ([WordPress](#wordpress)): wordpress-nix's FrankenPHP on a socket serving the site's Composer-built tree, read-only in the store; local MariaDB; uploads on JuiceFS; its salts and its S3 and mail secret; every hostname routed from the first deploy; the nightly media mirror and dev-restore dump from the host. |
 
 The payload modules come from [wordpress-nix](https://github.com/Avunu/wordpress), [frappe-nix](https://github.com/Avunu/frappe-nix) and [odoo-nix](https://github.com/Avunu/odoo-nix). Your project flake supplies the `package`. To pin its payload module to the library's, use `inputs.odoo-nix.follows = "cluster/odoo-nix"`.
 
@@ -809,7 +808,7 @@ An app with `juicefsPaths` has a JuiceFS volume of its own: a bucket (`<appBucke
 - **Mounted where the app runs.** The app's container starts its mount (`juicefs-mount-<app>`, at `/mnt/jfs-app/<app>`) and the mount goes when the container does. The first start anywhere formats the volume; every later one finds it formatted. A mount that dies takes its container with it, and Nomad starts the app again.
 - **A new app needs its bucket first.** `avc cloud apply` makes the bucket and writes the S3 pair into the site's secrets ([Providers](#providers)); without `topology.cloud`, make the bucket and its key by hand and `avc secrets provision` prompts for them. The key and role password are generated. Until the bucket exists the app's start fails and Nomad retries it.
 - **A preview's files are a clone inside the app's volume** (`previews/<slot>` beside `data`), so a preview needs no bucket and shares none of its writes with production.
-- **Two apps can share one volume** by naming it (`juicefsVolume`): a WordPress site's two faces do.
+- **Two apps can share one volume** by naming it (`juicefsVolume`).
 - **Removing an app** leaves its bucket and database. The bucket carries `prevent_destroy`, so `avc cloud plan` fails on it and names it; delete it by hand once you are sure, and its database with `dropdb -p 5433 jfs_<app>` on the primary.
 - **Every node still holds every app's keys**, because any node may be the one an app runs on. A volume per app bounds a leaked S3 key, a mistake and a restore to one app; it does not bound a lost node.
 
@@ -833,6 +832,51 @@ JuiceFS keeps file names, sizes and the map from files to objects in PostgreSQL.
 A site with one Nomad server and no `etcd` tag has one PostgreSQL, on that server, in the same place and with the same roles. [Growing to three voters](#growing-to-three-voters) turns it into the first member.
 
 **Moving a site from the `juicefs-meta` tag.** The node that carried the tag has the database, and its member starts the cluster from it; the others, with nothing, wait until it has (a member with no data creates no database while the bucket holds a volume). Remove the tag in the same commit. This path is the one `checks.voter-growth` covers for a one-server site; on a site that already had an etcd it has not been run.
+
+### WordPress
+
+A site is one stock [Roots Bedrock](https://roots.io/bedrock/) project in a repository of its own, built by [wordpress-nix](https://github.com/Avunu/wordpress) from its `composer.lock` into a store path: core, plugins and themes from Composer, premium code committed. Production never writes code: the tree is read-only, with Bedrock's `DISALLOW_FILE_MODS`. A plugin update is a commit to the site, which reaches the cluster as a bump of its flake input. One container per site, with its own MariaDB; there is no shared database.
+
+```nix
+# flake.nix: the site follows the library's wordpress-nix, so the module here and the
+# build there are one version (and one nixpkgs). The site has no nixpkgs input.
+site-acme = {
+  url = "git+https://github.com/OWNER/site-acme.git?ref=main";
+  inputs.wordpress-nix.follows = "cluster/wordpress-nix";
+};
+
+# apps/acme.nix
+{ inputs, ... }:
+{
+  wordpress = {
+    package = inputs.site-acme.packages.x86_64-linux.default;
+    domain = "acme.example";
+    extraDomains = [ "www.acme.example" ];
+    stagingDomain = "staging.acme.example";
+    media = {
+      bucket = "wp-acme-media";
+      endpoint = "https://<account id>.r2.cloudflarestorage.com";
+      publicUrl = "https://media.acme.example";
+    };
+  };
+}
+```
+
+- **Its tunnel is in the client's account.** `wordpress-nix edge provision` makes the tunnel where the site's zone is, with its DNS, cache and WAF rules, and writes `tunnel.id` and `tunnel.accountId` into `apps/<name>.json`. `avc cloud` leaves that tunnel and its records alone ([Providers](#providers)), and a client zone is never in `cloud.cloudflare.zones`. Every hostname is routed from the first deploy, so a cutover is a DNS change.
+- **Secrets.** `<name>/env` holds Bedrock's eight salts (generated). `<name>-cloud-files/cloud-files` is an env file with `S3_KEY`, `S3_SECRET` (the site's bucket-scoped R2 key) and `CLOUDFLARE_EMAIL_*`, prompted. `<name>-media-ro/{access-key,secret-key}` is a read-only key to the bucket, for the mirror, on the host only. `<name>-cf/cloudflared` is the tunnel's. Run `avc secrets provision` before the app's file is merged: a secret the app mounts that was never generated is a build error.
+- **Sizing.** `profile` sets PHP's threads and limits and the InnoDB pool, and the app's `resources.memoryMB` with them, so the worst case fits the reservation:
+
+  | Profile | PHP threads | `memory_limit` | InnoDB pool | `memoryMB` |
+  | --- | --- | --- | --- | --- |
+  | `brochure` | 3 | 192M | 256M | 1280 |
+  | `woocommerce` | 4 | 384M | 384M | 2560 |
+
+  Forty sites at that size are about 56 GB of reservations, which must fit on two of three nodes while one is down.
+- **Backups.** The nightly backup takes MariaDB's dump and the uploads, as for any app, and rehearses the restore against an options table. After it, on the same node, with deploys no longer held, the host copies the site's R2 bucket into the fleet's versioned media mirror (`rclone copy`, never `sync`: R2 keeps no versions, so this copy is what brings back a deleted file), and uploads the dump, gzipped, to the dev-restore bucket for a developer's `wp restore`. The two buckets are named like the apps' JuiceFS buckets (`<prefix>-wordpress-media`, `<prefix>-wordpress-dev-restore`), so no app's JuiceFS volume may be called `wordpress-media` or `wordpress-dev-restore`; the node fails to evaluate if one is. `cluster-restore <name> --db-only` puts back a database a migration broke.
+- **Previews.** `preview.slots` works as for the other kinds: a slot gets production's salts and database copy, `WP_ENV=staging` (no mail, no indexing, production-only plugins off), no cron, its home and its theme and plugin URLs from the request, and the bucket's name without a key, so it serves production's media and cannot change it.
+- **Releases.** The nodes build every site with the library's wordpress-nix, whatever the site's own lock says. A wordpress-nix release reaches the library's lock first, then the site's cluster `rev`, whose merge gate builds every site and boots one (`wordpress-site-smoke`), and only then the sites' own locks. `project-inputs-follow` refuses a site input that does not follow the library's payload flake.
+
+The site is not created here: `wordpress-nix site import` loads its converted database after the first start, and every deploy after that migrates it (`wp core update-db`).
 
 ### Adding an app
 
@@ -910,7 +954,9 @@ Generators run offline, so anything a third party issues is a `prompt`, filled o
 | `cloudflare/provision-token` | The operator's own Cloudflare token, for site provisioning and for `avc cloud`; never deployed to a node | Prompt |
 | `cloud-ovh/{application-key,application-secret,consumer-key}` | The operator's OVH API application, for `avc cloud`, only with `cloud.ovh`; never deployed to a node | Prompt |
 | `cloud-state/passphrase` | What `cloud/terraform.tfstate` is encrypted with, only with `cloud`; never deployed to a node. Never regenerate it: a new one reads none of the state | Generated |
-| `<app>-cf/cloudflared` | Each app's tunnel | Prompt, from `cloudflared tunnel create` |
+| `<app>-cf/cloudflared` | Each app's tunnel | Prompt, from `cloudflared tunnel create` (or `wordpress-nix edge provision`) |
+| `wordpress-media-mirror/{access-key,secret-key}` | The WordPress sites' media mirror bucket, only with a `wordpress` app whose `media.backup` is on. On every node, in no container: the backup's host step copies with it | `avc cloud apply`, or prompt |
+| `wordpress-dev-restore/{access-key,secret-key}` | The WordPress sites' dev-restore bucket, only with a `wordpress` app whose `devRestore` is on. On every node, in no container | `avc cloud apply`, or prompt |
 
 Each kind declares its own, from its entry in `apps/`. A secret an app mounts but that was never generated is a build error, not an empty file.
 
@@ -1119,8 +1165,9 @@ avc cloud tofu "state list"    # OpenTofu itself, same configuration, state and 
 | --- | --- | --- |
 | OVH | A bucket, a user of its own, that user's S3 key pair, and a policy that reaches that bucket and no other | `objectStorage.juicefsBucket`; one for each app with `juicefsPaths`; `backup.state.target.bucket` when it is on the same endpoint |
 | OVH | The same for the binary cache's bucket, unversioned | an app of kind `attic`, its `attic.bucket` |
-| OVH | Versioning on the state backup's bucket, and hidden versions expired after `noncurrentDays` | `backup.state.target.bucket` |
-| Cloudflare | A tunnel per app, locally configured | every app with a hostname |
+| OVH | The same for the WordPress sites' media mirror (versioned) and dev-restore bucket, one each for the fleet | an app of kind `wordpress` with `media.backup`, or `devRestore` |
+| OVH | Versioning on the state backup's and the media mirror's buckets, and hidden versions expired after `noncurrentDays` | `backup.state.target.bucket`; the media mirror |
+| Cloudflare | A tunnel per app, locally configured | every app with a hostname whose `tunnel.accountId` is unset or `cloud.cloudflare.accountId` |
 | Cloudflare | A proxied CNAME per hostname, to the app's tunnel | hostnames in a zone of `cloud.cloudflare.zones` |
 | Cloudflare | The private route to a FreeIPA server's address | `freeipa.privateIp4` |
 | Cloudflare | The audit trail's R2 bucket, with a lock rule | `cloud.cloudflare.auditBucket` |
@@ -1131,13 +1178,15 @@ No user may delete an object version, so on the versioned bucket a node that is 
 
 **A tunnel made by hand is adopted.** An app that already has a `tunnel.id` gets an import of it, and its secret and its name stay as they are. A DNS record made by hand is not known to the topology by any id: delete it first, or `avc cloud tofu "import cloudflare_dns_record.<name> <zone id>/<record id>"`. A bucket made by hand likewise (`import ovh_cloud_project_storage.juicefs <project>/<region>/<name>`); its old user and key are then yours to remove once the new pair is deployed.
 
+**A tunnel in another account is left alone.** An app whose `tunnel.accountId` names another Cloudflare account than `cloud.cloudflare.accountId` has its tunnel and its DNS records made there, outside OpenTofu: a client's zone in the client's own account, where a CNAME to `<id>.cfargotunnel.com` resolves only to a tunnel in that same account. `wordpress-nix edge provision` makes such a tunnel and prints its id and credentials, which go into the app's file and `<app>-cf/cloudflared` as for a tunnel made by hand. `avc cloud` makes no tunnel, import or record for the app, and names its hostnames as someone else's. None of them may be in a zone of `cloud.cloudflare.zones`, or the node fails to evaluate: two owners of one record would undo each other's changes (`checks.cloud-accounts`, `checks.container-tunnel`).
+
 **Nothing is destroyed by accident.** Buckets and tunnels carry `prevent_destroy`, so a plan that would delete one fails in OpenTofu. Anything else a plan would delete or replace, `avc cloud apply` refuses until each address is named with `--destroy`. A replaced key pair is one a node is using: name it, apply, and let the ship reach the nodes.
 
 **The state** is `cloud/terraform.tfstate` in your repository, committed with each apply. It holds every key the providers issued, so OpenTofu encrypts it (and every saved plan) with `cloud-state/passphrase`, enforced: without the passphrase it refuses to read the state, and it never writes one in the clear. Put the passphrase in the [offline kit](#the-offline-kit). Two operators applying at once would each commit a state; the pull request of the second conflicts, which is the lock.
 
 To turn it on: `cloud` in the topology; `avc secrets provision` for `cloud-state` (it leaves the key pairs `avc cloud apply` issues, such as `ovh-s3`, to that command while they are missing), and for `cloud-ovh` an API application of your own (`https://<endpoint>/createToken`, with GET, POST, PUT and DELETE on `/cloud/project/<project>/*`); `cloudflare/provision-token` needs Cloudflare Tunnel, DNS and R2 write. Then `avc cloud plan`.
 
-Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket (the site provisioner's), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
+Not made here: the Workers' own code and secrets (`wrangler deploy`), API tokens, Access applications and their policies, a WordPress site's R2 bucket, tunnel, DNS and edge rules (`wordpress-nix media provision` and `edge provision`, in the site's zone's account), the nightly backup's target (which is meant to be elsewhere), and the servers themselves.
 
 ### The binary cache
 
@@ -1197,6 +1246,8 @@ cluster-restore <app> --to-scratch /var/tmp/r
 ```
 
 A weekly rehearsal restores each app's backup to prove it works. If you lose a node, its apps start on the others by themselves, from their replicated state ([Where an app runs](#where-an-app-runs)); the backup is for losing more than that, or for going further back. `cluster-restore` runs on the node the app is running on, or on any node while it runs on none. Keep your age key somewhere other than your laptop, because backups can't be decrypted without it.
+
+An app's `backup.hostPostCommand` runs on the host after its snapshot is written, on the node that took it, with `$APP` and `$BACKUP_STAGING` (the run's dumps) set: a copy that belongs beside the backup but is made with a key the container never sees, such as a WordPress site's media mirror. It runs after the deploy hold is released, so a long copy holds up no deploy. Its failure marks the run partial (`BackupPartial`); the snapshot is kept.
 
 The staging, verify and restore directories (`/var/lib/cluster-backup/{staging,verify,restore}`) hold plaintext dumps until the next run, on the node's encrypted root.
 
@@ -1302,6 +1353,9 @@ A weekly report emails each app's last backup, rehearsal and repository check. I
 | `AppLogCritical` | warning | An app logged at critical level or above. |
 | `AppErrorBurst` | warning | An app logged over 100 errors in 10 minutes. |
 | `AppMigrationFailed` | warning | A database migration failed. |
+| `WordPressPhpFatal` | warning | A WordPress site logged a PHP fatal error. |
+| `WordPressCronFailing` | warning | A WordPress site's cron failed three times in a row. |
+| `WordPressOffloadFailed` | warning | wp-cloud-files could not put an attachment in the site's bucket. |
 | `BackupStale` | critical | No successful backup recently, on any node. |
 | `BackupPartial` | warning | The last backup could not read some files. |
 | `BackupVerifyStale` | warning | Backups not proven restorable recently. |
@@ -1412,7 +1466,7 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `cluster-ci` | The pipeline's Worker: a pull request becomes one preview per app and branch with its own tunnel and hostname, a fork gets nothing, a node's report reaches the pull request only for the commit it is about, a preview's tunnel is deleted only after its node let go of it, and which push deploys and which updates the site's lock. And a node's GitHub tokens: only a node's bearer token is answered, GitHub is asked for read-only tokens naming the site's repositories, the set comes from the site's repository and never from a node, a stranger's installation of the public App causes nothing, a token is minted once and replaced with half an hour left, and an uncovered repository is named. |
 | `ci-agent` | The pipeline's agent as a process, against stand-in commands: build with the input overridden and fresh GitHub tokens asked for first, clone before start, a push that does not seed again, a reset that does, a full app that says so, a release that leaves nothing, a failure that names units and no log line, and a deploy started once per push, across a restart. |
 | `github-access` | A node's GitHub token refresh as a process, against a stand-in Worker: both files replaced by rename, mode 0600 in a 0700 directory, one `access-tokens` entry per repository that the nodes' Nix parses, a missing include ignored, a failed refresh keeping the tokens still good and dropping the expired, an answer that is not tokens and names refused. And git's credential helper, asked by git: the token of the repository named, nothing for an unknown owner, another repository of a known owner, an expiring token or another host. |
-| `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in. |
+| `mk-cluster` | The consumer interface, with a `self` that exports nothing, and the template's own flake outputs, including that the template as shipped refuses to evaluate until its boot fields are filled in, and `project-inputs-follow` over locks whose projects follow the library's payload flake and ones that do not. |
 | `docs` | This README against the code: every check has a row here, every `avc` and `cluster-boot-seal` command it names exists, every topology field, alert and generator is documented, and no address or email is outside the reserved ranges. |
 | `security-policy` | The boot security posture and its one opt-out: what evaluates, what is refused and for the reason it claims; the boot contract's fields, the boot stack, the canary's topology rules; and that every generator of a new site can be read. Evaluation only. |
 | `security-policy-fixture` | The posture checks that need a whole fixture system per node. |
@@ -1437,12 +1491,15 @@ nix build --no-link "$(nix eval --raw .#checks.x86_64-linux.<name>.drvPath)^*"
 | `secrets-tpm` | The real path, in VMs with a software TPM: agenix-rekey's own app rekeys two master-encrypted secrets to a node's TPM recipient, the node decrypts them at boot at their paths and with their owners, what `avc`'s runner rekeyed from the same site's `clusterSecrets` has the same names and decrypts on that TPM too, a secret removed on the running node is counted and comes back with an activation, and the same system on another TPM decrypts nothing, fails `cluster-secrets`, starts no Nomad and says so in its metric, with SSH up. |
 | `backup` | What the fixture apps generate: engine detection, units, salted repository paths, target URLs. |
 | `freeipa` | FreeIPA's wiring, and Authelia's own `validate-config` over its generated config. |
-| `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool). |
+| `wordpress-site-smoke` | One stock Bedrock site, built by wordpress-nix and placed by Nomad on the fixture node1 in a VM: served through its socket (home, REST API, login, the `/wp-admin` redirect), no PHP under uploads, a code tree PHP cannot write, no permission error in its journal, a `--db-only` restore, and a preview slot in staging with no cron, no S3 key, no mail and its home and asset URLs from the request. The cluster template re-exports it for the merge gate. |
+| `wordpress` | The wordpress kind's wiring: one container with its own MariaDB, Bedrock's environment, the secrets and whose they are, the host-only backup keys, every hostname on a tunnel in the site's account, the probes, the profile's reservation, the nightly host copies, and a preview slot without the S3 key, cron or production's home. |
+| `alert-rules` | Every alert rule fires when it should and stays quiet when it should not (promtool); the log rules parse as Loki's ruler parses them (lokitool). |
 | `alerting` | An alert travels Prometheus, Alertmanager and the bridge to a stub of the Cloudflare API, in a VM. |
 | `cluster-watchdog` | The dead-man's logic, and the audit Worker's schemas, tokens and emails. |
 | `logging` | A journal entry reaches Loki with the label contract, in a VM. Loki keeps its store on local disk with no credentials, retention deletes old lines, and a crash leaves no core dump on the host or in a container. |
+| `cloud-accounts` | `tunnel.accountId`: a tunnel in the cluster's Cloudflare account, by default or by name, is made with its records and imported where the app names it; one in another account gets no tunnel, import, record, output or write-back, and its hostnames are reported as someone else's. |
 | `cloud` | The fixture's OpenTofu configuration validated against the OVH and Cloudflare providers' own schemas, with the OpenTofu `avc` runs: a bucket, user, key pair and one-bucket policy per bucket, none able to delete a version; a tunnel per app, adopted where the app names one; proxied CNAMEs, FreeIPA's private route, the locked audit bucket; and where each output is written back. No provider is contacted. |
-| `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM. |
+| `backup-roundtrip` | Backup, damage and restore against an S3 server, for PostgreSQL and MariaDB, in a VM; an app's `hostPostCommand` with the dumps staged, and its failure a partial run. |
 | `attic` | The binary cache on the fixture node, placed by Nomad: made with the site's signing key and unchanged by a second run; reached at the node's loopback through the mesh port; a pushed path deleted and substituted back, which takes the trusted signature; no configuring or pushing without a token, no configuring with a node's; the public face serving reads and refusing every write and the API; and with the cache stopped, a refused port, a build that goes ahead, a push that fails nothing, and a probe that says down. The fixture keeps NARs in a directory: S3 is not exercised. |
 | `app-state` | An app's local state following it between three VMs with real ZFS: replicas received whole and then incrementally, a move that loses nothing, a dead holder waited out and replaced from the newest copy any node has, its return with its own writes set aside, a legacy directory adopted where it is, and a new app not started empty while a node is silent. Also: a replica keeping its history when the running node destroys its own, the state backup taken by one replica, and its restore reaching every node. |
 | `install-boot` | The plain disk layout installs into a VM, reboots, and comes back. |
@@ -1498,7 +1555,7 @@ These are accepted deliberately.
 8. **x86_64-linux only.** The machine platform is fixed in `lib/mk-cluster.nix`.
 9. **A preview is the pipeline's first real run.** [Previews and continuous deployment](#previews-and-continuous-deployment) is proven with GitHub, Cloudflare and the node's tools stood in for, and by evaluation.
 10. **Nothing here has run on real firmware.** Every boot path is proven in VMs (OVMF, a software TPM); the [checklist](#real-hardware-checklist) is what proves a real node.
-11. **State replication has run in VMs only.** `checks.app-state` proves the moves, the failover and the orphan with real ZFS on three VMs, with a stand-in for the container; no check yet has Nomad itself move a stateful app, and nothing has timed a large database's first replica or a failover on real disks. `wpdb` cannot move at all, and FreeIPA's move is the generic one, untried with a real FreeIPA.
+11. **State replication has run in VMs only.** `checks.app-state` proves the moves, the failover and the orphan with real ZFS on three VMs, with a stand-in for the container; no check yet has Nomad itself move a stateful app, and nothing has timed a large database's first replica or a failover on real disks. FreeIPA's move is the generic one, untried with a real FreeIPA.
 12. **`avc cloud` has met no provider.** Its configuration is validated against the providers' published schemas and its state encryption against OpenTofu itself, but no plan has been made against a real OVH or Cloudflare account. Unverified there: that OVH's policy language keeps `s3:DeleteObjectVersion` from a user that has `s3:DeleteObject`, the import ids, and the `ovh-us` endpoint's coverage of each resource. Read the first plan before applying it.
 
 ## License

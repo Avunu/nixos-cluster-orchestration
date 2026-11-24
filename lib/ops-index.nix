@@ -22,7 +22,6 @@ let
   # The kinds an app can be (modules/kinds/); each is a nullable namespace.
   kinds = [
     "wordpress"
-    "wpdb"
     "odoo"
     "frappe"
     "freeipa"

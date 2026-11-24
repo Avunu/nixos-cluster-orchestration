@@ -127,7 +127,7 @@ let
           default = 9;
           description = ''
             The container's host number in the app subnet of the node it runs on. Below
-            that node's DHCP pool, and no other app's fixed address (a `wpdb.address`).
+            that node's DHCP pool.
           '';
         };
         storage = mkOption {
@@ -520,14 +520,6 @@ in
       {
         assertion = lib.all (n: n.appDhcpPoolOffset > a.hostOctet) (lib.attrValues topology.nodes);
         message = "clusterApps.${appName}: attic.hostOctet ${toString a.hostOctet} is inside a node's DHCP pool (nodes.<n>.appDhcpPoolOffset).";
-      }
-      {
-        assertion = lib.all (
-          o:
-          (o.wpdb or null) == null
-          || lib.all (n: o.wpdb.address != guestIp n a) (lib.attrValues topology.nodes)
-        ) (lib.attrValues hostApps);
-        message = "clusterApps.${appName}: attic.hostOctet ${toString a.hostOctet} is a wpdb's address on one node; give one of them another.";
       }
     ];
 

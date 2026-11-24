@@ -4,8 +4,7 @@
 # The nodes read GitHub with tokens the cluster-ci Worker mints for them, and the Worker
 # decides which repositories from the site's repository alone (workers/cluster-ci/
 # src/access.ts): the repository itself, every github.com input in flake.lock, and
-# `github-repos.json` at its root. The file is for what no lock names: a WordPress
-# site's content, fetched at evaluation (lib/mk-wordpress-site.nix), an app's
+# `github-repos.json` at its root. The file is for what no lock names: an app's
 # `preview.repo`, a private submodule of a project.
 #
 # The Worker cannot evaluate Nix, so the list has to be a file. It must not drift from

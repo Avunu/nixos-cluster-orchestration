@@ -195,12 +195,48 @@ check(
     {"pull_request", "push", "merge_group"} <= set(gate[True]),
 )
 utext = runs(update["jobs"]["update"])
+stext = runs(update["jobs"]["split"])
+script = (tpl_dir.parent / "flake-update.sh").read_text()
 check(
-    "flake-update.yml never pushes to main, and merges only by auto-merge",
-    "git push --force origin flake-auto-update" in utext
-    and not re.search(r"push[^\n]*\bmain\b", utext)
-    and "gh pr merge flake-auto-update --auto" in utext,
-    utext,
+    "flake-update.yml runs its script's steps, and the script never pushes to main and merges only by auto-merge",
+    "bash .github/flake-update.sh update" in utext
+    and 'bash .github/flake-update.sh split "$BRANCH" "$RUN_URL"' in stext
+    and "git push --force origin flake-auto-update" in script
+    and not re.search(r"push[^\n]*(\bmain\b|\$BASE\b)", script + utext + stext + runs(update["jobs"]["refresh"]))
+    and "gh pr merge flake-auto-update --auto" in script
+    and 'local name=$1 branch="flake-update/$1"' in script
+    and 'gh pr merge "$branch" --auto' in script
+    # A hold is a person's decision: its pull request is never auto-merged.
+    and "gh pr merge \"flake-update-hold" not in script,
+    utext + stext,
+)
+check(
+    "flake-update.yml splits only after merge-gate failed on one of its own branches, from this repository",
+    update[True]["workflow_run"]["workflows"] == ["merge-gate"]
+    and "github.event.workflow_run.conclusion == 'failure'" in update["jobs"]["split"]["if"]
+    and "head_branch == 'flake-auto-update'" in update["jobs"]["split"]["if"]
+    and "startsWith(github.event.workflow_run.head_branch, 'flake-update/')" in update["jobs"]["split"]["if"]
+    and "head_repository.full_name == github.repository" in update["jobs"]["split"]["if"]
+    and update["jobs"]["update"]["if"] == "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+)
+# Every merge-gate run in the repository starts flake-update.yml. A workflow-level group
+# would let one whose jobs all skip cancel a pending update or split; a skipped job
+# takes no group.
+ujobs = update["jobs"]
+check(
+    "flake-update.yml has no workflow-level concurrency; each job its own group, one at a time",
+    "concurrency" not in update
+    and ujobs["update"]["concurrency"] == {"group": "flake-update", "cancel-in-progress": False}
+    and ujobs["split"]["concurrency"]
+    == {"group": "flake-update-split-${{ github.event.workflow_run.head_branch }}", "cancel-in-progress": False}
+    and ujobs["refresh"]["concurrency"] == {"group": "flake-update-refresh", "cancel-in-progress": False},
+    {k: v.get("concurrency") for k, v in ujobs.items()} | {"workflow": update.get("concurrency")},
+)
+check(
+    "flake-update.yml makes the open per-input pull requests again whenever main moves",
+    update[True]["push"] == {"branches": ["main"]}
+    and ujobs["refresh"]["if"] == "github.event_name == 'push'"
+    and "bash .github/flake-update.sh refresh" in runs(ujobs["refresh"]),
 )
 
 readme = tpl_readme.read_text()

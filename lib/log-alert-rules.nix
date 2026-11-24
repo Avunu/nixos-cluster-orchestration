@@ -78,5 +78,42 @@ in
         })
       ];
     }
+    # WordPress (modules/kinds/wordpress.nix). Its migrate unit (wp core update-db,
+    # rolled back on failure) is AppMigrationFailed's, under service="migrate", like
+    # frappe's and odoo's. These are what is particular to it, matched on text that
+    # only PHP, systemd or wp-cloud-files write, so no label but the app's is assumed.
+    {
+      name = "wordpress";
+      interval = "1m";
+      rules = [
+        # A fatal is a page, a cron run or a CLI command that died: on a read-only
+        # tree, mostly a plugin bump that does not run on this PHP or core.
+        (rule {
+          alert = "WordPressPhpFatal";
+          expr = ''sum by (app, site) (count_over_time({app=~".+", app!="platform"} |= "PHP Fatal error" [5m])) > 0'';
+          severity = "warning";
+          summary = "{{ $labels.app }} ({{ $labels.site }}): PHP fatal errors";
+          description = explore;
+        })
+        # The timer fires every minute; three failures in four minutes is three in a
+        # row. Scheduled posts, mail queues and Action Scheduler stop with it.
+        (rule {
+          alert = "WordPressCronFailing";
+          expr = ''sum by (app) (count_over_time({app=~".+", app!="platform"} |= "wordpress-cron.service: Failed with result" [4m])) >= 3'';
+          severity = "warning";
+          summary = "{{ $labels.app }}: WordPress cron has failed three times in a row";
+          description = explore;
+        })
+        # An attachment wp-cloud-files could not put in the bucket stays on the
+        # container's uploads only, and is not where the site's URLs say.
+        (rule {
+          alert = "WordPressOffloadFailed";
+          expr = ''sum by (app, site) (count_over_time({app=~".+", app!="platform"} |~ "(?i)offload failed" [15m])) > 0'';
+          severity = "warning";
+          summary = "{{ $labels.app }} ({{ $labels.site }}): media offload to the bucket failed";
+          description = explore;
+        })
+      ];
+    }
   ];
 }
