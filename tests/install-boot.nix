@@ -56,14 +56,15 @@ let
   # as a command, so the subtests below can call it with one ESP missing.
   espSyncHook = import ../lib/esp-sync-hook.nix { inherit pkgs; };
   espSyncCommand = pkgs.writeShellScriptBin "esp-sync-hook" espSyncHook;
-  diskoLib = pkgs.callPackage "${diskoSrc}/lib/tests.nix" {
-    inherit lib;
-    makeTest = import "${pkgs.path}/nixos/tests/make-test-python.nix";
-    eval-config = args: evalConfig (args // { modules = map withInitrdAnswer args.modules; });
-    # qemu-common.nix takes { lib, stdenv }, and tests.nix calls this as
-    # `qemu-common-lib pkgs`, so route it through callPackage.
-    qemu-common-lib = p: p.callPackage "${p.path}/nixos/lib/qemu-common.nix" { };
-  };
+  # disko's own entry point builds its test library: tests.nix now also takes the whole
+  # `diskoLib`, which only lib/default.nix assembles.
+  diskoLib =
+    (import "${diskoSrc}/lib" {
+      inherit lib;
+      makeTest = import "${pkgs.path}/nixos/tests/make-test-python.nix";
+      eval-config = args: evalConfig (args // { modules = map withInitrdAnswer args.modules; });
+      qemu-common = import "${pkgs.path}/nixos/lib/qemu-common.nix";
+    }).testLib;
 in
 diskoLib.makeDiskoTest {
   inherit pkgs;
